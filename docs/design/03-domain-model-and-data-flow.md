@@ -2,7 +2,7 @@
 
 > 本篇回答：Simple Long Horizon Agent 用什么数据描述一次运行，这些数据由谁创建、如何转换、保存在哪里，以及哪些关系在任何实现中都必须成立。
 >
-> 本篇关注稳定的数据语义，不要求读者理解 Python 类型声明。Agent 如何逐轮推进将在 `04-agent-runtime.md` 中展开，Provider 的具体适配将在 `05-model-access.md` 中展开。
+> 本篇关注稳定的数据语义，不要求读者理解 Python 类型声明。Agent 如何逐轮推进将在 [`04-agent-runtime.md`](04-agent-runtime.md) 中展开，Provider 的具体适配将在 [`05-model-access.md`](05-model-access.md) 中展开。
 
 ## 1. 为什么先定义项目自己的数据语言
 
@@ -565,10 +565,10 @@ Trace 序列化可以省略可重建的冗余请求投影，并把体积很大�
 
 - [返回设计文档总览](README.md)
 - [上一篇：系统总体架构](02-system-architecture.md)
-- 下一篇 `04-agent-runtime.md` 将使用这些数据对象说明完整 Agent 循环、工具调度和停止条件。
-- `05-model-access.md` 将进一步展开 LLMRequest、流式响应、Adapter 和具体 Provider Wire。
-- `07-context-and-long-horizon.md` 将进一步展开压缩、Recall、Skills 和跨运行 Memory。
-- `09-trace-and-observability.md` 将进一步展开 Event Stream、Trace、Span、存储和 Viewer。
+- [下一篇：Agent 核心运行机制](04-agent-runtime.md)将使用这些数据对象说明完整 Agent 循环、工具调度和停止条件。
+- [`05-model-access.md`](05-model-access.md) 将进一步展开 LLMRequest、流式响应、Adapter 和具体 Provider Wire。
+- [`07-context-and-long-horizon.md`](07-context-and-long-horizon.md) 将进一步展开压缩、Recall、Skills 和跨运行 Memory。
+- [`09-trace-and-observability.md`](09-trace-and-observability.md) 将进一步展开 Event Stream、Trace、Span、存储和 Viewer。
 
 ## 20. 参考依据
 

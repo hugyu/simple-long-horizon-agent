@@ -221,10 +221,9 @@ FilesystemMemory 不在每轮自动做向量检索。启动时注入短说明和
 
 - [返回设计文档总览](README.md)
 - [上一篇：工具与外部能力](06-tools-and-integrations.md)
-- 下一篇 `08-agent-composition-and-workflows.md` 将说明子 Agent 和工作流怎样扩展任务跨度。
+- [下一篇：Agent 组合与工作流](08-agent-composition-and-workflows.md)将说明子 Agent 和工作流怎样扩展任务跨度。
 - [`context_view.py`](../../src/simple_long_horizon_agent/context_view.py)与 [`compression/`](../../src/simple_long_horizon_agent/compression/)：预算、策略与压缩执行。
 - [`tools/recall.py`](../../src/simple_long_horizon_agent/tools/recall.py)：有界历史恢复。
 - [`skills/`](../../src/simple_long_horizon_agent/skills/)：发现、指令和初始状态注入。
 - [`docs/memory.md`](../memory.md)与 [`memory/`](../../src/simple_long_horizon_agent/memory/)：Memory 契约和文件实现。
 - [`tests/unit/test_compression_control.py`](../../tests/unit/test_compression_control.py)、[`tests/unit/test_skills.py`](../../tests/unit/test_skills.py)和 [`tests/unit/test_memory.py`](../../tests/unit/test_memory.py)：行为验证。
-

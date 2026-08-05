@@ -212,10 +212,9 @@ Runtime 没有后台守护线程替调用者无限推进。谁消费迭代器，
 
 - [返回设计文档总览](README.md)
 - [上一篇：核心概念与数据流](03-domain-model-and-data-flow.md)
-- 下一篇 `05-model-access.md` 将展开 `generate` 背后的模型访问边界。
+- [下一篇：模型访问边界](05-model-access.md)将展开 `generate` 背后的模型访问边界。
 - [`core.py`](../../src/simple_long_horizon_agent/core.py)：Agent、run、resume 和工具调度。
 - [`hooks.py`](../../src/simple_long_horizon_agent/hooks.py)：HookPoint、决策合并与事件记录。
 - [`llm_agent.py`](../../src/simple_long_horizon_agent/llm_agent.py)：模型 Agent 的装配函数。
 - [`tests/unit/test_core.py`](../../tests/unit/test_core.py)：循环、停止、压缩、工具与恢复验证。
 - [`tests/unit/test_hooks.py`](../../tests/unit/test_hooks.py)：Hook 顺序、阻止和消息发射验证。
-

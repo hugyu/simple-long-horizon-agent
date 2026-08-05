@@ -213,7 +213,7 @@ raw 通过 AssistantMessage sidecar 进入调试链路，但 Runtime 不读取�
 
 - [返回设计文档总览](README.md)
 - [上一篇：Agent 核心运行机制](04-agent-runtime.md)
-- 下一篇 `06-tools-and-integrations.md` 将说明 LLMTool 声明背后的本地能力。
+- [下一篇：工具与外部能力](06-tools-and-integrations.md)将说明 LLMTool 声明背后的本地能力。
 - [`llm/README.md`](../../src/simple_long_horizon_agent/llm/README.md)：模型层现有职责说明。
 - [`llm/types.py`](../../src/simple_long_horizon_agent/llm/types.py)：统一请求、响应与流协议。
 - [`llm/stream.py`](../../src/simple_long_horizon_agent/llm/stream.py)：Adapter 注册与完成路径。
@@ -223,4 +223,3 @@ raw 通过 AssistantMessage sidecar 进入调试链路，但 Runtime 不读取�
 - [`tests/unit/test_real_adapters.py`](../../tests/unit/test_real_adapters.py)：各 Provider wire 转换验证。
 - [`tests/unit/test_llm_retry.py`](../../tests/unit/test_llm_retry.py)：恢复策略验证。
 - [`tests/unit/test_model_registry.py`](../../tests/unit/test_model_registry.py)：模型注册表验证。
-

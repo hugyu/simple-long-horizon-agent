@@ -224,7 +224,7 @@ JSON Schema 帮助模型生成参数，但不是完整安全验证。真正的�
 
 - [返回设计文档总览](README.md)
 - [上一篇：模型访问边界](05-model-access.md)
-- 下一篇 `07-context-and-long-horizon.md` 将说明 Recall 与其他长周期能力。
+- [下一篇：上下文与长周期能力](07-context-and-long-horizon.md)将说明 Recall 与其他长周期能力。
 - [`tools/__init__.py`](../../src/simple_long_horizon_agent/tools/__init__.py)：AgentTool 与 ToolResult 契约。
 - [`tools/bash.py`](../../src/simple_long_horizon_agent/tools/bash.py)：命令执行边界。
 - [`tools/read.py`](../../src/simple_long_horizon_agent/tools/read.py)与 [`tools/edit.py`](../../src/simple_long_horizon_agent/tools/edit.py)：文件能力。
