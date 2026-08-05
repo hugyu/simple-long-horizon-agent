@@ -1,6 +1,6 @@
 # Simple Long Horizon Agent 设计文档
 
-> 当前状态：总体目录与写作框架。
+> 当前状态：总体设计与 12 篇专题文档已经完成；后续以源码、测试和评审结果持续校正。
 >
 > 本目录通过阅读当前代码、测试和已有说明，反向整理项目的需求与设计。这里不会修改原项目，也不会逐行解释源码。
 
@@ -108,18 +108,18 @@ docs/design/
 ├── 01-product-goals-and-scope.md       # 已完成
 ├── 02-system-architecture.md            # 已完成
 ├── 03-domain-model-and-data-flow.md     # 已完成
-├── 04-agent-runtime.md
-├── 05-model-access.md
-├── 06-tools-and-integrations.md
-├── 07-context-and-long-horizon.md
-├── 08-agent-composition-and-workflows.md
-├── 09-trace-and-observability.md
-├── 10-evaluation-and-operations.md
-├── 11-configuration-and-extension.md
-└── 12-system-scenarios-and-completeness.md
+├── 04-agent-runtime.md                    # 已完成
+├── 05-model-access.md                     # 已完成
+├── 06-tools-and-integrations.md            # 已完成
+├── 07-context-and-long-horizon.md          # 已完成
+├── 08-agent-composition-and-workflows.md   # 已完成
+├── 09-trace-and-observability.md           # 已完成
+├── 10-evaluation-and-operations.md         # 已完成
+├── 11-configuration-and-extension.md       # 已完成
+└── 12-system-scenarios-and-completeness.md # 已完成
 ```
 
-后续文档将在开始编写时创建。创建完成后，本页对应文件名会改为可点击链接。
+每篇文档都可以独立阅读；首次了解项目建议仍按编号顺序阅读。第 12 篇用于从完整场景反查前面各专题是否闭环。
 
 ### 00. 总体入口——当前文档
 
@@ -162,7 +162,7 @@ docs/design/
 
 本篇强调数据语义和关系，不要求读者理解具体语言类型声明。
 
-### 04. `04-agent-runtime.md`——Agent 核心运行机制
+### 04. [`04-agent-runtime.md`](04-agent-runtime.md)——Agent 核心运行机制
 
 回答“Agent 如何持续推进任务”：
 
@@ -175,7 +175,7 @@ docs/design/
 
 这是理解项目行为的核心文档。
 
-### 05. `05-model-access.md`——模型访问边界
+### 05. [`05-model-access.md`](05-model-access.md)——模型访问边界
 
 回答“系统如何使用不同模型而不污染核心设计”：
 
@@ -186,7 +186,7 @@ docs/design/
 - 超时、限流重试和非法工具调用修复；
 - 为什么供应商对象不能直接进入核心状态。
 
-### 06. `06-tools-and-integrations.md`——工具与外部能力
+### 06. [`06-tools-and-integrations.md`](06-tools-and-integrations.md)——工具与外部能力
 
 回答“模型如何作用于真实环境”：
 
@@ -199,7 +199,7 @@ docs/design/
 
 本篇关注能力边界与交互语义，而不是逐个解释工具代码。
 
-### 07. `07-context-and-long-horizon.md`——上下文与长周期能力
+### 07. [`07-context-and-long-horizon.md`](07-context-and-long-horizon.md)——上下文与长周期能力
 
 回答“有限模型窗口如何支撑长时间工作”：
 
@@ -211,7 +211,7 @@ docs/design/
 - Memory 如何在不同运行之间保存经验；
 - 为什么这些能力不能混成一个笼统的“记忆模块”。
 
-### 08. `08-agent-composition-and-workflows.md`——Agent 组合与工作流
+### 08. [`08-agent-composition-and-workflows.md`](08-agent-composition-and-workflows.md)——Agent 组合与工作流
 
 回答“一个简单循环如何处理更复杂的任务”：
 
@@ -222,7 +222,7 @@ docs/design/
 - 子运行为什么持有独立 State；
 - 多步骤结果和轨迹如何重新组合。
 
-### 09. `09-trace-and-observability.md`——轨迹与可观测性
+### 09. [`09-trace-and-observability.md`](09-trace-and-observability.md)——轨迹与可观测性
 
 回答“人如何知道 Agent 做过什么”：
 
@@ -233,7 +233,7 @@ docs/design/
 - 成本分析和训练数据导出；
 - 为什么可观测产品应从事实派生，而不反向控制运行时。
 
-### 10. `10-evaluation-and-operations.md`——评测与运行体系
+### 10. [`10-evaluation-and-operations.md`](10-evaluation-and-operations.md)——评测与运行体系
 
 回答“如何在真实任务中运行、比较和验证 Agent”：
 
@@ -244,7 +244,7 @@ docs/design/
 - Oracle、环境内评分和官方评测器；
 - Runs、Profiles 和可复现实验入口。
 
-### 11. `11-configuration-and-extension.md`——配置与扩展原则
+### 11. [`11-configuration-and-extension.md`](11-configuration-and-extension.md)——配置与扩展原则
 
 回答“如何修改系统而不破坏其核心性质”：
 
@@ -255,7 +255,7 @@ docs/design/
 - 核心不能反向依赖外围模块的原因；
 - 文档、测试和架构检查如何随设计一起演进。
 
-### 12. `12-system-scenarios-and-completeness.md`——整体场景与完整性检查
+### 12. [`12-system-scenarios-and-completeness.md`](12-system-scenarios-and-completeness.md)——整体场景与完整性检查
 
 通过若干完整场景串联前面的模块：
 

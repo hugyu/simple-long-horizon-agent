@@ -692,7 +692,7 @@ sequenceDiagram
 - [返回设计文档总览](README.md)
 - [上一篇：项目目标与范围](01-product-goals-and-scope.md)
 - [下一篇：核心概念与数据流](03-domain-model-and-data-flow.md)将详细说明 Message、Content Block、Event、State 及其数据流。
-- `04-agent-runtime.md` 将展开主循环的逐轮时序和停止语义。
+- [`04-agent-runtime.md`](04-agent-runtime.md) 将展开主循环的逐轮时序和停止语义。
 
 ## 23. 参考依据
 

@@ -175,7 +175,7 @@ Trace 可能包含任务、文件内容、命令输出、模型 raw 和工具 de
 
 - [返回设计文档总览](README.md)
 - [上一篇：Agent 组合与工作流](08-agent-composition-and-workflows.md)
-- 下一篇 `10-evaluation-and-operations.md` 将说明轨迹如何成为评测产物。
+- [下一篇：评测与运行体系](10-evaluation-and-operations.md)将说明轨迹如何成为评测产物。
 - [`trace/run_trace.py`](../../src/simple_long_horizon_agent/trace/run_trace.py)：RunTrace、schema 和序列化。
 - [`trace/spans.py`](../../src/simple_long_horizon_agent/trace/spans.py)：Span 派生与子运行合并。
 - [`trace/training.py`](../../src/simple_long_horizon_agent/trace/training.py)：ModelTurn 提取。

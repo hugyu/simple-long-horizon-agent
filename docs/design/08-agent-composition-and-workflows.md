@@ -186,9 +186,8 @@ Facade 用于统一调用入口，不应隐藏失败或伪造一个共享 Runtim
 
 - [返回设计文档总览](README.md)
 - [上一篇：上下文与长周期能力](07-context-and-long-horizon.md)
-- 下一篇 `09-trace-and-observability.md` 将说明多运行事件怎样形成统一可观测视图。
+- [下一篇：轨迹与可观测性](09-trace-and-observability.md)将说明多运行事件怎样形成统一可观测视图。
 - [`agents/README.md`](../../src/simple_long_horizon_agent/agents/README.md)、[`agents/starter.py`](../../src/simple_long_horizon_agent/agents/starter.py)和 [`agents/toolsets.py`](../../src/simple_long_horizon_agent/agents/toolsets.py)：Builder、Session 与 Toolset。
 - [`tools/task.py`](../../src/simple_long_horizon_agent/tools/task.py)：工具式委派。
 - [`workflow/README.md`](../../src/simple_long_horizon_agent/workflow/README.md)与 [`workflow/`](../../src/simple_long_horizon_agent/workflow/)：工作流契约和模式。
 - [`tests/unit/test_workflow.py`](../../tests/unit/test_workflow.py)、[`tests/unit/test_goal_loop.py`](../../tests/unit/test_goal_loop.py)、[`tests/unit/test_pdr.py`](../../tests/unit/test_pdr.py)和 [`tests/unit/test_agent_starter.py`](../../tests/unit/test_agent_starter.py)：组合行为验证。
-

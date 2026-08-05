@@ -484,7 +484,7 @@ Agent 在代码仓库中调查问题、修改文件并运行验证命令。执�
 - [返回设计文档总览](README.md)
 - [下一篇：系统总体架构](02-system-architecture.md)
 - 核心概念将在 `03-domain-model-and-data-flow.md` 中定义。
-- Agent 的完整运行过程将在 `04-agent-runtime.md` 中展开。
+- Agent 的完整运行过程将在 [`04-agent-runtime.md`](04-agent-runtime.md) 中展开。
 
 ## 16. 参考依据
 
