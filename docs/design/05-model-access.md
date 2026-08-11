@@ -2,6 +2,8 @@
 
 > 本篇回答：系统怎样使用不同模型和 API，同时让 Runtime、State 与工具协议保持供应商无关。
 
+案例锚点：在 [00. 用一个真实运行看懂 Agent](00-running-example.md) 中，第一次 `model_request` 携带一条 task Message 和 system prompt；Fake Adapter 返回带 `ToolCallBlock("bash_1")` 的响应，第二次请求再把工具结果转换成模型可读的 LLMMessage。
+
 ## 1. 为什么模型访问必须独立
 
 不同模型接口在 system prompt、工具结果、图片、思考内容、流式事件、TokenUsage 和停止原因上都有差异。若 Runtime 直接构造 SDK 请求，切换 Provider 会改变核心循环，历史也会混入外部对象。

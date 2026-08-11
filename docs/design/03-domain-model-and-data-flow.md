@@ -4,6 +4,8 @@
 >
 > 本篇关注稳定的数据语义，不要求读者理解 Python 类型声明。Agent 如何逐轮推进将在 [`04-agent-runtime.md`](04-agent-runtime.md) 中展开，Provider 的具体适配将在 [`05-model-access.md`](05-model-access.md) 中展开。
 
+先阅读 [00. 用一个真实运行看懂 Agent](00-running-example.md)。本篇会把该案例中的 4 条 Message、16 条 State Event 以及两次 Model Request 抽象成可复用的数据模型。
+
 ## 1. 为什么先定义项目自己的数据语言
 
 [上一篇](02-system-architecture.md)把系统划分为运行时、模型访问、工具、上下文、编排和可观测等模块。这些模块要协作，首先需要对“正在发生什么”使用同一种表达。
