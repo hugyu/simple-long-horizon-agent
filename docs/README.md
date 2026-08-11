@@ -6,6 +6,14 @@ behavior.
 
 ## Guides
 
+### Architecture and learning path
+
+- [`design/README.md`](design/README.md) — architecture-first index for the
+  design notes.
+- [`design/00-running-example.md`](design/00-running-example.md) — a concrete,
+  deterministic task traced from input through model, tool, state, events, and
+  final output. Start here when learning how the system actually runs.
+
 - [`development.md`](development.md) — the quality gate, and the `ty` false
   positives worth recognizing.
 - [`configuration.md`](configuration.md) — every environment variable, grouped
