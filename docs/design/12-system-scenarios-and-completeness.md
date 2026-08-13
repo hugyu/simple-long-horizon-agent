@@ -320,8 +320,6 @@ flowchart LR
 - [轨迹与可观测性](09-trace-and-observability.md)
 - [评测与运行体系](10-evaluation-and-operations.md)
 - [配置与扩展原则](11-configuration-and-extension.md)
-- [面试深挖与证据边界](13-interview-deep-dive.md)
-- [无代码上下文的面试问答](14-interview-questions-and-answers.md)
 
 ## 14. 参考验证入口
 

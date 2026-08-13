@@ -54,6 +54,111 @@ Agent 自己不保存对话历史；同一个 Agent 配置可以运行多个互�
 
 这种接口让调用者可以实时打印、持久化或中止，也可以在开始消费前追加委派上下文。若调用者不消费迭代器，Agent 不会完成模型调用或工具执行。
 
+### 3.1 最小调用示例：什么时候真正触发运行
+
+```python
+agent = Agent(name="writer", generate=generate)
+
+# 这一步创建 State，并返回一个惰性 Event Iterator。
+state, events = agent.run("读取 README.md", max_turns=3)
+
+# 这一步才拉动 Runtime：模型调用、工具执行和后续回合都会发生。
+for event in events:
+    print(event)
+
+# 消费结束后，再从同一个 State 读取完整事实。
+print(state.task)       # 原始运行任务
+print(state.messages)   # MessageEvent 派生的 transcript
+print(state.events)     # 完整 Event Stream
+```
+
+可以把调用拆成两个时间点：
+
+```text
+agent.run(task)
+  ├─ init_state(agent, task)
+  ├─ State.task = task
+  ├─ MessageEvent(task) 已写入 State
+  └─ 返回 (state, events)
+
+消费 events
+  ├─ AgentStartEvent
+  ├─ TurnStartEvent
+  ├─ ModelRequestEvent → generate(...)
+  ├─ ModelResponseEvent / Assistant MessageEvent
+  ├─ 可选工具执行与 ToolResult MessageEvent
+  └─ AgentEndEvent
+```
+
+因此，下面的代码不会发起模型请求：
+
+```python
+state, events = agent.run("读取 README.md")
+# 如果此处直接返回，events 没有被消费，Runtime 也没有推进。
+```
+
+调用者可以用 `for` 实时观察，也可以用 `list(events)` 一次性执行；两者都会推进同一个生成器。事件每次 `yield` 前已经记录到 `state`，所以观察者不需要再手动写一份运行历史。
+
+### 3.2 默认 initializer 与自定义 initializer
+
+`Agent.run()` 的初始化选择只有一个入口：有 `agent.init_state` 就调用它，否则使用默认实现。默认实现等价于：
+
+```python
+def _default_init_state(agent, task):
+    state = State(task=task)
+    state.send("task", "user", agent.name, task)
+    return state
+```
+
+它建立两条不同用途的数据：`State.task` 保存运行级原始输入，`state.send(...)` 创建模型可见的 `UserMessage(kind="task")`，并产生第一个 `MessageEvent`。`State(task=task)` 本身只创建容器，不会自动创建消息。
+
+自定义 initializer 的契约是“接收 Agent 和任务，返回已经准备好的 State”：
+
+```python
+def init_state(agent, task):
+    state = State(task=task)
+    state.send(
+        "system",
+        "runtime",
+        agent.name,
+        "可用能力：read_file、search、bash",
+    )
+    state.send("task", "user", agent.name, task)
+    return state
+
+agent = Agent(
+    name="writer",
+    generate=generate,
+    init_state=init_state,
+)
+```
+
+初始化顺序会成为模型和 Trace 看到的事实：这里先有运行说明，再有用户任务。如果 initializer 只返回 `State(task=task)`，`state.messages` 为空，核心 Runtime 不会替它补写任务；除非这是一个明确不需要普通任务消息的特殊流程，否则模型可能看不到用户任务。Skills Agent 也是同一机制：Skills 层安装 initializer，调用者仍然只需调用普通的 `agent.run(task)`。
+
+### 3.3 运行完成后的 `resume`
+
+`resume(state, followup)` 不重新初始化，也不复制会话，而是在原 State 上追加一条新的 `UserMessage(kind="task")` 后重新调用同一个 Runtime：
+
+```python
+state, events = agent.run("读取 README.md")
+for _ in events:
+    pass
+
+state, events = agent.resume(state, "继续检查 StateSnapshot")
+for _ in events:
+    pass
+```
+
+此时 `state.task` 仍是第一次的原始输入，后续要求只出现在 transcript 和新增 Event 中：
+
+```text
+State.task = "读取 README.md"
+task Message 1 = "读取 README.md"
+task Message 2 = "继续检查 StateSnapshot"
+```
+
+这使 `run()` 表示“新建运行”，`resume()` 表示“延续已有事实”。恢复时应保持 Agent name 一致；跨进程恢复还需要调用者序列化并重建 State 和外部资源。
+
 ## 4. 一轮的固定顺序
 
 ```mermaid
@@ -80,6 +185,82 @@ flowchart TD
 ```
 
 顺序本身就是契约：请求事件必须先于生成，响应事件必须先于响应消息，工具调用消息必须先于工具执行，工具结果必须在下一轮构建 ContextView 前进入 State。
+
+### 4.1 为什么 task Message 排在 AgentStart 前面
+
+`Agent.run(task)` 先初始化 State，并由默认 initializer 把任务写成 `kind="task"` 的 UserMessage；这个写入产生第一个 MessageEvent。此时循环尚未执行。调用者开始消费返回的 Event 迭代器后，`run()` 才记录 AgentStartEvent 并触发 SESSION_START Hook。因此默认运行的开头是：
+
+```text
+0 MessageEvent(task)   # 建立初始 transcript
+1 AgentStartEvent      # 开始消费惰性 Runtime 循环
+2 TurnStartEvent       # 第一轮模型决策即将开始
+```
+
+这里的 `0`、`1`、`2` 是 State 在追加事件时分配的顺序索引，不是事件类型编号。自定义 initializer 必须自己建立需要的初始 transcript；若它没有写入 task Message，就不能假设所有运行都以同样的 MessageEvent 开头。
+
+`State.task` 与第 0 条 task Message 内容相同但职责不同：前者保存新 State 的原始运行输入，后者建立模型可见 transcript。`State(task=...)` 的 dataclass 构造器不会隐式记录 Event；这一步必须由默认或自定义 initializer 显式完成。完整数据归属见[领域模型文档](03-domain-model-and-data-flow.md#81-为什么-task-还要写成-message)。
+
+因此自定义 initializer 不能把“返回 `State`”误认为“已经建立了模型对话”：
+
+```python
+def incomplete_init(agent, task):
+    return State(task=task)  # events/messages 仍为空
+
+def complete_init(agent, task):
+    state = State(task=task)
+    state.send("task", "user", agent.name, task)
+    return state
+```
+
+前者适合明确不需要普通 task Message 的特殊流程；普通 Agent、Skills Agent 和需要让模型执行用户任务的初始化器应采用后者，或在它前面追加自己的 Runtime/context 消息。
+
+### 4.2 Turn 的准确边界
+
+当前 Runtime 中，一个 Turn 可以近似理解为“一次模型决策，以及这次决策直接引发的工具处理”：
+
+```text
+TurnStartEvent
+  → 请求前压缩检查
+  → 构建 ContextView
+  → ModelRequestEvent
+  → Agent.generate
+  → ModelResponseEvent
+  → MessageEvent(AssistantMessage)
+  → 可选：ToolExecutionEvent + MessageEvent(tool_result)
+  → TurnEndEvent
+```
+
+因此 `Model Call` 是 Turn 的一部分，而不是 Turn 的同义词。Turn 还拥有请求前上下文处理、消息写入、工具调度和终止判断。这个边界让 Span Viewer 可以把模型访问和工具执行都归入促成它们的同一轮控制流程。
+
+在贯穿本文的 Bash 示例中，第一次模型调用只能提出工具请求，不能同时知道尚未产生的工具结果：
+
+```text
+Turn 1
+  模型看到：task
+  模型输出：ToolCallBlock(id="bash_1")
+  Runtime：执行 Bash，写入 ToolResultBlock(tool_call_id="bash_1")
+
+Turn 2
+  模型看到：task + Assistant tool call + tool_result
+  模型输出：final AssistantMessage
+```
+
+所以一次需要模型读取工具结果的任务通常至少有两个 Turn。工具完成不会“自动唤醒”上一轮模型；结果先作为新的 UserMessage 进入 State，再由下一轮重新构建 ContextView 并调用模型。
+
+### 4.3 Agent 结束与 Turn 结束不能合并
+
+AgentStart/AgentEnd 包围整次运行，TurnStart/TurnEnd 只包围其中一次控制循环。一名 Agent 连续调用模型十次，应表现为一对 Agent 生命周期事件和最多十对 Turn 生命周期事件，而不是十次 Agent 启动。
+
+几个边界情况可以帮助理解：
+
+| 情况 | 可能的生命周期序列 | 含义 |
+| --- | --- | --- |
+| 第一轮直接 final | AgentStart → TurnStart → TurnEnd → AgentEnd(done) | 一轮正常完成 |
+| 工具返回 `terminate=true` | TurnEnd(terminated=true) → AgentEnd(tool_terminate) | 工具要求立即停止 |
+| 第一轮前 abort | AgentStart → AgentEnd(abort) | 尚未开始任何模型决策 |
+| `max_turns=0` | AgentStart → AgentEnd(max_turns) | 没有可用回合预算 |
+
+正常 `final` 不会把 `TurnEndEvent.terminated` 设为 true：`terminated` 专门表达工具终止信号，正常完成由后续 `AgentEndEvent(reason="done")` 表达。这样观察者可以区分“模型认为任务完成”“工具要求停止”“外部中止”和“预算耗尽”。
 
 ## 5. 模型请求前为什么先处理上下文
 
@@ -155,6 +336,8 @@ Hook 可以返回 block reason 或要追加的 Message，但不能编辑历史�
 ## 10. resume：延续 State，而不是复制会话
 
 `Agent.resume(state, followup)` 在现有 State 中追加新的 task Message，再运行同一个循环。此前 Message、Event、压缩视图和 Trace 均继续累积。
+
+`resume()` 不会把 `State.task` 改成 followup。原字段继续表示这份 State 最初的运行输入，followup 则作为新的 `UserMessage(kind="task")` 进入 transcript。这让一次持续运行同时保留“最初为何启动”和“后来要求继续做什么”。
 
 适用场景包括：
 

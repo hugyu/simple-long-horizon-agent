@@ -119,8 +119,6 @@ docs/design/
 ├── 10-evaluation-and-operations.md         # 已完成
 ├── 11-configuration-and-extension.md       # 已完成
 ├── 12-system-scenarios-and-completeness.md # 已完成
-├── 13-interview-deep-dive.md               # 已完成
-├── 14-interview-questions-and-answers.md    # 已完成
 └── 15-resume-project-description.md         # 已完成
 ```
 
@@ -286,27 +284,6 @@ docs/design/
 
 本篇不是新的功能设计，而是检查前面是否已经把系统讲完整。若一个关键行为无法通过已有概念和模块解释，就说明前面的文档仍有遗漏。
 
-### 13. [`13-interview-deep-dive.md`](13-interview-deep-dive.md)——面试深挖与证据边界
-
-围绕面试中容易被继续追问的六类问题整理证据：
-
-- 定量实验与结果归因；
-- 性能与容量；
-- 安全威胁模型；
-- 故障恢复；
-- 方案演进；
-- 个人贡献。
-
-本篇把已有事实、当前缺失和模拟回答分开。它不新增系统能力，也不把建议实验、
-设计方案或模拟经历写成已经发生的项目事实。
-
-### 14. [`14-interview-questions-and-answers.md`](14-interview-questions-and-answers.md)——无代码上下文的面试问答
-
-假设面试官只看过简历项目描述并听过候选人的介绍，从项目目标、架构、长周期能力、
-工具与编排、评测、可靠性和个人贡献逐层提问。文档先按“简历主张 → 回答触发词 →
-下一层追问”给出真实提问路径，再提供可口述的模拟回答，不要求面试官预先了解文件、
-类型或具体代码实现。
-
 ### 15. [`15-resume-project-description.md`](15-resume-project-description.md)——简历项目描述
 
 将项目定位、核心工作和实验结果整理为可直接用于简历的完整版、精简版和极简版，
@@ -344,12 +321,6 @@ docs/design/
   → 09 轨迹与可观测性
   → 10 评测与运行体系
 ```
-
-### 准备项目面试
-
-先按首次了解项目路线掌握核心，再阅读 07、09、10 和 12，使用第 13 篇检查证据
-边界，用第 14 篇演练完整问答，最后从第 15 篇选择与简历篇幅匹配的项目描述。
-模拟回答必须结合真实实验记录和个人经历校正。
 
 ### 准备扩展项目
 

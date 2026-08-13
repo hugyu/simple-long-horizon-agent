@@ -39,6 +39,105 @@ AgentTool 包含：
 
 内容和控制不能混为一段字符串。模型需要知道错误内容，Runtime 需要知道是否停止，Trace 需要保留执行事实，调用者可能还需要非模型可见细节。
 
+### 3.1 content 与 details 是两条不同通道
+
+以 Read 工具读取一个 12,000 行日志为例。它可能只把前 200 行和续读提示放进 `content`，同时在 `details` 中保留结构化的截断数据：
+
+```python
+ToolResult(
+    content=(
+        TextBlock(
+            "...前 200 行...\n\n"
+            "[Showing lines 1-200 of 12000. Use offset=201 to continue.]"
+        ),
+    ),
+    details={
+        "path": "large.log",
+        "total_lines": 12000,
+        "start_line": 1,
+        "truncation": {
+            "truncated": True,
+            "truncated_by": "lines",
+            "output_lines": 200,
+            # 还包含字节数、上限等本地诊断字段。
+        },
+    },
+)
+```
+
+这两部分沿不同路径流转：
+
+```text
+ToolResult.content
+  → ToolResultBlock.content
+  → UserMessage(kind="tool_result")
+  → 下一轮模型请求
+
+ToolResult.details
+  → UserMessage.sidecar["details"][tool_call_id]
+  → Trace、Viewer 或明确读取该协议的本地模块
+```
+
+因此，模型可以看到“结果被截断，请从 201 行继续”，却不会自动收到整份结构化诊断字典。`details` 适合保存子 Agent 事件、结构化产物引用和调试元数据；会影响模型下一步判断的事实仍应放进 `content`，会影响 Runtime 通用控制流的事实应使用 `is_error`、`terminate` 或明确 Event，不能藏在 `details` 里。
+
+### 3.2 为什么 details 还要按 tool_call_id 分组
+
+Runtime 会把同一 Assistant 回合的全部工具结果合并为一个 `UserMessage`。上例进入 State 后，规范形状近似为：
+
+```python
+UserMessage(
+    kind="tool_result",
+    sender="tool",
+    target="writer",
+    content=(
+        ToolResultBlock(
+            tool_call_id="read_1",
+            tool_name="read",
+            content=(TextBlock("...前 200 行..."),),
+            is_error=False,
+        ),
+    ),
+    sidecar={
+        "details": {
+            "read_1": {
+                "path": "large.log",
+                "total_lines": 12000,
+                "start_line": 1,
+                "truncation": {"truncated": True, "truncated_by": "lines"},
+            },
+        },
+    },
+)
+```
+
+`ToolResultBlock.tool_call_id` 与 `sidecar["details"]` 的键使用同一个因果身份：
+
+```text
+ToolCallBlock(id="read_1")
+          ↕
+ToolResultBlock(tool_call_id="read_1")
+          ↕
+sidecar["details"]["read_1"]
+```
+
+一轮并行调用时，结果包可能包含：
+
+```python
+sidecar={
+    "details": {
+        "read_1": {"path": "README.md", ...},
+        "search_1": {"matches": 8, ...},
+        "task_1": {"sub_events": [...]},
+    },
+}
+```
+
+不能只用工具名作为键，因为同一轮可以两次调用 `read`；也不能依赖字典位置或并发完成顺序，因为执行快慢会变化。调用 ID 是请求、模型可见结果和本地详情已经共同使用的稳定配对键。当前 Runtime 即使某次调用的 `details` 为 `None`，也会为该 call id 保留对应项，使结果包保持一一对齐。
+
+### 3.3 非模型可见不等于非敏感
+
+`details` 不会通过普通 Bridge 自动进入 Provider 请求，但它仍属于 State 中消息的 sidecar，可能被 Trace 持久化、被 Viewer 展示或被本地分析器读取。因此不要把密钥、无保留必要的私密文件内容或其他敏感数据随意放入其中。若某种详情开始被多个模块长期依赖，应将其提升为明确字段、事件或专门的 namespaced 协议，而不是让 sidecar 逐渐成为第二套消息协议。
+
 ## 4. 一组工具调用的调度
 
 ```mermaid
@@ -205,7 +304,7 @@ JSON Schema 帮助模型生成参数，但不是完整安全验证。真正的�
 
 - 每个 ToolCall 都产生可配对的结果，即使未知、被阻止或失败；
 - ToolResult content 只含模型可见 TextBlock/ImageBlock；
-- details 不自动暴露给模型；
+- details 不自动暴露给模型，并按 tool_call_id 与结果配对；
 - 并行执行不改变结果包的调用顺序；
 - sequential 工具不会与同组其他调用并发；
 - 工具不能直接篡改历史协议；需要注入消息时使用受控 Hook 或 State 入口；
@@ -216,6 +315,7 @@ JSON Schema 帮助模型生成参数，但不是完整安全验证。真正的�
 
 - AgentTool 与 LLMTool 的区别是什么？
 - ToolResult 的 content、details、is_error、terminate 分别由谁读取？
+- 为什么同一结果包中的 details 不能只按工具名或列表位置关联？
 - 为什么错误结果通常应进入下一轮模型？
 - 并行工具完成顺序为何不决定结果展示顺序？
 - Task 工具怎样复用普通 Agent Runtime？

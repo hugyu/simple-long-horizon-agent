@@ -158,6 +158,8 @@ Sidecar 是少量非正文附加信息的逃生口，例如：
 
 Sidecar 不能成为第二套消息协议。频繁使用、语义稳定、跨模块读取的数据，应提升为明确字段、内容块或事件。
 
+以模型摘要为例：摘要正文属于 `Message.content`；生成摘要的 compressor、模型、usage 和 raw 是这条摘要旁边的局部证据；被折叠的消息索引、压缩后的活跃索引、前后 Token 估算和策略属于 `ContextCompressionEvent`。sidecar 不能替代前两种正式事实，完整分工见[上下文与长周期能力](07-context-and-long-horizon.md#52-模型摘要的三层事实)。
+
 ## 5. Tool Call 与 Tool Result：用身份建立因果关系
 
 工具交互不是两段碰巧相邻的文本，而是一组必须可配对的请求和结果。
@@ -234,7 +236,35 @@ Message 回答“对话里出现了什么”，Event 回答“运行过程中发
 | Hook | HookFired | 生命周期扩展点是否触发、阻止或追加消息 |
 | Goal | GoalStatus | 外层目标循环的状态、预算和原因 |
 
-### 7.2 Message 与 Event 的关系
+### 7.2 Agent、Turn 与 Model Call 是三种粒度
+
+生命周期事件使用三层边界描述一次运行：
+
+```text
+AgentStartEvent                     # 整次 Agent 运行开始
+├── TurnStartEvent                  # 一次控制循环开始
+│   ├── ModelRequestEvent           # 一次模型访问开始
+│   ├── ModelResponseEvent          # 一次模型访问结束
+│   ├── 可选的工具执行与结果消息
+│   └── TurnEndEvent                # 本轮控制循环结束
+├── 下一轮 TurnStartEvent
+│   └── ...
+└── AgentEndEvent                   # 整次 Agent 运行结束
+```
+
+三层边界回答不同问题：
+
+| 边界 | 回答的问题 | 一次运行中的数量 |
+| --- | --- | --- |
+| AgentStart / AgentEnd | 哪个 Agent 开始运行，使用什么固定 prompt，最终为何停止？ | 通常一对 |
+| TurnStart / TurnEnd | 一次“模型决策 + 该决策直接引发的工具处理”何时开始和结束？ | 零到多对 |
+| ModelRequest / ModelResponse | 模型实际何时被调用，本轮输入、输出、模型和 usage 是什么？ | 每个正常 Turn 一对；压缩器等嵌套能力也可产生独立模型调用 |
+
+Turn 不等于一条 Message，也不只等于一次模型调用。当前核心 Runtime 中，一个正常 Turn 从请求前的上下文压缩检查开始，包含 ContextView 构建、模型调用、Assistant Message 写入，以及该 Assistant 回合请求的全部工具执行和结果包写入。工具结果进入 State 后，本轮才结束；下一次模型读取这些结果时，会开启新的 Turn。
+
+`TurnEndEvent.terminated` 只表示工具是否要求立即终止本轮及整个 Agent。模型正常输出 `final` 时，本轮仍使用普通的 `TurnEndEvent(terminated=false)`，随后由 `AgentEndEvent(reason="done")` 表达整次运行正常完成。不要把“Turn 被工具强制终止”和“Agent 正常完成”混为一件事。
+
+### 7.3 Message 与 Event 的关系
 
 每条进入 State 的 Message 都由 MessageEvent 承载，因此消息顺序可以从事件流重建。但不是每个 Event 都产生 Message：
 
@@ -245,7 +275,7 @@ Message 回答“对话里出现了什么”，Event 回答“运行过程中发
 
 这一区分让“模型看到的内容”和“观察者需要知道的事实”同时完整，而不互相污染。
 
-### 7.3 事件的时序身份
+### 7.4 事件的时序身份
 
 事件在写入 State 时统一获得：
 
@@ -268,7 +298,84 @@ State 是一次 Agent 运行携带的状态，但它不是一个随意覆盖字�
 
 默认 Agent 初始化会创建 State，并记录一条发给 Agent 的 `kind="task"` 消息。直接构造 State 不等于自动写入任务消息；自定义初始化者必须明确建立所需的初始 transcript。
 
-### 8.1 为什么追加而不是覆盖
+### 8.1 为什么 task 还要写成 Message
+
+默认初始化看起来把同一内容保存了两次：
+
+```python
+state = State(task="读取 README.md")
+state.send("task", "user", "writer", "读取 README.md")
+```
+
+它们不是互为缓存，而是回答不同问题：
+
+| 载体 | 回答的问题 | 是否进入模型上下文 | 当前直接用途 |
+| --- | --- | ---: | --- |
+| `State.task` | 这份 State 最初由什么运行输入创建？ | 否 | RunTrace 的任务字段和 Header 预览、组合 Trace 保留运行身份 |
+| `UserMessage(kind="task")` | transcript 中给模型看的任务要求是什么？ | 是 | MessageEvent、Snapshot、活跃上下文、ContextView、LLMRequest |
+
+数据流因此是两条支路：
+
+```text
+Agent.run(task)
+├── State.task
+│   └── 运行身份 / RunTrace task
+└── UserMessage(kind="task")
+    └── MessageEvent → Snapshot → ContextView → LLMRequest
+```
+
+上层 Workflow 的 `StepResult.task` 和 Goal Loop 的 `objective` 也会保存各自的编排输入，但它们通常从调用参数构造，并不意味着所有上层模块都必须回读 `State.task`。`State.task` 的稳定语义只是“这份 State 创建时的原始输入”；编排层可以拥有更具体的任务或目标字段。
+
+`resume(state, followup)` 更能说明区别：它不创建新 State，也不改写原始 `State.task`，只追加一条新的 `kind="task"` UserMessage。于是：
+
+```text
+State.task                    = "读取 README.md"
+transcript task Message #1   = "读取 README.md"
+transcript task Message #2   = "继续检查 StateSnapshot"
+```
+
+运行身份仍指向最初输入，而模型可以看到后来追加的任务要求。若只保留 `State.task`，模型路径拿不到初始任务；若只保留 task Message，运行级消费者就必须从一个可能含多个续接任务、经过路由和压缩的 transcript 中猜测“最初输入”。
+
+### 8.2 为什么 State(task=...) 不自动创建任务消息
+
+直接构造容器时，当前状态就是空 transcript：
+
+```python
+state = State(task="分析项目")
+
+assert state.task == "分析项目"
+assert state.events == []
+assert state.messages == []
+```
+
+这是刻意设计，不是初始化遗漏。通用 `State` 不知道任务应该发给哪个 Agent、`sender` 应该是 `user` 还是其他来源、是否要先注入 RuntimeMessage/Skills/context，甚至不知道这个自定义运行是否需要普通 task Message。初始化器才拥有这些运行语义：
+
+```text
+State(task=...)
+  → 创建运行事实容器
+
+Agent initializer
+  → 决定初始 transcript、消息顺序和路由
+```
+
+例如 Skills Agent 可以先注入菜单，再写入用户任务：
+
+```python
+def init_state(agent, task):
+    state = State(task=task)
+    state.send(
+        "system",
+        "runtime",
+        agent.name,
+        "Available skills: docs-sync, ...",
+    )
+    state.send("task", "user", agent.name, task)
+    return state
+```
+
+如果自定义 initializer 只返回 `State(task=task)`，核心 Runtime 不会替它补写 task Message；第一轮模型可能只能看到固定 system prompt，而看不到用户任务。这也是“默认 initializer 的方便行为”与“State 构造器的通用契约”必须分开的原因。
+
+### 8.3 为什么追加而不是覆盖
 
 追加式 State 能够回答：
 
@@ -281,7 +388,7 @@ State 是一次 Agent 运行携带的状态，但它不是一个随意覆盖字�
 
 如果压缩直接删除消息，或模型响应覆盖前一轮状态，这些问题都无法可靠回答。
 
-### 8.2 StateSnapshot 为什么存在
+### 8.4 StateSnapshot 为什么存在
 
 每次读取都从完整 Event Stream 回放，会让核心循环变得低效。StateSnapshot 因此缓存两项当前投影：
 
@@ -298,6 +405,27 @@ Snapshot 只响应会影响这两项投影的事件：
 ## 9. 完整历史、活跃上下文与模型可见上下文
 
 长周期系统必须把三种“历史”分开：
+
+这里的 `transcript` 可以理解为“对话消息记录”：通常由所有 `MessageEvent` 投影出的 `StateSnapshot.messages` / `State.messages` 组成，按消息追加顺序保存任务、Assistant 输出和工具结果。它不是完整的 Event Stream，因为 Agent 生命周期、模型请求、工具开始/结束和压缩事件不会自动变成对话消息。
+
+```text
+Event Stream = 完整运行账本
+Transcript   = 从 MessageEvent 提取的对话记录
+ContextView  = 本轮按压缩和可见性策略投影给模型的消息
+```
+
+例如：
+
+```text
+MessageEvent(task)                 ─┐
+AgentStartEvent                    │ 不进入 transcript
+ModelRequestEvent                  │
+MessageEvent(assistant + toolcall) ├─ transcript
+ToolExecutionStart/EndEvent        │ 不进入 transcript
+MessageEvent(tool_result)          ┘
+```
+
+因此，transcript 说明“对话中出现过什么”，ContextView 才说明“本轮模型实际被允许看到什么”。压缩会让旧消息退出活跃投影，可见性策略还可能过滤某些 kind；这些操作都不会删除完整 transcript。
 
 ```mermaid
 flowchart TB

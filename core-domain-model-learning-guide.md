@@ -1,4 +1,4 @@
-# Simple Long Horizon Agent 核心数据模型学习指南
+﻿# Simple Long Horizon Agent 核心数据模型学习指南
 
 > 本文回答一个核心问题：一次 Agent 运行中，系统认为哪些信息是事实，这些事实如何流转、保存，又如何被投影成模型本轮真正看到的请求。
 >
@@ -55,6 +55,65 @@ Use bash to run command: `printf 'hello-from-tool\n'`
 14 TurnEndEvent
 15 AgentEndEvent(reason="done")
 ```
+
+这里的 `0` 到 `15` 是事件追加到 `State.events` 后得到的顺序索引，不是事件类型编号。最前面的三条事件可以读成：
+
+```text
+MessageEvent(task)  → 默认 initializer 先建立初始 transcript
+AgentStartEvent     → 调用者开始消费惰性的 Runtime 事件流
+TurnStartEvent      → Agent 的第一轮模型决策即将开始
+```
+
+`AgentStart/AgentEnd` 包围整次运行；`TurnStart/TurnEnd` 包围其中一次“模型决策 + 可选工具处理”。第一轮产生工具调用并写入结果，第二轮模型才能读取该结果并生成 final，因此这个示例有一个 Agent run、两个 Turn 和两次主模型调用。生命周期字段的完整定义见 [`03-domain-model-and-data-flow.md`](docs/design/03-domain-model-and-data-flow.md#72-agentturn-与-model-call-是三种粒度)，对应的 Runtime 控制顺序与特殊停止情况见 [`04-agent-runtime.md`](docs/design/04-agent-runtime.md#41-为什么-task-message-排在-agentstart-前面)。
+
+### 1.1 `agent.run()` 到底怎样触发一次运行
+
+最小调用方式是：
+
+```python
+agent = Agent(name="writer", generate=generate)
+
+state, events = agent.run(
+    "读取 README.md 并总结主要内容",
+    max_turns=3,
+)
+
+# 迭代 events 才会拉动 Runtime。
+for event in events:
+    print(event)
+
+# 消费完后，从同一个 State 读取事实和 transcript。
+print(state.task)
+print(state.messages)
+print(state.events)
+```
+
+这段代码必须分成两个时刻理解：
+
+```text
+调用 agent.run(task)
+  → 选择默认或自定义 init_state
+  → 创建 State
+  → 写入初始 task Message（默认行为）
+  → 返回 (state, 惰性 events)
+
+消费 events
+  → AgentStartEvent
+  → TurnStartEvent
+  → ModelRequestEvent / 模型调用
+  → ModelResponseEvent / Assistant MessageEvent
+  → 可选 ToolExecution 与 tool_result MessageEvent
+  → AgentEndEvent
+```
+
+所以只写下面两行时，通常还没有发生模型调用：
+
+```python
+state, events = agent.run("读取 README.md")
+# events 尚未被消费，Runtime 还没有推进。
+```
+
+`for event in events` 和 `list(events)` 都会推进同一个生成器；前者适合实时打印或增量写 Trace，后者适合只关心最终 State。每个事件在 `yield` 前已经追加到 State，因此调用者不需要再维护第二份事件历史。这个“入口调用”和“事件消费”之间的边界，是理解 `AgentStartEvent` 为什么排在初始 `MessageEvent` 后面的关键。
 
 这个例子先暴露了整个数据链：
 
@@ -413,6 +472,50 @@ OpenAI Chat Wire:
 
 Provider Wire 条目数可以不同，但 `tool_call_id` 和结果顺序不能丢失。
 
+### 4.6 details：同一结果包里的本地详情
+
+工具执行得到的 `ToolResult` 不只有给模型看的 `content`，还可以携带不自动进入模型请求的 `details`：
+
+```text
+content  → ToolResultBlock → 下一轮模型
+details  → Message sidecar → Trace / Viewer / 本地模块
+```
+
+例如 Read 工具截断大文件时，模型需要看到已返回的内容和续读提示；本地观察层则可能需要结构化的文件路径、总行数和截断原因。Runtime 会使用调用 ID 把两者重新放进同一个结果包：
+
+```python
+UserMessage(
+    kind="tool_result",
+    content=(
+        ToolResultBlock(
+            tool_call_id="read_1",
+            tool_name="read",
+            content=(
+                TextBlock(
+                    "...前 200 行...\n\n"
+                    "[Showing lines 1-200 of 12000. "
+                    "Use offset=201 to continue.]"
+                ),
+            ),
+        ),
+    ),
+    sidecar={
+        "details": {
+            "read_1": {
+                "path": "large.log",
+                "total_lines": 12000,
+                "start_line": 1,
+                "truncation": {"truncated": True, "truncated_by": "lines"},
+            },
+        },
+    },
+)
+```
+
+为什么 `details` 下面还要有一层 `read_1`？因为一个结果消息可以同时包含 `read_1`、`search_1` 和 `task_1`，甚至可以包含两个同名 Read 调用。`tool_call_id` 是唯一能同时连接 ToolCall、ToolResultBlock 和本地 details 的因果身份；工具名、列表位置和并发完成顺序都不够可靠。
+
+需要特别区分：`details` 是“默认不让模型看”，不是“不会保存”或“可以放秘密”。Trace 和 Viewer 仍可能读取它。完整的数据流、并行示例和边界约束见 [`06-tools-and-integrations.md`](docs/design/06-tools-and-integrations.md#31-content-与-details-是两条不同通道)。
+
 ---
 
 ## 5. TokenUsage：一次模型调用的资源小票
@@ -517,7 +620,101 @@ usage=None
 
 但如果压缩已经将旧内容移出活跃视图，压缩前 AssistantMessage 的 usage 仍然包含那些已退出的内容。它就不能继续作为新视图的基线。系统需要退回逐消息估算，直到压缩后又产生一条新的可信 usage AssistantMessage。
 
-压缩前后的具体消息索引只在第 7 章完整演示，这里不重复。
+#### “新增工具结果约 250 Token”是怎样算出的
+
+工具本身不会报告“这条 ToolResult 占多少 Token”，Provider 也只会在下一次模型调用结束后报告整次请求 usage。因此，在新 ToolResult 已写入 State、下一次可信 usage 尚未返回的间隙，Runtime 使用字符启发式估算：
+
+```text
+estimated_tokens = ceil(estimated_model_visible_chars / 3.5)
+```
+
+假设新增结果为：
+
+```python
+UserMessage(
+    sender="tool",
+    target="writer",
+    kind="tool_result",
+    content=(
+        ToolResultBlock(
+            tool_call_id="call_1",
+            tool_name="bash",
+            content=(TextBlock("...840 个字符的命令输出..."),),
+        ),
+    ),
+)
+```
+
+当前估算器会计算模型可见正文及少量结构元数据：
+
+| 组成 | 字符数 |
+| --- | ---: |
+| ToolResultBlock 内部文本 | 840 |
+| role=`user` | 4 |
+| sender=`tool` | 4 |
+| target=`writer` | 6 |
+| kind=`tool_result` | 11 |
+| tool_call_id=`call_1` | 6 |
+| tool_name=`bash` | 4 |
+| 合计 | 875 |
+
+所以：
+
+```text
+ceil(875 / 3.5) = 250 Token
+```
+
+这里的 `250` 只属于这个模拟结果，不是每次工具调用的固定成本。输出越长、结果块越多，估算越大。一条消息包含多个 ToolResultBlock 时，会递归累计每个结果的模型可见文本或图片，并为每个结果增加 call id 和工具名长度。
+
+不参与估算的内容包括：
+
+- `ToolResult.details`；
+- Message `sidecar` 中的 details、raw、compression 等本地证据；
+- ToolExecution Event 和工具内部日志，除非它们另行成为模型可见 Message content。
+
+图片没有可直接使用的文本长度，当前每个 ImageBlock 按 `7373` 个等价字符保守估算，单张图片正文约为：
+
+```text
+ceil(7373 / 3.5) = 2107 Token
+```
+
+消息路由字段等少量元数据还会在此基础上增加几个 Token。
+
+#### 可靠基线与新增尾部怎样相加
+
+若最近一次可信调用报告：
+
+```text
+input_tokens = 600
+output_tokens = 100
+cache_read_tokens = 0
+cache_write_tokens = 0
+context_tokens = 700
+```
+
+随后新增上面的工具结果，下一次请求前估算为：
+
+```text
+当前上下文 ≈ 最近可信前缀 700 + 新增 ToolResult 250 = 950
+```
+
+这表示 `700` 已经覆盖到产生该 AssistantMessage 为止的整个请求及输出，系统只估算它后面的消息，不能再把旧 task、Assistant 输出重复相加。下一次 Provider 返回新 usage 后，`950` 会被新的调用级事实替代。
+
+压缩发生后则分两种阶段：
+
+```text
+压缩刚完成、尚无压缩后的可信 Assistant usage：
+  旧基线失效
+  task 80 + summary 180 + recent 120 + tool_result 300 ≈ 680
+
+压缩后已经完成一次模型调用并取得可信 context_tokens=700：
+  700 成为新前缀基线
+  再新增 ToolResult 250 → 700 + 250 ≈ 950
+```
+
+第一种情况是对当前活跃消息逐条估算；第二种情况是“Provider 基线 + 基线后的短尾部估算”。字符比例对中文、代码、JSON 和日志都可能有误差，所以这些数字只用于预算判断，并由 safety buffer 吸收偏差，不能当作精确计费数据。
+
+压缩前后的具体消息索引在第 7 章完整演示；稳定的估算契约见 [`07-context-and-long-horizon.md`](docs/design/07-context-and-long-horizon.md#31-新增工具结果怎样估算)。
 
 ---
 
@@ -592,6 +789,186 @@ State(task="...")
 
 不会自动生成任务 Message。默认 `Agent.run()` 的初始化器会显式记录 `kind="task"` 的 UserMessage；自定义初始化器必须自己建立所需 transcript。
 
+#### 为什么 task 还要再写成 Message
+
+看起来这里重复了两次：
+
+```python
+state = State(task="读取 README.md")
+state.send("task", "user", "writer", "读取 README.md")
+```
+
+但它们服务于不同的问题：
+
+```text
+State.task
+  回答：这份 State 最初是用什么运行输入创建的？
+  用于：运行身份、RunTrace task/Header、组合 Trace 等运行级读取
+
+UserMessage(kind="task")
+  回答：模型对话中应该看到什么任务要求？
+  进入：MessageEvent → Snapshot → active context
+       → ContextView → LLMRequest
+```
+
+可以把 `Agent.run(task)` 想成在初始化时分叉：
+
+```text
+task="读取 README.md"
+├── State.task
+│   └── 运行级原始输入，不自动进入模型
+└── UserMessage(kind="task")
+    └── transcript 中的模型可见任务锚点
+```
+
+这不是“一份是真相、另一份是缓存”。`State.task` 与 task Message 都是事实，只是事实粒度不同：前者属于整份运行，后者属于可回放对话。Snapshot 才是可以从 Event 重建的缓存。
+
+当前代码中，`run_trace_from_state()` 会直接读取 `state.task` 生成 RunTrace 的 task 字段；模型调用不会读取 `State.task`，而是沿 Message/ContextView 路径取得 task Message。Workflow 的 `StepResult.task` 与 Goal Loop 的 `objective` 通常由各自调用参数保存，不能笼统写成所有上层模块都直接读取 `State.task`。
+
+续接运行时差异更明显：
+
+```python
+state, events = agent.run("读取 README.md")
+# 消费 events 后：State.task 和第一条 task Message 都是原任务
+
+state, events = agent.resume(state, "继续检查 StateSnapshot")
+# State.task 不变，只新增第二条 kind="task" Message
+```
+
+最终形状是：
+
+```text
+State.task = "读取 README.md"
+
+transcript:
+0 UserMessage(kind="task", content="读取 README.md")
+...
+N UserMessage(kind="task", content="继续检查 StateSnapshot")
+```
+
+如果只保留 `State.task`，模型上下文中没有任务消息；如果只保留 task Message，RunTrace 等运行级消费者就要从可能包含多次 resume、路由和压缩的 transcript 中猜最初输入。完整契约见 [`03-domain-model-and-data-flow.md`](docs/design/03-domain-model-and-data-flow.md#81-为什么-task-还要写成-message)。
+
+### 6.3.1 为什么 State(task="...") 不自动创建任务消息
+
+直接写：
+
+```python
+state = State(task="分析项目")
+```
+
+此时：
+
+```python
+state.task == "分析项目"
+state.events == []
+state.messages == []
+```
+
+模型对话仍然是空的。因为 `State` 只是事实容器，它不知道任务应该发给哪个 Agent、由谁发送，也不知道是否要先加入 Skills 菜单、Runtime 说明或子 Agent context。由初始化器决定初始 transcript：
+
+```python
+def init_state(agent, task):
+    state = State(task=task)
+    state.send(
+        kind="system",
+        sender="runtime",
+        target=agent.name,
+        content="Available skills: docs-sync, ...",
+    )
+    state.send(
+        kind="task",
+        sender="user",
+        target=agent.name,
+        content=task,
+    )
+    return state
+```
+
+这个初始化结果的消息顺序是：
+
+```text
+RuntimeMessage(kind="system")  # 运行时指导
+UserMessage(kind="task")       # 模型真正要执行的任务
+```
+
+如果自定义 initializer 只返回 `State(task=task)`，Runtime 不会自动补写 task Message。除非这是一个明确不需要普通任务消息的特殊流程，否则模型第一轮可能只能收到固定 system prompt，看不到用户任务。记忆为：
+
+```text
+State 构造器      → 创建事实容器
+初始化器          → 决定初始 transcript
+ContextView/Bridge → 把 transcript 投影给模型
+```
+
+### 6.3.2 默认初始化器、自定义初始化器与 `resume()`
+
+`Agent.run()` 的初始化选择在一个地方完成：如果 Agent 配置了 `init_state`，就调用它；否则使用默认初始化器。默认实现可以近似写成：
+
+```python
+def _default_init_state(agent, task):
+    state = State(task=task)
+    state.send("task", "user", agent.name, task)
+    return state
+```
+
+这里的 `state.send(...)` 同时完成两件事：构造模型可见的 `UserMessage(kind="task")`，并通过 `MessageEvent` 把它追加到 State。`State(task=task)` 只保存运行级输入，不知道消息应该发给谁，也不知道是否需要先注入 Skills 或其他上下文。
+
+自定义 initializer 的类型约定是 `init_state(agent, task) -> State`。它必须返回一个已经符合本次运行需要的初始 State，例如：
+
+```python
+def init_state(agent, task):
+    state = State(task=task)
+    state.send(
+        kind="system",
+        sender="runtime",
+        target=agent.name,
+        content="可用能力：read_file、search、bash",
+    )
+    state.send(
+        kind="task",
+        sender="user",
+        target=agent.name,
+        content=task,
+    )
+    return state
+
+agent = Agent(
+    name="writer",
+    generate=generate,
+    init_state=init_state,
+)
+```
+
+因此，Skills Agent 并没有另一套隐藏循环；它只是通过 initializer 在 `agent.run(task)` 初始化阶段把菜单或技能正文写入普通 Message。相反，下面的 initializer 是不完整的：
+
+```python
+def incomplete_init(agent, task):
+    return State(task=task)
+```
+
+它返回的 State 中 `events` 和 `messages` 都为空，核心 Runtime 不会自动补写 task Message。除非流程明确不需要普通任务消息，否则模型第一轮可能只能看到固定 system prompt，看不到用户任务。
+
+运行完成后，`resume(state, followup)` 会复用原 State，而不是创建副本：
+
+```python
+state, events = agent.run("读取 README.md")
+for _ in events:
+    pass
+
+state, events = agent.resume(state, "继续检查 StateSnapshot")
+for _ in events:
+    pass
+```
+
+`resume()` 会追加一条新的 `UserMessage(kind="task")`，但不改写 `State.task`：
+
+```text
+State.task = "读取 README.md"
+transcript task #1 = "读取 README.md"
+transcript task #2 = "继续检查 StateSnapshot"
+```
+
+所以 `run()` 表示“从任务创建新 State 并开始一次运行”，`resume()` 表示“在同一事实账本上追加输入并继续运行”。恢复时应保持 Agent name 一致；跨进程恢复还需要调用者序列化并重建 State 与外部资源。
+
 ### 6.4 State 如何统一为事件盖章
 
 调用者创建 Event 时只提供领域字段。`State.record_event()` 负责：
@@ -665,7 +1042,19 @@ state.data["final_answer"] = "..."
 
 ## 7. 完整历史、活跃上下文与 ContextView
 
-### 7.1 三层投影各自回答什么
+### 7.1 `transcript` 是什么
+
+`transcript` 可以理解为 Agent 运行中的“对话记录”。它通常由 `MessageEvent` 投影得到，包含任务、Assistant 消息和工具结果：
+
+```text
+Event Stream = 完整运行账本
+Transcript   = MessageEvent 提取出的对话记录
+ContextView  = 本轮模型被允许看到的消息投影
+```
+
+例如，`AgentStartEvent`、`ModelRequestEvent`、`ToolExecutionStartEvent` 和 `ToolExecutionEndEvent` 都是运行事实，但不会自动成为 transcript；`MessageEvent(task)`、Assistant 的 ToolCall 消息和 ToolResult 消息才会进入对话记录。压缩或可见性过滤可能改变本轮 ContextView，却不会删除完整 transcript。
+
+### 7.2 三层投影各自回答什么
 
 ```text
 完整消息历史
@@ -683,7 +1072,7 @@ ContextView
 
 它们不是三份互相覆盖的历史，而是从完整事实逐层缩小的投影。
 
-### 7.2 用一组索引完整演示压缩
+### 7.3 用一组索引完整演示压缩
 
 假设完整消息历史为：
 
@@ -722,7 +1111,7 @@ active_context_indices      = [0, 6, 4, 5]
 
 旧消息 1、2、3 仍可供 Trace、Recall 和审计读取，但不再参与当前模型上下文。
 
-### 7.3 为什么活跃索引不一定递增
+### 7.4 为什么活跃索引不一定递增
 
 消息 6 在物理上最后追加，所以拥有高索引；但它在语义上替代消息 1、2、3，所以被插回消息 4 之前：
 
@@ -741,7 +1130,7 @@ active_context_indices = None
 
 它的意思不是“没有活跃消息”，而是“尚未压缩，所有 messages 默认活跃”。
 
-### 7.4 ContextView 只做可见性投影
+### 7.5 ContextView 只做可见性投影
 
 假设活跃上下文后来又追加了一条：
 
@@ -798,7 +1187,7 @@ ContextView.visible_messages = 4
 
 因此，把 `total_messages` 称为“压缩前的全部消息数”不准确。正确语义是“压缩后、可见性过滤前的活跃消息数”。
 
-### 7.5 压缩与隐藏不能混用
+### 7.6 压缩与隐藏不能混用
 
 | 机制 | 回答的问题 | 对历史的影响 |
 | --- | --- | --- |
@@ -809,7 +1198,89 @@ ContextView.visible_messages = 4
 
 当前压缩 Runtime 在把消息交给压缩策略前，也会排除 `model_invisible_kinds`。这是一个执行细节，不改变两者的语义边界：一个管上下文大小，一个管模型可见性。
 
-### 7.6 压缩策略只做决定，公共 Runtime 负责安全执行
+#### 用同一组索引区分两种机制
+
+假设运行中追加了以下消息：
+
+```text
+0 task: 请分析项目
+1 assistant step: 请求读取 README
+2 tool_result: README 内容
+3 assistant step: 请求读取 architecture.md
+4 tool_result: architecture.md 内容
+5 assistant message: 当前阶段总结
+6 user message: 继续分析最新部分
+```
+
+如果上下文超出预算，Compression 可以追加一条摘要 7，并将活跃视图重指向：
+
+```text
+完整 messages          = [0, 1, 2, 3, 4, 5, 6, 7]
+active_context_indices = [0, 7, 6]
+```
+
+消息 1～5 没有被删除，仍可被 Trace、Recall 和审计读取；它们只是退出了当前活跃上下文。摘要 7 是新的 MessageEvent，压缩动作还会由 ContextCompressionEvent 记录。
+
+如果不压缩，只配置可见性：
+
+```python
+ContextPolicy(model_invisible_kinds=("task",))
+```
+
+State 中仍然是同一组 `messages` 和 `active_context_indices`，但 ContextView 在构建本轮请求时过滤掉索引 0：
+
+```text
+模型实际看到 = [7 summary, 6 recent message]
+```
+
+此操作不会删除 task，不会改变活跃索引，不会生成摘要，也不会追加 ContextCompressionEvent。它只是让 task 不进入本次 LLMRequest。
+
+因此两个配置的含义必须分开：
+
+```text
+preserve_kinds=("task", "system", "summary", "context")
+  → 压缩时不要把这些 kind 替代掉
+
+model_invisible_kinds=("task",)
+  → 构建本轮模型输入时不要发送这些 kind
+```
+
+前者不保证消息一定对模型可见，后者也不表示消息受到压缩保护。当前实现的顺序是：压缩 Runtime 先从活跃消息中排除不可见 kind，再把剩余候选交给策略；这是执行顺序，不是把两种策略合并成一个概念。
+
+#### 什么时候会故意隐藏 `task`
+
+普通用户任务不应隐藏。默认的 `model_invisible_kinds` 是空元组，因此默认 `task` 会进入模型上下文。只有当 `task` 不是模型真正要执行的指令，或调用者明确进行可见性实验时，才可能配置：
+
+```python
+ContextPolicy(model_invisible_kinds=("task",))
+```
+
+常见例外包括：
+
+| 场景 | 被隐藏的内容 | 目的 |
+| --- | --- | --- |
+| 运行元数据 | 评测编号、内部路径、调度标签 | 保留运行身份，但不把内部标签暴露给模型 |
+| 子 Agent 委派 | 父 Agent 的宽泛总任务 | 让子 Agent 只处理明确的子任务 |
+| 可见性实验 | 原始 task Message | 测试模型是否依赖该消息 |
+| 特殊 Workflow/facade | 外层编排目标 | 只向模型提供当前阶段的 context 和任务 |
+
+例如：
+
+```text
+State.task = "评测 case-17：参考答案位于私有目录"
+
+RuntimeMessage(kind="context")
+  请分析工作区中的测试失败。
+
+UserMessage(kind="message")
+  找出失败原因并提出修复方案。
+```
+
+此时隐藏原始 `task` 可能是有意的，但更清晰的设计是：在初始化阶段就把运行级元数据和模型任务分开，而不是把完整内部内容写入 task Message 后再用 Visibility 遮住。子 Agent 同样应优先使用“独立 State + 正确子任务”，而不是复制父任务后再隐藏。
+
+还要注意：`model_invisible_kinds` 不是安全删除或访问控制。被隐藏的消息仍保存在 State、Trace 和可能的 Viewer 中；如果内容敏感，仍需在上游脱敏并限制轨迹访问。
+
+### 7.7 压缩策略只做决定，公共 Runtime 负责安全执行
 
 前面的索引例子只展示了“压缩之后发生什么”，还没有回答“摘要是谁写的”。项目把这两个问题分开：
 
@@ -851,7 +1322,7 @@ CompressionDecision(
 
 前三种最终都产生 CompressionDecision；TieredStrategy 自己不写摘要，只负责选择本次检查采用哪个阶段。
 
-### 7.7 用同一组消息比较三种摘要策略
+### 7.8 用同一组消息比较三种摘要策略
 
 为了覆盖多个工具交换，把 7.2 的 README 任务继续运行到下面的活跃历史：
 
@@ -1024,7 +1495,157 @@ Next:
 }
 ```
 
-所以摘要正文服务于主 Agent 的工作连续性；Trace Event 和 sidecar 服务于压缩过程的审计。
+把这几类信息放回实际对象中，可以更清楚地看到各自边界。当前 SummarizeStrategy 的 replacement 是 `UserMessage`，不是 `RuntimeMessage`：
+
+```python
+UserMessage(
+    kind="summary",
+    sender="runtime",
+    target="writer",
+    content=(
+        TextBlock(
+            "[This session continues ...]\n\n"
+            "此前已确认 State.events 是事实来源；"
+            "下一步检查 ContextView。\n\n"
+        ),
+    ),
+    sidecar={
+        "compression": {
+            "compressor": "compressor",
+            "model": "compressor-model",
+            "usage": {
+                "input_tokens": 8000,
+                "output_tokens": 300,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+            },
+        },
+        "raw": {"request": {...}, "response": {...}},
+    },
+)
+```
+
+可以按三个问题记忆：
+
+```text
+摘要写了什么、下一轮模型读什么
+  → summary Message.content
+
+谁调用了压缩模型、实际模型和 usage 是什么
+  → ModelRequestEvent / ModelResponseEvent
+  → summary sidecar.compression 和 raw 保留就近调试证据
+
+哪些消息退出活跃视图、摘要插到哪里
+  → ContextCompressionEvent
+```
+
+对应的压缩动作可能是：
+
+```python
+ContextCompressionEvent(
+    agent="writer",
+    compressed_message_indices=[1, 2, 3, 4],
+    summary_message_index=8,
+    active_context_indices=[0, 8, 5, 6, 7],
+    before_tokens=9000,
+    after_tokens=1600,
+    strategy="summarize",
+    start_elapsed=12.4,
+)
+```
+
+它表达索引替换和大小变化，不重复摘要正文。成本聚合使用 compressor 的 `ModelResponseEvent`，不能因为 sidecar 也保存 usage 就把同一次调用计算两遍。真实事件顺序是：
+
+```text
+ModelRequestEvent(compressor)
+  → ModelResponseEvent(compressor)
+  → MessageEvent(summary)
+  → ContextCompressionEvent
+```
+
+##### 谁生成摘要，谁应用压缩
+
+这里最容易混淆的是：`compressor` 生成了摘要文本，但它没有独立完成整个压缩动作。四个角色的边界是：
+
+```text
+compressor Agent / Provider
+  → 理解旧消息，生成“摘要写了什么”
+
+SummarizeStrategy
+  → 选择“压缩哪些消息”
+  → 准备 compressor 请求
+  → 构造 CompressionDecision
+
+compression.runtime
+  → 执行 decision
+  → 追加摘要 MessageEvent
+  → 更新 active_context_indices
+  → 生成 ContextCompressionEvent
+
+State
+  → 追加全部 Event
+  → 统一补 index、elapsed、UUID
+```
+
+实际调用链是：
+
+```text
+core.run()
+  → maybe_compress_context()
+  → SummarizeStrategy
+  → compressor.generate(compressor_messages)
+  → CompressionDecision
+  → _apply_decision()
+  → State.events / StateSnapshot
+```
+
+假设压缩前活跃消息是：
+
+```text
+[0 task, 1 old call, 2 old result, 3 old call,
+ 4 old result, 5 old note, 6 recent, 7 recent]
+```
+
+默认保护 `task/system/summary/context`，保留最近两条普通消息后，Strategy 可能选择：
+
+```text
+compress_indices = [1, 2, 3, 4, 5]
+```
+
+它把这些消息和一条“请整理 Goal、Done、State、Facts、Open、Next”的指令交给 compressor。模型返回摘要文本后，Strategy 构造：
+
+```python
+CompressionDecision(
+    compress_indices=(1, 2, 3, 4, 5),
+    replacement=summary_message,
+    label="summarize",
+    trace_events=(request_event, response_event),
+)
+```
+
+此时 `replacement`、`trace_events` 和 `CompressionDecision` 仍只是内存中的对象，还没有进入主 State。Runtime 应用它时才按以下顺序追加：
+
+```text
+1. ModelRequestEvent(agent="compressor")
+2. ModelResponseEvent(agent="compressor", usage=...)
+3. MessageEvent(UserMessage(kind="summary"))
+4. ContextCompressionEvent(agent="writer", strategy="summarize")
+```
+
+因此需要区分：
+
+| 事实 | 对象构造者 | 正式写入者 |
+| --- | --- | --- |
+| compressor 请求/响应事件 | `SummarizeStrategy` | `_apply_decision()` |
+| 摘要消息事件 | `_apply_decision()` | `_apply_decision()` |
+| 活跃索引变化事件 | `_apply_decision()` | `_apply_decision()` |
+| index、elapsed、UUID | 调用者不决定 | `State.record_event_at()` |
+
+`ContextCompressionEvent` 不能由 compressor 生成：compressor 不知道主 State 当前的活跃索引、摘要应插入的位置、压缩前后 Token，也不知道这次动作属于哪个主 Agent。
+
+当前压缩器调用的是 `self.compressor.generate(...)`，不是 `run(compressor, compressor_state)`。所以它不会产生独立的 `AgentStartEvent`、`TurnStartEvent`、工具生命周期或 `AgentEndEvent`，只记录这次内部模型访问对应的 ModelRequest/Response Event。Trace 可以把这些事件派生为 compression Span，但 Span 仍是观察视图，不能反过来修改 Runtime。
+
+如果把 `summary`、`compressed_indices`、`active_indices` 和 `should_apply` 全塞进 sidecar，正常 Runtime 就必须从附加字典恢复控制语义，sidecar 会成为第二套 Message/Event 协议。简化判断是：模型可见摘要进 `content`，运行投影变化进 Event，非正文的局部生成证据才进 sidecar。更完整的契约和非模型压缩对照见 [`07-context-and-long-horizon.md`](docs/design/07-context-and-long-horizon.md#52-模型摘要的三层事实)。
 
 #### 7.7.3 AgentCompactStrategy：主 Agent 主动提交阶段摘要
 
@@ -1048,6 +1669,8 @@ compact(
 11 UserMessage(tool_result + compact_request details)
 ```
 
+这里的 10、11 是 Message 索引，不是 Event 索引。一次 compact 工具调用还会产生 `ToolExecutionStartEvent`、`ToolExecutionEndEvent` 等执行事件，但它们不会投影到 `state.messages`，因此不占用 Message 索引。
+
 compact 工具执行时不会立即改变 State，只在 ToolResult details 中写入申请：
 
 ```python
@@ -1058,6 +1681,18 @@ compact 工具执行时不会立即改变 State，只在 ToolResult details 中�
     }
 }
 ```
+
+完整的当前回合仍然是一次普通工具交互：
+
+```text
+AssistantMessage(kind="step", ToolCallBlock(name="compact"))
+  → ToolExecutionStartEvent
+  → ToolExecutionEndEvent
+  → UserMessage(kind="tool_result")
+       sidecar.details[call_id].compact_request = {...}
+```
+
+工具在调度线程中执行，不能直接修改共享 State。若它完成后立即压缩，而同一回合的其他并行工具仍未返回，就可能把 ToolCall 与 ToolResult 拆开，或让一组工具结果跨越压缩边界。因此它只提交申请，结果包写入完成后再等待下一轮的统一安全点。
 
 下一轮开始时，AgentCompactStrategy 才读取这项申请。默认保护消息 0，并保留最近两个非保护消息 10、11，因此它可以用主 Agent 的摘要折叠消息 1～9：
 
@@ -1073,9 +1708,16 @@ compact 工具执行时不会立即改变 State，只在 ToolResult details 中�
 [0, 12, 10, 11]
 ```
 
-这表示：旧工作由主 Agent 自己写的 working memory 替代，而 compact 调用和确认结果暂时保留原文。
+完整历史和活跃上下文分别是：
 
-### 7.8 为什么 Agent compact 要等到下一轮开始
+```text
+完整 messages          = [0, 1, 2, ..., 10, 11, 12]
+active_context_indices = [0, 12, 10, 11]
+```
+
+这表示：旧工作由主 Agent 自己写的 working memory 替代，而 compact 调用和确认结果暂时保留原文。摘要 12 最后追加，所以物理索引最高；但它在逻辑上替代消息 1～9，因此被插回消息 10、11 前面。Message index 回答“什么时候写入完整历史”，active context 顺序回答“模型应该按什么顺序阅读”。
+
+### 7.9 为什么 Agent compact 要等到下一轮开始
 
 compact 工具只提交请求，真正压缩仍发生在统一的模型请求前阶段：
 
@@ -1096,7 +1738,7 @@ compact 工具只提交请求，真正压缩仍发生在统一的模型请求前
 
 如果 compact 工具在执行中途直接修改 State，一轮中的其他并行工具可能仍未完成，容易导致工具调用/结果被拆开、Snapshot 在回合中途改变，或者压缩绕过统一 Event 记录。请求与执行分离保证所有压缩都位于同一个安全边界。
 
-### 7.9 high-water mark 如何保证 compact 请求只应用一次
+### 7.10 high-water mark 如何保证 compact 请求只应用一次
 
 上例中 compact 请求位于消息 11。下一轮开始时：
 
@@ -1123,7 +1765,30 @@ max(active_indices) = 12
 
 如果下一轮没有足够旧消息可折叠，策略本轮返回 no-op；一旦模型随后产生更新的消息，compact 请求也不再是最高索引，因此不会在很久以后用一份陈旧摘要去压缩后来才产生的历史。
 
-### 7.10 TieredStrategy：每次检查采用首个可执行阶段
+例如请求 11 本轮无法折叠，之后主 Agent 又追加消息 13：
+
+```text
+request_index = 11
+max(active_indices) = 13
+```
+
+请求 11 从此失效，而不是排队等待以后执行。Agent compact 的语义因此是“立即下一轮尝试；成功则只消费一次；无法执行则丢弃”，避免在旧状态下写出的摘要覆盖后来出现的新事实。
+
+最后与 `SummarizeStrategy` 对照：
+
+```text
+SummarizeStrategy
+  旧消息 → compressor 模型 → ModelRequest/Response Event
+  → summary Message → ContextCompressionEvent
+
+AgentCompactStrategy
+  主 Agent 的 compact 参数 → ToolResult.details.compact_request
+  → 下一轮 Strategy → summary Message → ContextCompressionEvent
+```
+
+两者最终都由 `compression.runtime` 应用 `CompressionDecision`，并由 State 盖章保存；区别只在摘要文本的来源以及是否增加一次 compressor 模型调用。
+
+### 7.11 TieredStrategy：每次检查采用首个可执行阶段
 
 ContextPolicy 只持有一个 strategy：
 
@@ -1179,7 +1844,92 @@ TieredStrategy(
 
 例如 SummarizeStrategy 可能因为受保护的 task 将候选内容分成不同连续区间，从同一个阶段返回多个决定。这不等于 TieredStrategy 在同一次检查中同时执行 ToolCompact 和 Summarize。
 
-### 7.11 如何选择策略
+#### 用 5200 Token 的运行区分 Stage 与 Decision
+
+假设第 N 轮请求前：
+
+```text
+active context ≈ 5200 tokens
+
+0 task
+1 assistant read call
+2 read result
+3 assistant search call
+4 search result
+5 普通分析
+6 recent
+7 recent
+```
+
+按优先级检查：
+
+```text
+AgentCompact
+  → 没有最新 compact_request
+  → 返回空，继续
+
+ToolCompact
+  → 5200 > 4000，且存在旧工具交换 1～4
+  → 返回 CompressionDecision(label="tool-compact")
+  → TieredStrategy 停止
+
+Summarize
+  → 本次不会调用
+```
+
+Runtime 应用 ToolCompact 后，即使当前估算仍有 4300 Token，也会进入第 N 轮模型请求：
+
+```text
+MessageEvent(tool summary)
+  → ContextCompressionEvent(strategy="tool-compact")
+  → build_context_view()
+  → ModelRequestEvent
+```
+
+第 N+1 轮开始前才重新从第一个阶段检查。若 AgentCompact 仍无申请，ToolCompact 已没有旧工具对，而上下文仍超过 4000，Summarize 才会命中并调用 compressor。因此“先廉价折叠，再模型摘要”通常是逐轮降级，不是在同一次检查中把所有算法执行一遍。
+
+这种单阶段选择有三个直接效果：一次请求前不会突然进行多种昂贵操作；每次上下文变化更容易预测；Trace 能清楚归因本轮采用的压缩机制。代价是一次压缩不保证立即降到阈值以下。
+
+同一阶段返回多个 Decision 是另一件事。假设受保护的 task 把旧消息分隔开：
+
+```text
+0 old A
+1 old B
+2 task（受保护）
+3 old C
+4 old D
+5 recent E
+6 recent F
+```
+
+SummarizeStrategy 可以一次返回：
+
+```text
+Decision A: compress [0, 1] → summary 7
+Decision B: compress [3, 4] → summary 8
+```
+
+Runtime 在同一次检查中依次应用 A、B，最终活跃顺序可能是：
+
+```text
+[7, 2, 8, 5, 6]
+```
+
+它没有在 A 与 B 之间重新从 AgentCompact 或 ToolCompact 开始选择。完整心智模型是：
+
+```text
+每轮请求前
+  → TieredStrategy 按顺序选择首个非空 Stage
+  → 停止检查后续 Stage
+  → Runtime 依次应用该 Stage 返回的全部 Decision
+  → 追加 replacement Message 和 ContextCompressionEvent
+  → 构建 ContextView
+  → 调用主模型
+```
+
+一句话：TieredStrategy 决定“本轮采用哪一种压缩方法”；CompressionDecision 决定“这种方法具体替换哪些消息”。
+
+### 7.12 如何选择策略
 
 | 主要问题 | 建议策略 | 取舍 |
 | --- | --- | --- |
@@ -1238,6 +1988,89 @@ LLMMessage(
 
 `sender`、`target` 和 `kind` 被移除，因为 Provider 不需要理解谁是 `writer`、target 是否为 `all`、或 kind 是否为 `summary`。
 
+#### 工具声明和执行为什么必须分开
+
+假设 Runtime 注册了一个可执行工具：
+
+```python
+AgentTool(
+    name="read",
+    description="读取指定文件",
+    parameters={
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"],
+    },
+    execute=read_file,
+    execution_mode="parallel",
+    timeout_seconds=30,
+)
+```
+
+它混合了两种信息：
+
+```text
+模型需要知道：name、description、parameters
+  → 有什么工具、工具做什么、应该传什么参数
+
+Runtime 才需要：execute、execution_mode、timeout_seconds
+  → 调哪个本地函数、是否并行、单次等待多久
+```
+
+Bridge 投影给模型时只保留声明：
+
+```python
+LLMTool(
+    name="read",
+    description="读取指定文件",
+    parameters={
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"],
+    },
+)
+```
+
+`execute` 是本地 Python callable，不能序列化进 HTTP，也不是 Provider 的权限。模型只能产生：
+
+```python
+ToolCallBlock(
+    id="call-1",
+    name="read",
+    arguments={"path": "README.md"},
+)
+```
+
+随后 Runtime 在本地注册表中按 `name` 查找 `AgentTool`，调用其 `execute`，再把结果包装成 `ToolResultBlock(tool_call_id="call-1")`。所以：
+
+```text
+LLMTool
+  = 告诉模型“可以请求什么”
+
+AgentTool.execute
+  = Runtime 决定“请求如何在本地执行”
+```
+
+#### LLMRequest 和 Provider Wire 的完整边界
+
+Runtime 先形成统一请求，仍不包含某家 SDK 的实际 JSON：
+
+```python
+LLMRequest(
+    provider=provider,
+    system_prompt="你是代码架构分析助手。",
+    messages=[LLMMessage(role="user", content=(TextBlock("请分析 README.md"),))],
+    tools=[read_llm_tool],
+    reasoning="high",
+    timeout_seconds=600,
+    extra={},
+)
+```
+
+Adapter 再翻译差异：同一工具参数 Schema 在 OpenAI Chat Wire 中通常位于 `function.parameters`，在 Anthropic Messages Wire 中位于 `input_schema`；固定 system prompt 可以成为首条 system message，也可以是顶层 `system` 字段；`reasoning="high"` 则翻译为各 Provider 自己的 reasoning/thinking 配置。
+
+响应方向也先统一再执行：OpenAI `tool_calls[].function` 和 Anthropic `content[].type="tool_use"` 都规范化为同一个 `ToolCallBlock`。Provider 从始至终只收到工具声明，不会拿到本地 `execute`；工具执行权始终留在 Runtime。
+
 如果 Message.sidecar 包含：
 
 ```python
@@ -1252,6 +2085,67 @@ LLMMessage(
 ```
 
 Bridge 只会把 `sidecar["extra"]` 提升到 `LLMMessage.extra`。`details` 和 `raw` 不会整包发给 Provider。Anthropic Adapter 可以识别自己的 namespaced hint 并转换为 `cache_control`；OpenAI Adapter 可以忽略它不认识的 Anthropic hint。
+
+### 8.3 缓存锚点：给 Provider 的可复用前缀提示
+
+长任务中，每次模型请求经常重复携带一段稳定历史：
+
+```text
+system prompt + task + 已完成的代码分析 + 新增内容
+                            ↑
+                       稳定前缀
+```
+
+运行时可以在某条 `LLMMessage` 上携带供应商命名空间提示：
+
+```python
+LLMMessage(
+    role="assistant",
+    content="前面的代码分析已经完成……",
+    extra={"anthropic.cache_breakpoint": True},
+)
+```
+
+它不是模型需要理解的文本，也不是 State 中新增的 Message。数据流是：
+
+```text
+Message.sidecar["extra"]
+    → Bridge 提升为 LLMMessage.extra
+    → Anthropic Adapter 读取自己的命名空间
+    → 最后一个 wire block 增加 cache_control
+```
+
+Anthropic 侧可能得到：
+
+```json
+{
+  "type": "text",
+  "text": "前面的代码分析已经完成……",
+  "cache_control": {"type": "ephemeral"}
+}
+```
+
+含义是“允许 Provider 把这里作为临时 Prompt Cache 边界”。例如：
+
+```text
+请求 1：system + task + 历史分析
+请求 2：system + task + 历史分析 + 新工具结果
+请求 3：system + task + 历史分析 + 新工具结果 + 新问题
+```
+
+如果 Provider 支持并实际命中，后续请求可能复用 `历史分析` 之前的输入，减少重复处理、延迟或成本。这里的“可能”很重要：锚点是请求提示，不是命中保证；缓存的写入、读取、过期和计费由 Provider 决定，项目只能从规范化的 `cache_write_tokens` 和 `cache_read_tokens` 判断发生了什么。
+
+换成 OpenAI Adapter 时，`anthropic.cache_breakpoint` 通常被忽略，正文仍然发送，只是不生成 Anthropic 的 `cache_control`。因此它体现的是“核心协议统一、供应商差异下沉 Adapter”，而不是把 Anthropic 字段扩散到所有 Provider。
+
+缓存锚点也不等于：
+
+```text
+Prompt Cache   = Provider 临时复用输入前缀
+Compression    = Runtime 改变活跃上下文索引
+Memory        = 跨请求或跨运行保存和取回信息
+```
+
+是否真的落到 wire，要看 Trace 的 raw request；是否真的产生缓存读写，要看 AssistantMessage/ModelResponse 中的 TokenUsage。仅看到 `extra` 不能声称已经节省了 Token。
 
 工具也会从可执行 Runtime Tool 降级为纯数据 LLMTool：
 
@@ -1297,7 +2191,7 @@ Anthropic:
 
 但普通模型调用默认 `with_header=False`，不会把 Runtime 路由元数据偷偷拼进模型正文。
 
-### 8.3 响应方向：从 Provider 回到 State
+### 8.4 响应方向：从 Provider 回到 State
 
 假设 Provider 返回了思考、文本和 Bash 调用。Adapter 先转换为统一内容：
 
@@ -1339,6 +2233,72 @@ LLMResponse(
 
 `LLMResponse.content` 是规范化模型输出的事实来源。`response.text`、`response.thinking_blocks` 和 `response.tool_calls` 都是从同一个有序 content 序列中导出的便利视图，不是三份独立状态。
 
+#### 8.4.1 为什么要有 `LLMResponse`
+
+OpenAI Chat、OpenAI Responses 和 Anthropic Messages 对同一件事使用不同的
+字段和嵌套结构。例如，一个 Provider 把工具调用放在
+`choices[].message.tool_calls`，另一个放在 `content[].type="tool_use"`。
+如果 `core.py` 直接读取这些 SDK 对象，主循环就必须不断判断“当前是哪一家
+Provider”，工具调度、停止判断和 Trace 也会被供应商格式污染。
+
+Adapter 的边界职责是：
+
+```text
+Provider raw response
+  → Adapter 解析、规范化
+  → LLMResponse
+  → Bridge 转成 AssistantMessage
+  → Runtime 记录 Event 并更新 State
+```
+
+因此，Runtime 只依赖项目自己的 `ContentBlock`、`StopReason`、`TokenUsage`
+和模型标识；Provider 专用字段留在 Adapter 或 `raw` 中。换 Provider 时，
+变化集中在 Adapter，不需要重写 Agent 循环。
+
+#### 8.4.2 `content` 为什么是唯一事实来源
+
+`content` 是一个有顺序的 `ContentBlock` 元组，而不是把文本、思考和工具调用
+分别存放的三个字段：
+
+```python
+response.content == (
+    ThinkingBlock(text="先确认文件位置"),
+    TextBlock(text="我先读取 README。"),
+    ToolCallBlock(
+        id="call-1",
+        name="read",
+        arguments={"path": "README.md"},
+    ),
+)
+```
+
+从它派生出的便利属性只是查询：
+
+```text
+response.text             → 拼接/提取 TextBlock
+response.thinking_blocks  → 筛选 ThinkingBlock
+response.tool_calls       → 筛选 ToolCallBlock
+```
+
+保留顺序很重要：模型可能先产生思考，再说明意图，随后请求工具；如果只保留
+三个互相独立的列表，就无法准确重放、审计或构建下一轮请求。任何需要判断
+“模型是否请求工具”的 Runtime 逻辑，都应读取规范化的 `content`（或其派生
+查询），而不是读取某个 OpenAI/Anthropic 原始对象。
+
+#### 8.4.3 其他响应字段各自回答什么
+
+| 字段 | 它回答的问题 | 主要用途 |
+| --- | --- | --- |
+| `stop_reason` | Provider 为什么结束这次生成？ | Bridge 判断继续执行工具还是结束本轮 |
+| `usage` | 本次调用报告了多少输入、输出及缓存 Token？ | `ModelResponseEvent`、成本和上下文分析 |
+| `model` | 实际为本次响应服务的模型标识是什么？ | Trace、价格匹配和版本复盘 |
+| `raw` | 实际发出的 Wire 请求和 Provider 原始响应是什么？ | Wire Debug 和 Adapter 排查 |
+
+`model` 优先使用 Provider 返回的实际标识；请求使用别名时，响应可能返回带
+日期或版本的服务标识。`usage` 中缓存读写 Token 要与普通输入 Token 分开，
+避免重复计数。若 Provider 没有提供 usage，运行时应保留“未知”，不能把缺失
+数据伪装成精确的零消耗。
+
 Bridge 再补回 Runtime 语义：
 
 ```text
@@ -1376,9 +2336,22 @@ MessageEvent(AssistantMessage)
   → 这条消息正式进入 transcript
 ```
 
-### 8.4 当前“流式汇总”的准确理解
+### 8.5 当前“流式汇总”的准确理解
 
-LLM 访问层暴露统一 StreamEvent 协议，事件流最后必须产生：
+LLM 访问层暴露统一 `StreamEvent` 协议。当前源码中真实存在的
+`StreamEvent.kind` 包括：
+
+| kind | 作用 |
+| --- | --- |
+| `text_delta` | 一段新增普通文本 |
+| `thinking_delta` | 一段新增思考内容 |
+| `tool_call_start` | 工具调用开始，参数可以暂时为空 |
+| `tool_call_delta` | 某个调用的 JSON 参数增量 |
+| `tool_call_complete` | 参数已完整解析的工具调用 |
+| `usage_update` | 本次调用的 Token 使用量更新 |
+| `done` | 携带最终 `LLMResponse`，必须是最后一个事件 |
+
+事件流最后必须产生：
 
 ```python
 StreamEvent(
@@ -1388,6 +2361,28 @@ StreamEvent(
 ```
 
 `complete()` 消费这个事件流并返回最终 LLMResponse。
+
+如果是一个真正逐片到达的 Provider 流，Adapter 内部可以按以下规则汇总：
+
+```text
+text_delta("我先") + text_delta("读取 README")
+  → TextBlock("我先读取 README")
+
+thinking_delta("需要先") + thinking_delta("读取文件")
+  → ThinkingBlock("需要先读取文件")
+
+tool_call_start(call-1)
+  + tool_call_delta('{"path":')
+  + tool_call_delta('"README.md"}')
+  → tool_call_complete(call-1)
+  → ToolCallBlock(arguments={"path": "README.md"})
+```
+
+实现上需要按工具 `id` 保存参数增量；收到 complete 时再解析 JSON，并把最终
+的有序 blocks、stop reason、usage、model 和 raw 组成一个 `LLMResponse`。
+不过，调用者不应自己从 delta 猜一个“第二份响应”：项目协议规定
+`done.payload["response"]` 已经是 Adapter 组装好的最终结果，`complete()` 只
+消费到 `done` 并返回它；没有合法 `done` 就应报错。
 
 但当前 OpenAI Chat、Anthropic 等真实 Adapter 的具体实现是：
 
@@ -1405,7 +2400,30 @@ StreamEvent(
 
 不应把当前实现描述成“已经逐个消费所有 Provider 网络流片段”。
 
-### 8.5 raw 是边界证据，不是核心协议
+当前真实 OpenAI Chat、OpenAI Responses 和 Anthropic Adapter 主要执行阻塞式
+SDK 调用：先拿到完整响应，再由公共 `emit_response()` 将完整 Block 回放成
+统一事件。通常一个完整 `TextBlock` 对应一次 `text_delta`，一个完整
+`ToolCallBlock` 对应 `tool_call_start` 后紧接 `tool_call_complete`；
+`tool_call_delta` 虽在协议中存在，但这些 Adapter 已经拿到完整参数时不一定
+会产生它。Fake Adapter 则可通过 `extra["chunk_size"]` 把文本拆成多个
+`text_delta`，用于测试消费流的代码。
+
+还要区分两层事件：
+
+```text
+StreamEvent                 # LLM 访问层的过程协议，通常不进入 State.events
+  → done(LLMResponse)
+  → AssistantMessage
+  → ModelResponseEvent
+  → MessageEvent
+  → State.events / State.messages
+```
+
+所以 StreamEvent 适合实时 UI 或模型访问层观察；`LLMResponse` 是完整响应；
+`AssistantMessage` 才是 Runtime transcript 中的消息；主 State 的事实仍由
+`ModelResponseEvent` 和 `MessageEvent` 保存。
+
+### 8.6 raw 是边界证据，不是核心协议
 
 `LLMResponse.raw` 通常包含：
 
@@ -1444,374 +2462,502 @@ Provider 调试  → raw
 
 当前 Bridge 对 OpenAI Responses 还有一个受控特例：它会从 raw response 中提取下一轮推理连续性需要的 Provider 元数据，放入 namespaced `extra`。这不意味着 raw 变成通用运行协议；它仍然是一个边界层明确控制的 Provider 特例。
 
+#### 8.6.1 SDK、Wire、raw 和 LLMResponse 的四层区别
+
+SDK 是 Provider 提供的 Software Development Kit，也就是帮你发 HTTP 请求、做
+认证、编码参数并解析响应的客户端库：
+
+```python
+client = OpenAI(api_key="...")
+sdk_response = client.responses.create(model="...", input=[...])
+```
+
+`sdk_response` 是 Provider SDK 的专用 Python 对象，不是项目的 `LLMResponse`。
+四层对象可以这样记：
+
+```text
+Provider HTTP JSON       # 网络边界上的真实字段
+Provider SDK 对象        # SDK 对 JSON 的 Python 包装
+LLMResponse              # Adapter 产出的项目统一运行协议
+raw 快照                 # Adapter 保存的请求/响应调试证据
+```
+
+Adapter 的 `sdk_dump()` 优先调用 SDK 的 `model_dump()`，尽量得到由字典、列表和
+基本值组成的快照；没有该能力时允许保留对象作为调试回退。因此 raw 适合
+Wire Debug 和事后核对，但不能保证在所有第三方 SDK 版本下都是完整的 JSON，
+更不能替代统一协议。
+
+原始 SDK 对象不能直接放进 State：这样会让 State 依赖某个供应商的类、属性
+路径和 SDK 版本，也会使 Fake Provider、Trace Reader 和重放难以工作。核心逻辑
+应读取：
+
+```python
+if response.tool_calls:
+    execute_tools()
+
+if response.stop_reason == "end_turn":
+    stop_agent()
+```
+
+而不是读取 `raw["response"]` 中某一家 Provider 的嵌套字段。完整的边界规则和
+持久化影响见 [`05-model-access.md`](docs/design/05-model-access.md#111-provider-wire-sdk-对象raw-和-llmresponse-不是一回事)。
+
+#### 8.6.2 OpenAI Responses 的推理连续性例子
+
+某些 Responses 推理模型会在一次输出中返回 reasoning item 和 function call：
+
+```json
+{
+  "output": [
+    {
+      "type": "reasoning",
+      "id": "rs_abc",
+      "summary": [{"type": "summary_text", "text": "先读取 README。"}],
+      "encrypted_content": "encrypted-state-xyz"
+    },
+    {
+      "type": "function_call",
+      "call_id": "call_1",
+      "name": "read",
+      "arguments": "{\"path\":\"README.md\"}"
+    }
+  ]
+}
+```
+
+Adapter 将可通用的部分转成：
+
+```python
+LLMResponse(
+    content=(
+        ThinkingBlock(text="先读取 README。", signature="rs_abc"),
+        ToolCallBlock(
+            id="call_1",
+            name="read",
+            arguments={"path": "README.md"},
+        ),
+    ),
+    stop_reason="tool_use",
+    raw={"response": {...}},
+)
+```
+
+Bridge 只从 `raw["response"].output` 提取 Responses 专用的 `id`、summary 和
+`encrypted_content`，放入：
+
+```python
+AssistantMessage.sidecar["extra"]["openai_responses.reasoning_items"]
+```
+
+下一轮 `message_to_llm_message()` 将它传给 OpenAI Responses Adapter。Adapter
+按 `ThinkingBlock.signature` 找到对应 item，把 reasoning item 放在相关
+`function_call` 前重新构造 wire 输入；没有 summary 或 encrypted content 的
+空 item 会被跳过。这样既满足 Provider 的连续性要求，也不把
+`reasoning_id`、加密内容等 OpenAI 专用概念污染所有 Message。
+
+这条路径是“raw → 指定 Bridge → namespaced extra → 指定 Adapter”的受控特例，
+不是 Runtime 的通用 raw 读取规则。Anthropic、OpenAI Chat 和 Fake Provider
+可以忽略这个命名空间，仍使用相同的 `LLMResponse.content` 和 Runtime 事件链。
+
 原始 SDK 对象也不能替代 LLMResponse 或 Message。Adapter 会尽量将 SDK 响应转换成可序列化快照，它的目的是保存证据，而不是让核心模块继续调用 Provider SDK 方法。
 
 ---
 
-## 9. 再把一次工具调用完整串起来
+## 9. 用一次 Bash 调用把所有层串起来
 
-现在回到开头的 Bash 主例子，不再引入新概念。
+这一章只追踪一个确定性例子：用户要求 Agent 执行
+`printf 'hello-from-tool\n'`。不再引入新的抽象，只观察同一份数据怎样经过
+初始化、两次模型决策、一次工具执行，最后变成可回放的 State 和 Event Stream。
 
-### 9.1 初始化
-
-```text
-Agent.run(task)
-  → State(task=task)
-  → 记录 UserMessage(kind="task")
-  → MessageEvent 进入 events
-  → Snapshot.messages = [task]
-```
-
-需要注意，`Agent.run()` 返回的运行事件是惰性生成器。调用后已经存在初始任务 Message，但只有开始消费 events，Runtime 才继续模型和工具流程。
-
-### 9.2 第一次模型请求
+先看完整账本。这里的数字是写入 `State.events` 后的事件索引，不是事件类型
+编号：
 
 ```text
-State.active_context_messages()
-  → [task]
-
-build_context_view()
-  → 本轮可见 Message
-
-Bridge
-  → LLMMessage，去掉 sender/target/kind
-
-LLMRequest
-  → 加入 Agent.system_prompt、bash 工具定义和请求参数
-
-Adapter
-  → Provider Wire
+0  MessageEvent(task)
+1  AgentStartEvent(agent="bash_agent")
+2  TurnStartEvent(agent="bash_agent")
+3  ModelRequestEvent(visible_count=1, llm_message_count=2)
+4  ModelResponseEvent(output_kind="step", tool_call_count=1)
+5  MessageEvent(assistant: ToolCallBlock(id="bash_1"))
+6  ToolExecutionStartEvent(tool_call_id="bash_1")
+7  ToolExecutionEndEvent(tool_call_id="bash_1", is_error=False)
+8  MessageEvent(tool_result: ToolResultBlock(id="bash_1"))
+9  TurnEndEvent(terminated=False)
+10 TurnStartEvent(agent="bash_agent")
+11 ModelRequestEvent(visible_count=3, llm_message_count=4)
+12 ModelResponseEvent(output_kind="final", tool_call_count=0)
+13 MessageEvent(assistant: TextBlock("Bash observation: hello-from-tool"))
+14 TurnEndEvent(terminated=False)
+15 AgentEndEvent(reason="done")
 ```
 
-Runtime 在调用前记录 ModelRequestEvent，它会保存 ContextView 统计、工具定义和请求投影。
-
-在这个确定性例子中：
+这个顺序体现了三条不同的事实线：
 
 ```text
-visible_count     = 1  # 一条 task Message
-llm_message_count = 2  # task + 固定 system prompt
+MessageEvent       → 对话中出现了什么 Message
+Model/Tool Event   → 模型访问和本地执行发生了什么
+State.snapshot     → 当前有哪些完整 Message、哪些处于 active context
 ```
 
-固定 system prompt 参与请求，但不是 State 中的普通 Message，所以两个计数不同。
+`Snapshot.messages` 可以从 MessageEvent 重建；`ModelRequestEvent` 和
+`ModelResponseEvent` 保存每次模型调用的投影和结果摘要；工具执行事件不替代
+工具结果消息，后者才是下一轮模型的环境观察。
 
-### 9.3 模型返回工具调用
+### 9.1 初始化：先建立运行输入，再启动惰性循环
 
-```text
-Provider response
-  → Adapter 规范化
-  → LLMResponse(
-        content=[TextBlock, ToolCallBlock("bash_1")],
-        stop_reason="tool_use",
-        usage=...,
-        model=...,
-        raw=...,
-     )
-  → Bridge 补回运行语义
-  → AssistantMessage(kind="step")
-```
-
-Runtime 先记录 ModelResponseEvent，再通过 MessageEvent 将 AssistantMessage 写入 State。
-
-### 9.4 Runtime 执行工具并返回观察
-
-```text
-ToolCallBlock(id="bash_1")
-  → ToolExecutionStartEvent
-  → bash.execute(...)
-  → ToolExecutionEndEvent
-  → ToolResultBlock(tool_call_id="bash_1")
-  → UserMessage(kind="tool_result")
-  → MessageEvent
-```
-
-ToolExecution Event 是给观察者的执行事实；ToolResultBlock 是给下一轮模型的环境观察。两者都必要，但不能互相替代。
-
-### 9.5 第二次模型请求和正常停止
-
-此时模型可见对话是：
-
-```text
-task
-+ Assistant tool call
-+ tool_result
-```
-
-再加上固定 system prompt，第二次 ModelRequestEvent 的核心计数是：
-
-```text
-visible_count     = 3
-llm_message_count = 4
-```
-
-模型返回 `stop_reason="end_turn"`，Bridge 生成：
+调用：
 
 ```python
-AssistantMessage(
-    kind="final",
-    sender="bash_agent",
-    target="user",
-    content=(TextBlock("Bash observation: hello-from-tool"),),
-    usage=...,
-    model=...,
+state, events = agent.run(
+    "Use bash to run command: printf 'hello-from-tool\\n'",
+    max_turns=3,
 )
 ```
 
-Runtime 记录 ModelResponseEvent、MessageEvent、TurnEndEvent 和：
+默认初始化器做两件事：
 
 ```text
-AgentEndEvent(reason="done")
+State(task=task)
+  → 保存运行级原始输入
+state.send("task", "user", "bash_agent", task)
+  → 创建 UserMessage(kind="task")
+  → 追加 MessageEvent(index=0)
+  → Snapshot.messages = [task]
 ```
 
-此时系统同时拥有：
+`agent.run()` 返回 `(state, events)`，但 `events` 是惰性迭代器。调用 `run()`
+本身只完成 State 和初始任务消息的准备；只有执行 `for event in events` 或
+`list(events)`，才会继续产生 `AgentStartEvent`、模型调用和工具执行事件。
+因此 `MessageEvent(task)` 可以排在 `AgentStartEvent` 前面：它是运行输入的
+初始化事实，不是 Agent 循环已经开始的证明。
 
-- 四条可回放的 Message；
-- 十六条完整运行 Event；
-- 两次模型请求的投影和 usage；
-- 一对通过 `bash_1` 稳定关联的 ToolCall/ToolResult；
-- 可从 Event Stream 重建的 Message Snapshot；
-- 不污染核心 State 的 Provider raw 边界证据。
+### 9.2 Turn 1：从 active Message 到 Provider Wire
+
+第一轮开始后，Runtime 依次完成：
+
+```text
+TurnStartEvent
+  → active_context_messages() = [task]
+  → ContextPolicy / ContextView 可见性处理
+  → Bridge：Message → LLMMessage
+  → LLMRequest：加入 system_prompt、bash LLMTool 和请求参数
+  → ModelRequestEvent
+  → Adapter：LLMRequest → Provider Wire
+```
+
+本例没有压缩或可见性过滤，所以模型对话中的可见 Message 只有一条：
+
+```text
+visible_count = 1
+```
+
+但是 `system_prompt` 是 Agent 配置，不是 State 中的普通 Message。Runtime
+会把它作为请求的第一条 system 输入，因此完整 LLM payload 是：
+
+```text
+llm_message_count = 2
+  1. system_prompt
+  2. task UserMessage
+```
+
+这两个数字回答不同问题：`visible_count` 统计 ContextView 中可见的对话
+Message；`llm_message_count` 统计送入 Adapter 的完整消息列表。ModelRequestEvent
+同时记录 ContextView 统计、工具声明和可重建的 LLM 投影。
+
+### 9.3 Turn 1 输出：模型只提出工具请求
+
+Provider 的 OpenAI、Anthropic 或 Fake 结果都会先由 Adapter 规范化为统一响应：
+
+```python
+LLMResponse(
+    content=(
+        TextBlock("我先执行 Bash。"),
+        ToolCallBlock(
+            id="bash_1",
+            name="bash",
+            arguments={"command": "printf 'hello-from-tool\\n'"},
+        ),
+    ),
+    stop_reason="tool_use",
+    usage=...,
+    model="served-model-id",
+    raw={"request": {...}, "response": {...}},
+)
+```
+
+Bridge 透传有序 `content`，补回 Runtime 的 `sender`、`target` 和 `kind`，得到：
+
+```python
+AssistantMessage(
+    sender="bash_agent",
+    target="user",
+    kind="step",
+    content=response.content,
+    usage=response.usage,
+    model=response.model,
+    sidecar={"raw": response.raw},
+)
+```
+
+Runtime 先写 `ModelResponseEvent(index=4)`，记录输出阶段、工具调用数量、
+usage 和 model；随后写 `MessageEvent(index=5)`，这条 AssistantMessage 才正式
+进入完整 transcript。`stop_reason="tool_use"` 表示“模型请求 Runtime 执行工具”，
+不是“Agent 已经完成”。
+
+### 9.4 Tool：执行事实与环境观察分开保存
+
+Runtime 从 `AssistantMessage.tool_calls` 找到 `bash_1`，在本地工具注册表中
+执行，不读取 Provider raw：
+
+```text
+ToolCallBlock(id="bash_1")
+  → ToolExecutionStartEvent(index=6)
+  → bash.execute(command)
+  → ToolExecutionEndEvent(index=7, is_error=False)
+  → ToolResultBlock(tool_call_id="bash_1", content="hello-from-tool")
+  → UserMessage(kind="tool_result")
+  → MessageEvent(index=8)
+```
+
+两种记录不能互相替代：
+
+| 记录 | 主要回答的问题 | 下一轮是否直接作为模型输入 |
+| --- | --- | --- |
+| `ToolExecutionStart/EndEvent` | 本地函数何时开始、何时结束、是否失败或终止？ | 否 |
+| `ToolResultBlock` | 工具向模型返回了什么观察？ | 是 |
+
+结果消息按 `tool_call_id="bash_1"` 与 Assistant 的 ToolCall 配对；并行工具
+时，多个结果仍可放在一个 `tool_result` Message 中，通过各自 call ID 关联。
+工具执行和结果写入完成后，Runtime 才记录 `TurnEndEvent(index=9)`，所以
+Turn 1 的边界包含完整的工具处理，而不只包含模型请求。
+
+### 9.5 Turn 2：模型读取观察并正常结束
+
+第二轮开始时，active context 中有三条可见 Message：
+
+```text
+1. task UserMessage
+2. AssistantMessage(kind="step", ToolCallBlock("bash_1"))
+3. UserMessage(kind="tool_result", ToolResultBlock("bash_1"))
+```
+
+于是：
+
+```text
+visible_count     = 3
+llm_message_count = 4  # system_prompt + 上面三条 Message
+```
+
+Bridge 再次去掉 Runtime 路由头，Adapter 把规范请求翻译成 Provider Wire。
+模型这次已经看到了工具结果，因此返回普通最终文本：
+
+```python
+LLMResponse(
+    content=(TextBlock("Bash observation: hello-from-tool"),),
+    stop_reason="end_turn",
+    usage=...,
+    model="served-model-id",
+    raw={"request": {...}, "response": {...}},
+)
+```
+
+`make_llm_agent()` 将 `end_turn` 映射为 `AssistantMessage(kind="final")`。Runtime
+依次记录 `ModelResponseEvent(index=12)`、`MessageEvent(index=13)` 和
+`TurnEndEvent(index=14)`；检测到本轮 final 后跳出控制循环，最后追加：
+
+```text
+AgentEndEvent(reason="done", index=15)
+```
+
+### 9.6 结束时怎样对账
+
+本次运行的四条 Message 是：
+
+```text
+0 task UserMessage
+1 assistant step（含 bash_1 ToolCall）
+2 tool_result UserMessage（含 bash_1 ToolResult）
+3 assistant final（Bash observation）
+```
+
+Message 的索引属于 `State.messages` / Snapshot；上面的 0～3 不是
+`State.events` 的索引。完整 Event Stream 有 16 条（事件索引 0～15），其中
+两次模型请求分别由 `ModelRequestEvent`/`ModelResponseEvent` 对记录，工具调用
+由 `bash_1` 在 Assistant ToolCall、ToolExecution Event 和 ToolResultBlock 之间
+保持因果关联。
+
+最终可以从不同层得到不同观察：
+
+```text
+State.messages / Snapshot
+  → 可回放的对话 transcript
+
+State.events
+  → 完整生命周期、模型访问和工具执行事实
+
+ModelRequestEvent / ModelResponseEvent
+  → 两次模型调用的输入投影、usage、model 和工具统计
+
+AssistantMessage.sidecar["raw"]
+  → Provider 边界调试证据（不参与普通控制流）
+```
+
+这就是一次工具调用的最小闭环：第一轮决定“调用 Bash”，Runtime 执行并写入
+观察，第二轮根据观察给出 final。两轮共享同一个 State，但每层只读取自己
+负责的事实；因此运行既能继续推进，也能在结束后独立重放和审计。
 
 ---
 
-## 10. 从一个 Agent 到多 Agent 系统：Builder、Session、委派与 Workflow
+## 10. 用一个“修复代码并通过测试”的任务理解组合层
 
-前九章解释的是一条 Agent 运行内部的数据和控制流。本章把粒度提升一层，回答三个新问题：
+前九章讲的是一次 Agent Run 内部怎样产生 Message、Event、工具结果和最终
+答案。本章只新增一个问题：当任务变长、需要不同专家或外部验收时，应该在
+哪一层组合运行？
 
-```text
-一个 Agent 应该具备哪些能力？
-这些能力依赖的外部资源应该存活多久？
-多个 Agent 运行之间怎样传递任务、结果和完成状态？
-```
-
-可以先把组合体系放进一条主线：
+贯穿例子：
 
 ```text
-Builder / Flavor
-  组装一个 Agent 的 prompt、tools、policy 和 hooks
-        ↓
-Session / Toolset
-  保证 MCP 等外部资源覆盖完整惰性运行
-        ↓
-Task Tool
-  让父模型在推理过程中动态委派子 Agent
-        ↓
-Workflow
-  由程序规定多个独立 Agent 运行的协作关系
-        ↓
-Goal Loop
-  在模型输出 final 后，用外部事实验证是否真正完成
-        ↓
-Workflow Facade
-  让复杂 Workflow 对外仍保持 Agent.run(task) 入口
+修复认证模块的 bug，并运行测试确认修复有效。
 ```
 
-这些层次不引入第二套 Message、State 或 Runtime。它们只是决定如何创建普通 Agent、如何托管资源，以及如何组织多次普通运行。
-
-### 10.1 先分清六个层次
-
-| 层次 | 回答的问题 | 是否拥有独立对话 State |
-| --- | --- | --- |
-| Builder | 一个 Agent 有什么能力 | 只创建 Agent，不运行 State |
-| Flavor | 哪组常用 Builder 配置有一个稳定名称 | 取决于该 flavor 构建普通 Agent 还是 Facade |
-| Session | Toolset、连接和子进程活多久 | 不创建第二套对话 State |
-| Task Tool | 父模型是否在当前推理中动态委派 | 子 Agent 拥有独立 State |
-| Workflow | 多个运行以什么程序关系协作 | 普通 Step 通常各有独立 State |
-| Goal Loop | 候选答案是否通过外部验收 | 多次 `resume` 继续同一个 State |
-
-最重要的边界是：
+先记住两个对象：
 
 ```text
-Builder 管配置
-Session 管资源生命周期
-State 管一次运行事实
-Workflow 管多次运行关系
-Goal Loop 管外部完成条件
+Agent = 可反复使用的配置
+  name / prompt / Provider / tools / policy / hooks / init_state
+
+State = 某一次实际运行的事实账本
+  task Message / Model Event / Tool Event / Tool Result / final / stop reason
 ```
 
-不要因为这些对象都能“运行 Agent”，就把它们理解成同一层抽象。
+同一个 `Agent` 可以产生很多互不干扰的 State：
 
-### 10.2 Builder：组装能力，不执行任务
+```text
+writer Agent
+├── 第一次 run → State A
+├── 第二次 run → State B
+└── Goal Loop resume → 仍是 State A
+```
 
-假设要构建一个能分析 State 与 Compression 的 Agent：
+### 10.1 先看全景：这些不是一条强制流水线
+
+最容易产生的误解是把它画成：
+
+```text
+Builder → Session → Task Tool → Workflow → Goal Loop → Facade
+```
+
+这不是项目要求的调用顺序。它们是可以独立选择的不同维度：
+
+```text
+Builder / Flavor  → 决定一个 Agent 有什么能力
+Session / Toolset  → 决定连接型资源活多久
+Task Tool          → 模型临场决定要不要委派
+Workflow           → 程序预先规定多个 Run 的关系
+Goal Loop          → 外部检查决定是否继续同一目标
+Workflow Facade    → 对外统一成普通 Agent.run() 入口
+```
+
+同一个“修复并验收”任务可能有不同配置：
+
+```text
+最小路径：Builder → Agent.run → State
+需要 MCP：Session → Agent.run → State
+需要临时专家：父 Agent → Task Tool → 子 Agent State
+固定三阶段：Planner → Executor → Reviewer（Workflow Steps）
+必须测试通过：Agent run → CompletionCheck → resume（Goal Loop）
+外部只接受 Agent：Facade.run → 内部 Workflow
+```
+
+不要为了让流程超过一步就把所有层都启用。每增加一层，都应有明确的控制权、
+资源生命周期或验收价值。
+
+### 10.2 Builder 与 Flavor：先决定“一个 Agent 有什么”
+
+Builder 的真实职责是把现有配置组装成普通 `Agent`，不执行模型：
 
 ```python
-agent = make_agent(
+writer = make_agent(
     provider=provider,
     cwd="C:/repo",
     bash=True,
     read=True,
     general_purpose=True,
-    tools=[custom_search_tool],
+    system_prompt="分析并修复认证代码，完成后运行测试。",
 )
 ```
 
-Builder 可能组装出：
+得到的是配置对象：
 
 ```text
-Agent
-├── name / role
+writer
 ├── system_prompt
 ├── Provider
-├── Bash Tool
-├── Read Tool
-├── Task Tool
-├── custom_search_tool
+├── Bash / Read
+├── 可选 Task Tool
 ├── ContextPolicy
 ├── Hooks
 └── init_state
 ```
 
-调用 `make_agent()` 不会自动产生 State，也不会自动请求模型。真正运行仍由调用者显式开始：
+此时没有模型请求，也没有运行 State。只有调用：
 
 ```python
-state, events = agent.run(
-    "分析 State 与 Compression，并验证文档是否准确。"
-)
+state, events = writer.run("修复认证模块的 bug，并运行测试确认修复有效。")
+for event in events:       # 消费惰性事件，才真正推进 Runtime
+    pass
 ```
 
-因此 Builder 的数据流是：
+才会创建并推进一次 State。Builder 只组合 `Agent.run()` 已有的边界，不复制
+`core.run()`、工具调度、ContextView 或停止逻辑。Skills 通过 `init_state`
+注入菜单和上下文，仍使用同一套 Runtime。
 
-```text
-Provider + prompt + 能力开关 + 自定义工具
-  → 组装 Agent
-  → 调用者决定何时 Agent.run()
-  → 仍进入同一个 core.run()
-```
+Flavor 是命名好的 Builder 入口，例如 `bash`、`bash_task`、`bash_skills`；
+`loop`、`pdr` 则是命名好的 Workflow/Facade 入口。Flavor 只是展开一组约定
+参数，不是新的 Agent 类型、State 类型或 Runtime。
 
-Builder 可以配置 Provider、system prompt、工具、ContextPolicy、Hooks 和 `init_state`，但不应该复制：
+### 10.3 Session 与 Toolset：再决定资源“活多久”
 
-```text
-Agent.run()
-core.run()
-ToolCall 调度
-ToolResult 组装
-State.record_event()
-ContextView 构建
-停止条件判断
-```
-
-例如 Skills 通过 `init_state` 在任务开始时注入菜单和方法，之后仍然进入同一套 Runtime；它不是一条专用 Skills 循环。
-
-#### Flavor 是命名好的 Builder 配置
-
-项目当前的简单 Agent flavor 包括：
-
-```text
-bash
-bash_task
-bash_task_read
-bash_skills
-```
-
-Workflow flavor 包括：
-
-```text
-loop
-pdr
-```
-
-Flavor 的本质是：
-
-```text
-稳定名称
-  → 一组约定的构建参数
-  → 普通 Agent 或 Workflow Facade
-```
-
-它不是新的 Message 类型、Runtime 类型或 Agent 继承体系。`bash_task` 只是“已约定装配 Bash 和 Task 能力”的入口；`pdr` 则构建一个对外像 Agent、内部运行 Workflow 的 Facade。
-
-### 10.3 Session 与 Toolset：资源生命周期不是对话生命周期
-
-普通 Bash、Read 工具通常已经可以直接执行，不需要维持长连接：
-
-```python
-agent = make_agent(provider=provider, bash=True, read=True)
-```
-
-MCP 等能力则通常依赖有生命周期的资源：
-
-```text
-连接 MCP Server
-  → 初始化 MCP Session
-  → 发现工具
-  → 在整个 Agent 运行期间保持连接
-  → 运行结束后关闭
-```
-
-因此使用 AgentSession：
+Bash、Read 这类普通工具通常没有需要跨调用保持的连接，可以直接交给 Builder。
+MCP Toolset 则可能拥有子进程、网络连接和握手状态：
 
 ```python
 with agent_session(
     provider=provider,
-    mcp_servers=[server_config],
+    mcp_servers=[filesystem_server],
 ) as session:
-    state, events = session.run(
-        "搜索项目文档并解释 State 与 Compression。"
-    )
-    for event in events:
-        print(event.kind)
+    state, events = session.run("读取认证代码并运行测试")
+    for event in events:   # 必须在 with 块内消费
+        pass
 ```
 
-完整顺序是：
+实际时间线是：
 
 ```text
 进入 with
-  → 创建 ExitStack
-  → 收集 Bash、Read 等静态 Tool
-  → 逐个打开 Toolset
-  → 从 Toolset 收集 AgentTool
-  → 使用全部 Tool 构建 Agent
-  → Agent.run() 返回 State 和惰性 events
-  → 在 with 内消费完整 Event Stream
+  → 打开 Toolset / MCP 连接
+  → 收集 AgentTool
+  → 构建普通 Agent
+  → Agent.run() 返回惰性 events
+  → 在 with 内消费模型和工具事件
 退出 with
-  → 清除 session.agent
-  → ExitStack 逆序关闭 Toolset
+  → 关闭连接和子进程
 ```
 
-#### 为什么 events 必须在 Session 内消费
+如果只在 `with` 内调用 `session.run()`，离开后才消费 events，惰性 Runtime
+可能在 MCP 已关闭时才真正执行工具。Session 管的是资源所有权，不保存第二份
+对话 State，也不改变 `agent.run()` 的 `(state, events)` 契约。
 
-下面的写法是错误的：
+### 10.4 Task Tool：模型临场决定是否找专家
+
+如果“是否需要代码阅读专家”取决于模型看到的当前代码，可以把子 Agent 注册
+为 Task Tool 的枚举选项：
 
 ```python
-with agent_session(...) as session:
-    state, events = session.run("分析项目")
-
-# Session 已退出，MCP 连接已经关闭
-for event in events:
-    ...
+task = task_tool([code_reader, test_runner])
 ```
 
-`Agent.run()` 返回的是惰性生成器。离开 `with` 时，真正的模型请求和工具执行可能尚未发生。之后模型再请求 MCP 工具，Runtime 面对的就是已关闭连接。
-
-这里存在两个不同生命周期：
-
-```text
-State 生命周期
-  = 一次 Agent 运行的消息与事件事实
-
-Session 生命周期
-  = 支撑工具执行的连接、Toolset 和子进程
-```
-
-Session 不保存第二份 State，不改变 `agent.run()` 的返回契约，也不会把 MCP 内部事件直接塞进模型 transcript。MCP 工具的模型可见输出仍然经过统一链路：
-
-```text
-MCP Tool 执行
-  → ToolResult
-  → ToolResultBlock
-  → UserMessage(kind="tool_result")
-  → 下一轮模型上下文
-```
-
-### 10.4 Task Tool：由父模型动态决定是否委派
-
-继续使用同一个任务：
-
-```text
-分析 State 与 Compression，并验证文档是否准确。
-```
-
-父 Agent 认为自己需要一个专门代码阅读者，于是产生：
+父模型可能输出：
 
 ```python
 ToolCallBlock(
@@ -1819,570 +2965,196 @@ ToolCallBlock(
     name="task",
     arguments={
         "subagent_type": "code_reader",
-        "task": (
-            "阅读 state.py 和 compression/runtime.py，"
-            "说明压缩如何修改 active_context_indices。"
-        ),
-        "context": "重点核对 ToolCall/ToolResult 配对保护。",
+        "task": "定位认证失败的根因，阅读 auth.py 和相关测试。",
+        "context": "只报告证据和建议，不修改文件。",
     },
 )
 ```
 
-Task Tool 内部持有受控注册表：
+Task Tool 的控制权在父模型：它可以不委派，也可以选择已注册的某一个子 Agent。
+Runtime 不会根据模型字符串动态 import 任意模块。
 
-```python
-{
-    "code_reader": code_reader_agent,
-    "test_runner": test_runner_agent,
-}
-```
-
-模型只能选择已经注册的 `subagent_type`，不能把任意模块路径、类名或 import 字符串变成可执行代码。
-
-#### Task Tool 内部数据流
+Task Tool 的内部流程是：
 
 ```text
-父 Agent
-  → ToolCallBlock(task_1)
-Task Tool
-  → 根据 subagent_type 查找已注册 Agent
-  → child_agent.run(task) 创建独立 Child State
-  → 在 Child State 中记录可选 context Message
-  → 消费完整 Child Event Stream
-  → 查找 child kind="final" Message
-  → 将 final 文本包装为 ToolResult.content
-  → 将 Child State 的完整事件放入 details["sub_events"]
 父 State
-  → 记录一个普通 tool_result Message
-  → 父模型下一轮读取子 Agent 结果文本
+  → 记录 task ToolCall
+Task Tool
+  → 注册表查找 subagent_type
+  → child_agent.run(task) 创建 Child State
+  → 写入可选 context Message
+  → 消费 Child events
+  → 要求 Child 产生 kind="final"
+  → ToolResult.content = 子 Agent final 文本
+  → details["sub_events"] = 子 State.events
+父 State
+  → 记录 tool_result Message
+  → 父模型下一轮读取结果
 ```
 
-父子事实被明确分开：
+父、子 State 始终独立。父模型只看到 ToolResult 的文本；Trace 可以从
+`details["sub_events"]` 派生子 Span。若子 Agent 因 `max_turns` 没有 final，
+Task Tool 返回错误 ToolResult；这和 Workflow `run_agent()` 可回退最后一条
+Assistant 文本的契约不同。
 
-```text
-Parent State
-├── 父任务
-├── 父模型请求
-├── task ToolCall(task_1)
-└── ToolResult：子 Agent 最终文本
+### 10.5 Workflow：程序决定固定阶段和数据传递
 
-Child State
-├── 子任务
-├── 委派 context
-├── 子模型请求
-├── 子工具执行
-├── 子压缩事件
-└── 子 final
-```
-
-父模型直接看到的是简化后的结果文本，例如：
-
-```text
-StateSnapshot.apply 只处理 MessageEvent 和 ContextCompressionEvent；
-压缩通过追加 replacement 和重指向 active_context_indices 改变活跃视图。
-```
-
-观察者则可以从：
-
-```python
-ToolResult.details["sub_events"]
-```
-
-检查子 Agent 的完整执行过程。这再次体现了前文的边界：模型可见内容保持简洁，Event/sidecar 为审计保留完整证据。
-
-#### 为什么父子 Agent 必须使用独立 State
-
-如果父子并发追加同一个 State，会产生：
-
-- 父任务与子任务混在同一 transcript；
-- 父子 Event index 相互交错；
-- 子 Agent 压缩可能修改父 Agent 的活跃索引；
-- 父子 ToolCall/ToolResult 容易跨运行错配；
-- 子 Agent 的 TurnEnd、AgentEnd 和 `max_turns` 污染父生命周期。
-
-独立 State 让父运行和子运行都能单独回放。父 State 只把子 Agent 当作一次普通 Tool 观察。
-
-#### Task Tool 与 Workflow 的输出回退不同
-
-当前 Task Tool 要求子 Agent 真正产生 `kind="final"`。如果子 Agent 因 `max_turns` 停止且没有 final，它返回错误 ToolResult：
-
-```text
-Sub-agent 'code_reader' produced no final message
-```
-
-这与后面的 Workflow `run_agent()` 不同：Workflow 为了让截断步骤仍能给下一阶段提供参考，可以回退到最后一条 Assistant 文本。不能把这两种契约混写。
-
-未知子类型同样形成可恢复的错误 ToolResult：
-
-```text
-Unknown subagent_type 'unknown_worker'.
-Available: ['code_reader', 'test_runner']
-```
-
-父模型可以读取错误后修正选择，而 Runtime 不会动态导入未知模块。
-
-### 10.5 Task Tool 与 Workflow 的本质区别
-
-两者都会运行其他 Agent，但控制权不同：
-
-| 问题 | Task Tool | Workflow |
-| --- | --- | --- |
-| 谁决定是否运行下一个 Agent | 父模型在当前推理中决定 | Python 程序或 Workflow 协议决定 |
-| 子运行如何进入父视角 | ToolResult | StepResult.output 成为下一步输入 |
-| 是否属于父 Agent 的一次工具回合 | 是 | 否，通常是多个并列或串联运行 |
-| 适合场景 | 是否委派取决于当前观察 | 阶段顺序是稳定业务规则 |
-
-例如：
-
-```text
-“遇到不熟悉模块时，模型可以选择委派 code_reader”
-  → Task Tool
-
-“必须先规划，再执行，最后审查”
-  → Workflow
-```
-
-### 10.6 StepResult 与 WorkflowResult：输出和事实必须同时保留
-
-一次 Workflow Step 的结果不是一个裸字符串：
-
-```python
-StepResult(
-    name="reviewer",
-    role="critic",
-    task="审查 State 与 Compression 文档",
-    output="发现 ContextView.total_messages 的表述需要修正。",
-    state=reviewer_state,
-)
-```
-
-其中：
-
-```text
-output
-  = 给下一步使用的文本接口
-
-state
-  = 本步骤完整的 Message、Event、工具调用、TokenUsage、
-    压缩历史和停止原因
-```
-
-整个 Workflow 返回：
-
-```python
-WorkflowResult(
-    output="最终审查和修订结果",
-    steps=[planner_step, writer_step, reviewer_step],
-)
-```
-
-其结构是：
-
-```text
-WorkflowResult
-├── output：整个流程的最终对外输出
-└── steps：按逻辑顺序排列
-    ├── StepResult(state_planner)
-    ├── StepResult(state_writer)
-    └── StepResult(state_reviewer)
-```
-
-WorkflowResult 不会在运行时把多个 State 强行合并成一条共享 transcript。每一步的 State 仍然是自己的事实来源。
-
-#### `run_agent()` 为什么必须消费惰性 Event Stream
-
-Workflow 辅助函数会完成：
-
-```text
-agent.run(task)
-  → 得到 state 和惰性 events
-  → 记录可选 context Message
-  → 消费 events，真正推进 Runtime
-  → 从完成后的 State 提取输出
-  → 返回 StepResult
-```
-
-如果不消费 events，StepResult 只会得到初始化状态，模型和工具流程还没有执行。
-
-#### `max_turns` 时为什么仍可能有 StepResult.output
-
-Workflow 输出提取顺序是：
-
-```text
-1. 当前 Agent 本段最新的 kind="final" Message
-2. 否则，当前 Agent 最后一条有文本的 AssistantMessage
-3. 否则，空字符串
-```
-
-假设 Agent 在回合耗尽前最后输出：
-
-```text
-已经定位到 state.py:64，但尚未完成修改和验证。
-```
-
-即使 State 最后记录：
-
-```text
-AgentEndEvent(reason="max_turns")
-```
-
-Workflow 仍可以得到：
-
-```text
-step.output = "已经定位到 state.py:64，但尚未完成修改和验证。"
-```
-
-这只是给下一阶段提供最后可用信息，不代表系统伪造了一条 final，也不代表该步骤成功完成。停止原因仍必须从 State Event 判断。
-
-### 10.7 六种 Workflow 如何组织独立运行
-
-下面都使用同一个总任务：
-
-```text
-分析 State 与 Compression，修正文档并完成验证。
-```
-
-#### 10.7.1 Sequential Chain：固定流水线
+如果业务规则明确要求“先分析，再修改，最后测试验收”，就不应让模型临场决定
+是否进入下一阶段，而应使用 Workflow：
 
 ```text
 Analyzer
-  输入：原始任务
-  输出：架构分析
-        ↓
-Writer
-  输入：原始任务 + Analyzer 输出
-  输出：修订稿
-        ↓
-Polisher
-  输入：原始任务 + Writer 输出
-  输出：最终稿
-```
-
-后一步默认同时接收原始任务和前一步输出，而不只是接收上一步文本。否则目标可能逐层漂移：分析只保留模块名，写作者继续丢失“解释为什么”的要求，最后润色器只会润色一个不完整结果。
-
-每个阶段仍然有独立 State：
-
-```text
-Analyzer State ≠ Writer State ≠ Polisher State
-```
-
-#### 10.7.2 Planner / Executor：计划与环境修改分离
-
-```text
-Planner
-  工具权限较少
-  输出：读取哪些文件、修改哪里、运行哪些检查
-        ↓
+  → 输出：根因、涉及文件和风险
+      ↓ 原始任务 + 分析输出
 Executor
-  拥有 Read/Edit/Bash
-  输入：原始任务 + 计划
-  实际修改文件并运行验证
+  → 输出：修改结果和测试命令
+      ↓ 原始任务 + 修改结果
+Tester / Reviewer
+  → 输出：测试证据和剩余问题
 ```
 
-它的价值不仅是“多调用一个模型”，而是明确权限和审计边界：Planner 决定做什么，Executor 才能改变环境。
-
-#### 10.7.3 Reflection：生成、批评、修订
-
-```text
-Generator 产生学习指南草稿
-  → Critic 检查事实和可理解性
-     ├─ 输出约定的 APPROVED → 返回当前草稿
-     └─ 未批准 → Generator 根据批评修订 → 再次 Critic
-```
-
-`APPROVED` 是协议，不是模糊语气。Critic prompt、Workflow 参数和 `is_approved()` 必须检查同一个 marker。
-
-如果达到 `max_rounds` 仍未批准，Workflow 返回最新草稿，但不会伪造“Critic 已批准”。因此：
-
-```text
-最新草稿 ≠ 已通过审查
-```
-
-完整 steps 仍保留 draft、critique、revision 等每一次 State。
-
-#### 10.7.4 Routing：从注册表中选择一个专家
+每一步通过 `run_agent()` 消费惰性 events，并返回 `StepResult`：
 
 ```python
-routes = [
-    Route("domain", domain_agent, "检查 Message、State 与 Event"),
-    Route("context", context_agent, "检查 Compression 与 ContextView"),
-]
-```
-
-Router 输出 route name，系统再从注册 Route 中解析：
-
-```text
-Router Step
-  → select_route()
-  → 注册表查找
-  → 只运行被选中的 Specialist Step
-```
-
-无法解析时可以使用显式 default；没有 default 时，只返回 Router Step 和原始输出。模型输出的任意模块名不会被动态 import。
-
-#### 10.7.5 Parallel：独立候选或任务分片
-
-Ensemble 模式让多个 Worker 接收同一任务：
-
-```text
-Worker A：从领域类型分析
-Worker B：从 Runtime 时序分析
-Worker C：从教学可理解性分析
-```
-
-Map 模式让 Worker 接收不同子任务：
-
-```text
-Worker A → messages.py
-Worker B → state.py
-Worker C → compression/runtime.py
-```
-
-每个 Worker 都有独立 State。即使完成时间是：
-
-```text
-C → A → B
-```
-
-WorkflowResult.steps 仍按声明顺序稳定排列：
-
-```text
-[A, B, C]
-```
-
-真实执行时序保存在各 State Event 中；结果数组顺序服务于稳定程序语义。可选 Aggregator 最后读取 Worker 输出并生成汇总，但不能反向修改 Worker State。
-
-#### 10.7.6 PDR：多轮并行探索和发现提炼
-
-当前 PDR 更准确的结构是：
-
-```text
-第 1 轮
-  多个 Attempt 并行分析
-        ↓
-  Distiller 提炼 findings brief
-
-第 2 轮
-  原始任务 + findings brief
-        ↓
-  多个 Attempt 再次并行分析
-        ↓
-  Distiller 更新 findings brief
-
-最后
-  Finalizer 根据原始任务和累计 brief 生成结果
-```
-
-跨轮传递的是显式 `brief`，不是让所有 Worker 共享一个不断增长的 State。
-
-如果配置外部 CompletionCheck，每轮 Attempt 完成后会按声明顺序检查各自 State；第一个被外部验证为完成的 Attempt 可以直接成为结果，跳过剩余轮次、Distiller 和 Finalizer。
-
-### 10.8 Goal Loop：模型 final 只是候选完成
-
-普通 Runtime 的停止条件是：
-
-```text
-AssistantMessage(kind="final")
-  → AgentEndEvent(reason="done")
-```
-
-这只证明模型认为本轮回答可以结束，不能证明：
-
-- 测试真的通过；
-- 文件真的存在；
-- 服务真的启动；
-- 外部 API 真的更新；
-- 验收条件已经满足。
-
-对于“修正文档并保证检查通过”这样的可验证目标，Goal Loop 增加外部 CompletionCheck：
-
-```text
-Agent 首次 run
-  → 模型产生候选 final
-  → CompletionCheck(state)
-     ├─ 外部验证通过 → complete
-     ├─ 未通过但可继续 → resume 同一个 State
-     ├─ 同一 blocker 连续达到阈值 → blocked
-     ├─ 回合/Token 预算耗尽 → budget_exhausted
-     └─ 调用者取消或墙钟时间到期 → aborted
-```
-
-#### 为什么继续使用同一个 State
-
-验证未通过时：
-
-```python
-agent.resume(
-    state,
-    continuation_feedback,
+StepResult(
+    name="tester",
+    role="验收者",
+    task="原始任务 + Executor 输出",
+    output="pytest: 42 passed",
+    state=tester_state,
 )
 ```
 
-同一个 State 持续保留：
+整个流程返回：
+
+```python
+WorkflowResult(
+    output="pytest: 42 passed",
+    steps=[analyzer_step, executor_step, tester_step],
+)
+```
+
+`output` 是给下一步或调用者的文本接口；`state` 是该步骤完整的 Message、
+Event、usage、工具和停止事实。普通 Workflow 的 Step 通常拥有独立 State：
+
+```text
+Analyzer State ≠ Executor State ≠ Tester State
+```
+
+Workflow 只负责顺序、输入传递、并发、重试和结果选择，不把多个 State 强行
+合并为一条共享 transcript。`max_turns` 时 `run_agent()` 可以回退最后一条
+Assistant 文本给下一步，但仍保留真实 `AgentEndEvent(reason="max_turns")`，
+不能把回退文本伪装成成功 final。
+
+### 10.6 Goal Loop：测试验收才是完成条件
+
+普通 Agent 在产生 `AssistantMessage(kind="final")` 后停止；这只说明模型认为
+回答结束，不证明认证 Bug 真修好或测试真的通过。
+
+Goal Loop 通过 `run_goal_loop(agent, objective, check=...)` 把外部检查加入控制流：
+
+```text
+第一次 agent.run(objective)
+  → 模型修改代码并声称完成
+  → CompletionCheck(state)
+      ├─ pytest 全部通过 → status="complete"
+      ├─ 未通过但可继续 → agent.resume(同一个 State, 反馈)
+      ├─ 同一 blocker 连续达到阈值 → status="blocked"
+      ├─ 回合或 Token 预算用完 → status="budget_exhausted"
+      └─ abort / 墙钟截止 → status="aborted"
+```
+
+未通过时继续的是同一个 State：
 
 ```text
 原始任务
-→ 之前的工具调用和修改结果
+→ 之前的读写和测试结果
 → 模型上一次 final
-→ 外部验证反馈
-→ 后续模型输出
-→ GoalStatusEvent
+→ 外部 pytest 反馈
+→ 后续修改和验证
 ```
 
-模型因此从真实工作进度继续，而不是重新创建 State 后从头开始。
-
-Goal Loop 中的多个 StepResult 表示同一 State 的不同 run/resume 片段。它们的 `state` 指向同一个持续增长的 State；输出提取通过 `after_message_index` 限定在当前续接片段，避免误用先前 segment 的 final。这与普通 Workflow 每个 Step 通常拥有独立 State 不同。
-
-#### Goal 状态
-
-| 状态 | 含义 | 是否成功 |
-| --- | --- | ---: |
-| active | 当前检查未通过，仍可继续 | 否 |
-| complete | 外部检查确认完成 | 是 |
-| blocked | 同一外部阻塞连续达到阈值 | 否 |
-| budget_exhausted | Goal 回合或输出 Token 预算耗尽 | 否 |
-| aborted | 调用者取消或墙钟时间到期 | 否 |
-
-当前默认阻塞判定要求同一个 blocker reason 连续出现至少三次。`blocked` 表示仍有预算但外部条件持续阻止推进；`budget_exhausted` 表示任务可能还能继续，但允许资源已经用完。二者都不能伪装成成功。
-
-### 10.9 状态、顺序与并发所有权
-
-默认所有权可以记成：
+Goal Loop 每轮追加 `GoalStatusEvent`，保留 objective、状态、回合和 Token 计数。
+`complete` 必须由 `CompletionCheck` 报告；`blocked` 和 `budget_exhausted` 都
+不是成功。也就是说：
 
 ```text
-父 Agent             → Parent State
-Task Tool 子 Agent   → Child State
-Planner              → Planner State
-Executor             → Executor State
-Parallel Worker A    → State A
-Parallel Worker B    → State B
-Goal Loop run/resume → 同一个持续 State
+模型 final = 候选完成
+外部 check 通过 = 可接受完成
 ```
 
-不要让多个并发 Worker 同时追加一个共享 `state.events`。否则会出现：
+### 10.7 Workflow Facade：统一入口，不隐藏内部事实
 
-- Event index 由线程调度竞争；
-- Message 顺序不稳定；
-- 一个 Worker 的压缩改变另一个 Worker 的活跃上下文；
-- ToolCall/ToolResult 可能跨 Worker 错配；
-- 单个步骤无法独立重放。
-
-上一步结果应通过明确输入进入下一步，而不是修改旧 State：
-
-```text
-Planner State
-  └─ output = 计划
-
-Executor State
-  └─ task/context = 原始任务 + Planner output
-```
-
-旧 State 继续忠实表达 Planner 当时发生的事实，不会被 Executor 反向改写。
-
-### 10.10 Workflow Facade：统一入口，不统一事实账本
-
-外部运行器通常只认识：
+某些外部运行器只接受普通接口：
 
 ```python
 state, events = agent.run(task)
 ```
 
-但 `pdr` 或 `loop` flavor 内部可能实际执行多个 Worker、Distiller、Finalizer 或多次 Goal resume。Workflow Facade 将它们包装成看起来像普通 Agent 的对象：
+但 `loop` 或 `pdr` flavor 内部可能执行多次 Agent Run、并行 Worker、Distiller
+和 Finalizer。这时可以返回一个 Workflow Facade：
 
 ```text
-外层 facade_agent.run(task)
-  → 外层 core.run()
-  → facade.generate(visible)
-  → 内部执行 Workflow
-  → 得到 WorkflowResult
-  → 返回一个 kind="final" 的 AssistantMessage
+facade.run(task)
+  → 外层普通 core.run()
+  → facade.generate(...)
+  → 内部 Workflow
+  → WorkflowResult
+  → 外层 AssistantMessage(kind="final")
 ```
 
-外层 State 主要记录：
+对外它像普通 Agent；对内每个 Worker、Goal resume 和 Distiller 仍然有自己的
+State。`compose_trace_state()` 只在最终导出时派生一个组合展示视图：
 
 ```text
-外层 task
-→ 外层 Agent/Turn 生命周期
-→ 一次 facade generate
-→ 外层 final
-```
-
-内部仍然保存：
-
-```text
-Worker State
-Distiller State
-Finalizer State
-WorkflowResult.steps
-```
-
-所以 Facade 只统一调用外形，不会把内部步骤变成真正共享的 Runtime transcript。
-
-#### `compose_trace_state()` 实际做什么
-
-内部步骤可以先各自写出子 Trace。最终导出时，Facade 根据 overview 派生一个新的轻量 State：
-
-```text
-Facade Trace
-├── step-00：Worker → 指向完整子 Trace
-├── step-01：Distiller → 指向完整子 Trace
-└── step-02：Finalizer → 指向完整子 Trace
-```
-
-这个组合 State 使用合成的 ToolCall/ToolResult 节点表达树状关系，并引用子 Trace；它不是把所有内部 Event 原样塞进外层运行 State，也不是内部步骤运行时共同写入的事实账本。
-
-更准确的关系是：
-
-```text
-多个独立 Step State / 子 Trace
+独立 Step State / 子 Trace
   → compose_trace_state()
-  → 便于统一展示的派生树
+  → 组合 Trace / Viewer 树
 ```
 
-内部 Step State 仍是完整事实来源，Facade Trace 是可重建的组合视图。
+Facade 不创建新的 Message/Event 协议，不把内部 State 偷偷合并成共享 Runtime，
+也不能用外层 final 隐藏内部失败。内部 `StepResult`、停止原因和 Goal 状态仍是
+事实，外层只是统一调用入口和组合视图。
 
-### 10.11 如何选择组合方式
+### 10.8 把“修复并验收”映射到正确层次
 
-| 实际需求 | 推荐方式 | 原因 |
+| 需求 | 优先使用 | 为什么 |
 | --- | --- | --- |
-| 给一个 Agent 增加 Bash、Read 等无状态能力 | Builder 参数 | 只改变单个 Agent 的能力集合 |
-| 使用常见能力组合 | Flavor | 减少重复配置，不增加新运行语义 |
-| 工具依赖 MCP 连接或子进程 | Session + Toolset | 资源必须覆盖完整惰性运行 |
-| 是否委派取决于模型当前推理 | Task Tool | 父模型动态决定是否调用子 Agent |
-| 阶段顺序是固定业务协议 | Sequential / Planner-Executor | Python 顺序清晰且可审计 |
-| 需要独立质量审查 | Reflection | Critic 显式批准或要求修订 |
-| 一个任务只交给一个专家 | Routing | 从受控 Route 中安全选择 |
-| 需要多个候选或分片 | Parallel | Worker 独立并发，结果顺序稳定 |
-| 需要多轮并行探索和提炼 | PDR | Attempt、brief、再探索、Finalizer |
-| 完成必须由测试或外部状态确认 | Goal Loop | 模型 final 只作为候选结果 |
-| 外部接口只接受普通 Agent | Workflow Facade | 保持 `agent.run()` 入口一致 |
+| 给一个 Agent 增加 Bash/Read 或自定义无状态能力 | Builder | 只改变能力集合 |
+| 为常见能力组合提供易懂名称 | Flavor | 命名配置，不增加运行语义 |
+| 工具需要 MCP 连接、子进程或握手状态 | Session + Toolset | 资源覆盖完整惰性运行 |
+| 是否找专家取决于模型当前观察 | Task Tool | 父模型拥有动态委派权 |
+| 必须按固定阶段分析→修改→测试 | Sequential / Planner-Executor | 程序顺序稳定、容易审计 |
+| 需要独立代码审查 | Reflection | Critic 结果是显式协议 |
+| 多个候选或代码分片并行 | Parallel + Aggregator | State 隔离、结果顺序稳定 |
+| 完成必须由 pytest/外部状态确认 | Goal Loop | final 只是候选，check 才是完成权威 |
+| 外部只接受 `Agent.run()` | Workflow Facade | 统一入口但保留内部事实 |
 
-最后可以把组合层压缩成下面几句话：
+### 10.9 最后只记住四条边界
 
 ```text
-Builder
-= 一个 Agent 有什么
-
-Session
-= 支撑能力的资源活多久
-
-Task Tool
-= 模型是否动态委派子 Agent
-
-Workflow
-= 多个独立 Agent 按什么程序关系协作
-
-StepResult / WorkflowResult
-= 如何保存单步事实和整体结果
-
-Goal Loop
-= 候选 final 如何通过外部事实变成 complete
-
-Workflow Facade
-= 如何让复杂 Workflow 对外保持普通 Agent 入口
+Agent     = 配置；State = 一次运行事实
+Builder   = 装配能力；Session = 管资源寿命
+Task Tool = 模型动态委派；Workflow = 程序固定编排
+Goal Loop = 外部验收；Facade = 统一外部入口
 ```
 
----
+无论选择哪种组合，底层都回到同一个 `Agent.run()` / `core.run()`：
+
+```text
+普通 Agent Run
+  → Message / Event / State
+
+多个独立 Run
+  → StepResult / WorkflowResult
+
+外部观察
+  → Trace / CompletionCheck / Eval
+```
+
+组合层的价值是让控制权、资源所有权和完成条件明确，而不是把简单循环藏在
+更大的框架名词后面。
+
 
 ## 11. 从事件账本到 Trace：一次运行如何被观察、回放和计费
 
@@ -2396,6 +3168,34 @@ Workflow Facade
 最核心的不变量是：
 
 > Runtime 负责产生事实，Event Stream 负责保存事实，Trace 层负责从事实派生观察视图，Viewer 只负责展示这些视图。
+
+把本章后面的几个组件放在同一张图里：
+
+```text
+State.events = 不可替代的运行事实账本
+       ↓
+观察层从账本派生不同视角
+├─ ModelTurn              模型视角：当时输入和输出是什么
+├─ RunCost                成本视角：usage 和价格如何聚合
+├─ Span                   时间视角：操作持续多久、嵌套在哪里
+├─ Trajectory v5          持久化视角：怎样追加到磁盘并恢复
+├─ IncrementalTraceWriter 实时写入视角：新增事件怎样落盘
+└─ Viewer                 人类查看视角：如何展示这些结果
+```
+
+它们共享同一条单向边界：
+
+```text
+Runtime 产生 Event
+Writer   保存 Event
+Reader   读取 Event
+Trace    派生视图
+Viewer   展示视图
+```
+
+观察层的筛选、展开、成本计算或 Span 合并都不会反向修改 State，也不会替代
+`agent.run()` / `resume()`。如果需要继续运行，必须回到拥有 Agent 配置、工具注册、
+Snapshot 和 ContextPolicy 的 Runtime State。
 
 可以先把各层放在一起：
 
@@ -2530,6 +3330,8 @@ Investigate the failing wc-line counter regression and ship a fix with a new tes
 
 ### 11.3 RunTrace：封装一次运行，不复制一套 Runtime
 
+可以把 `RunTrace` 理解成：从一次 Agent 运行的 `State` 中截取一份“只读观察报告”，再按需要生成 Span、ModelTurn 和成本视图。它不是新的运行容器，也不是第二个 Agent。
+
 运行结束或观察开始时，可以从 State 构造：
 
 ```python
@@ -2543,6 +3345,15 @@ trace = run_trace_from_state(
     },
 )
 ```
+
+构造时复制的是列表目录，而不是重新执行运行：
+
+```python
+trace.events = list(state.events)
+trace.messages = list(state.messages)
+```
+
+如果 Runtime 仍在运行，先创建的 Trace 只代表创建瞬间的快照；State 后续追加的事件不会自动回写到这份 Trace。要观察最新状态，应重新构造 Trace，或使用 `IncrementalTraceWriter` 做增量写入。
 
 得到的 `RunTrace` 主要保存：
 
@@ -2608,6 +3419,50 @@ State 产生并保存运行事实
 - Reader 可以重新派生 transcript、Span 和成本。
 
 Header 不重复保存完整 `messages`、`spans`、`model_turns` 或 `cost` 数组，因为它们都可以从后续事件重新计算。
+
+#### Header、Event Body 与 JSONL 的分工
+
+Header 回答“这是什么文件”：
+
+```text
+schema / trace_id / producer / task / meta
+```
+
+后续 Event Body 回答“运行中发生了什么”：
+
+```text
+index / elapsed / uuid / kind / 事件专用字段
+```
+
+其中 `index` 是追加顺序，`elapsed` 是相对运行时间，`uuid` 用于跨文件或子 Trace 引用，`kind` 决定 Reader 如何解释这一行；`schema` 描述整个文件的版本契约，不能和 `kind` 混为一谈。
+
+使用 JSONL 的核心原因是追加和恢复：新事件只需追加一行，Viewer 可以读取已经完成的前缀，进程中断时可以恢复完整尾行之前的内容，Reader 还可以边读边重建 transcript、活跃上下文、Span、ModelTurn 和 RunCost。
+
+因此 Header 不重复保存这些派生数组：
+
+```text
+messages / spans / model_turns / cost
+```
+
+它们都应从 Event Stream 重新计算。内存中的 `ModelRequestEvent.llm_payload` 是当时的请求投影，但 v5 写盘时会由 `event_record()` 移除，避免每一轮重复保存不断增长的历史；需要精确核对 Provider Wire 时，再读取外置 raw pool。
+
+`IncrementalTraceWriter` 的典型生命周期是：首次 flush 写 Header，后续只追加新增 Event，停止时执行最终 flush；没有新增事件则不写入。它观察 State 并写文件，不推进 Runtime，也不能替代 `agent.run()` 或 `resume()`。
+
+#### Reader 如何从文件恢复观察结果
+
+Reader 不是把整个 JSONL 文件当成一份新的 Runtime State，而是按顺序处理：
+
+```text
+读取 Header
+  → 校验 schema、trace_id 和运行元数据
+读取一行 Event
+  → 校验 index / kind / JSON 结构
+  → 追加事件并更新 transcript、Context、Span、成本聚合
+遇到 raw_ref
+  → 需要 Wire Debug 时再读取相邻 raw pool
+```
+
+如果写入过程在最后一行中断，Reader 只恢复此前完整写入的行，不会把半行数据当作真实 Event。恢复后的 transcript、活跃上下文和 Span 都是从事件重新派生的观察结果；它不能替代拥有 Agent 配置、工具注册和 ContextPolicy 的原始 State，因此不能仅凭 Trajectory 直接继续 `resume()`。
 
 内存中的 `ModelRequestEvent` 会携带精确的 `llm_payload`。写入 v5 时，`event_record()` 会移除这个可重建字段，避免每轮重复保存不断增长的模型上下文；持久化 Reader 需要结合 MessageEvent、Agent registry 或 Provider raw 重建相应视图。
 
@@ -2710,6 +3565,66 @@ Span 回答“何时开始和结束、属于哪个父操作、输入输出是什
 ```
 
 合并过程为子 Span 重设展示层 `parent_id`，并将子运行相对时间平移到父工具调用附近。它不把子事件直接追加进父 `State.events`，也不共享两边的消息、压缩索引或生命周期。
+
+可以用一个完整的模拟数据把这句话展开：
+
+```text
+父事件：
+0.0 AgentStart(parent)
+0.5 TurnStart(parent)
+1.0 ModelRequest(parent)
+2.0 ModelResponse(parent, ToolCall(task_1))
+2.1 ToolExecutionStart(task_1)
+9.3 ToolExecutionEnd(task_1)
+9.4 MessageEvent(tool_result, details[task_1].sub_events)
+9.5 TurnEnd(parent)
+
+父 Span：
+parent.agent_run 0.0 - 10.0
+└── parent.turn 0.5 - 9.5
+    ├── parent.model_call 1.0 - 2.0
+    └── parent.tool_call 2.1 - 9.3
+```
+
+子 Agent 的事件有自己的相对时间轴：
+
+```text
+0.0 AgentStart(child)
+0.5 TurnStart(child)
+1.0 ModelRequest(child)
+2.0 ModelResponse(child, ToolCall(read_1))
+2.1 ToolStart(read_1)
+4.0 ToolEnd(read_1)
+4.5 TurnEnd(child)
+5.0 TurnStart(child)
+5.5 ModelRequest(child)
+6.0 ModelResponse(child, final)
+6.5 TurnEnd(child)
+7.0 AgentEnd(child)
+```
+
+合并器先把子事件独立转换为 Span，再使用：
+
+```text
+merged_start = child.start + parent_tool.start
+merged_end   = child.end + parent_tool.start
+```
+
+因此子 `agent_run` 从 `0.0 - 7.0` 变成 `2.1 - 9.1`，完整落在父 Tool 的 `2.1 - 9.3` 区间内。实际 Task Tool 会在消费子运行并组装结果后才结束，所以正常数据通常保持这种嵌套。仍需知道当前合并器只做时间平移，不裁剪或缩放异常数据；这些时间适合展示相对结构，不能当作经过跨时钟校准的绝对时间。
+
+合并后的 parent-child 关系是：
+
+```text
+parent.tool_call(task_1)
+└── child.agent_run
+    ├── child.turn
+    │   ├── child.model_call
+    │   └── child.tool_call
+    └── child.turn
+        └── child.model_call
+```
+
+只有子 Agent 的根 Span 改挂到父 Tool Span；子树内部的 `parent_id` 保持原样。父 State 和子 State、两边的 Event index、ContextCompressionEvent 和生命周期事件都没有被合并或修改。Span 最终只是 Viewer 使用的派生树，不能再用它反向控制 Runtime，例如“Span 超过 10 秒就自动停止 Agent”；真正的停止必须由 Runtime 写入 abort、工具终止或其他结构化 Event。完整规则见 [`09-trace-and-observability.md`](docs/design/09-trace-and-observability.md#61-普通-span-怎样从-event-配对)。
 
 ### 11.7 ModelTurn：还原模型当时真正看到了什么
 

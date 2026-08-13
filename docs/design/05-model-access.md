@@ -76,6 +76,84 @@ Provider 是不可变配置值，不保存对话状态，也不等于 SDK client
 
 LLMRequest 是纯数据，适合记录和回放。工具声明只保留名称、描述和 JSON Schema；本地执行函数绝不能跨模型边界。
 
+### 4.1 工具声明与本地执行是两条边界
+
+Runtime 中的 `AgentTool` 同时包含“模型需要知道的声明”和“Runtime 才能使用的执行控制”：
+
+```python
+AgentTool(
+    name="read",
+    description="读取指定文件",
+    parameters={
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"],
+    },
+    execute=read_file,
+    execution_mode="parallel",
+    timeout_seconds=30,
+)
+```
+
+模型只需要前三项：
+
+```text
+有什么工具？      name
+工具做什么？      description
+如何传参？        parameters
+```
+
+而 `execute`、`execution_mode` 和 `timeout_seconds` 只回答 Runtime 的问题：调用哪个本地函数、是否可以并行、单次最多等待多久。Bridge 的投影结果是没有本地函数的 `LLMTool`：
+
+```python
+LLMTool(
+    name="read",
+    description="读取指定文件",
+    parameters={
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"],
+    },
+)
+```
+
+`AgentTool.execute` 不会序列化到 HTTP，也不由 Provider 执行。模型只能请求 `read(path)`；Runtime 收到规范化的 `ToolCallBlock(name="read")` 后，仍需在本地已注册工具表中查找并调用对应的 `execute`。这既避免发送不可序列化的 Python 函数，也保留了本地权限、超时和并发控制。
+
+### 4.2 一次 LLMRequest 如何跨过 Adapter
+
+Runtime、State 和 Agent 配置准备好后，先形成供应商无关的纯数据请求：
+
+```python
+LLMRequest(
+    provider=provider,
+    system_prompt="你是代码架构分析助手。",
+    messages=[
+        LLMMessage(
+            role="user",
+            content=(TextBlock("请分析 README.md"),),
+        ),
+    ],
+    tools=[read_llm_tool],
+    reasoning="high",
+    timeout_seconds=600,
+    extra={},
+)
+```
+
+此时还没有 OpenAI 或 Anthropic 的 JSON。Adapter 只在最后一步翻译字段：同一个 `LLMTool.parameters` 可能成为 OpenAI Chat 的 `function.parameters`，也可能成为 Anthropic 的 `input_schema`；`system_prompt` 可能成为首条 system message，也可能成为顶层 `system`；`reasoning="high"` 也由各 Adapter 转成自己的 reasoning/thinking 配置。
+
+响应方向同样先规范化再执行：OpenAI 的 `tool_calls[].function` 和 Anthropic 的 `content[].type="tool_use"` 都转换成项目自己的：
+
+```python
+ToolCallBlock(
+    id="call-1",
+    name="read",
+    arguments={"path": "README.md"},
+)
+```
+
+Provider 从始至终只收到工具声明，不会拿到本地 `execute`；Runtime 才根据这个统一的调用身份执行工具并在下一轮写入 `ToolResultBlock`。
+
 ## 5. Adapter Registry 与分发
 
 每个 Adapter 实现同一函数形状：接收 LLMRequest，产出 StreamEvent 迭代器。注册表以 `provider.api` 为键选择实现。
@@ -93,21 +171,36 @@ LLMRequest 是纯数据，适合记录和回放。工具声明只保留名称、
 
 ## 6. 统一流事件
 
-Adapter 对外产出以下事件：
+`StreamEvent.kind` 是项目真实定义的模型访问协议，不只是文档示意。Adapter 对外可产出：
 
-| kind | 语义 |
-| --- | --- |
-| text_delta | 新增文本片段 |
-| thinking_delta | 新增思考片段 |
-| tool_call_start | 工具调用开始，参数可能尚不完整 |
-| tool_call_delta | 工具参数 JSON 增量 |
-| tool_call_complete | 完整且已解析的工具调用 |
-| usage_update | 使用量更新 |
-| done | 最终 LLMResponse，且必须最后出现 |
+| kind | payload | 语义 |
+| --- | --- | --- |
+| `text_delta` | `{"delta": str}` | 新增文本片段 |
+| `thinking_delta` | `{"delta": str}` | 新增思考片段 |
+| `tool_call_start` | `{"tool_call": ToolCallBlock}` | 工具调用开始，参数可能尚不完整 |
+| `tool_call_delta` | 调用 ID 与 JSON 参数增量 | 工具参数仍在逐片形成 |
+| `tool_call_complete` | `{"tool_call": ToolCallBlock}` | 完整且已解析的工具调用 |
+| `usage_update` | `{"usage": TokenUsage}` | 使用量更新 |
+| `done` | `{"response": LLMResponse}` | 最终完整响应，必须最后出现 |
 
-`iter_stream` 允许调用者实时消费；`complete` 排空事件并取得最终响应。Adapter 若未产生合法 done 响应，应明确失败，而不是拼凑不完整结果。
+`iter_stream` 允许调用者消费这些事件；`complete` 排空事件流，找到最后的 `done`，并返回其中已经构造好的 `LLMResponse`。`complete` 不会根据早先 delta 自己猜测或重建一个响应；Adapter 必须保证 `done.response` 完整。若事件流没有合法 `done`，调用应明确失败。
 
-当前 Agent 主循环使用完整响应路径，但保留统一流协议，使实时 UI 和未来扩展无需改写 Provider 适配。
+需要区分协议能力与当前 Adapter 实现：
+
+```text
+统一协议支持
+  → 真正的 text/thinking/tool 参数增量
+
+当前 OpenAI Chat / Responses / Anthropic Adapter
+  → 先执行阻塞式 SDK 请求
+  → 取得完整 Provider 响应
+  → 解析成完整 Content Block
+  → emit_response() 将 Block 映射成统一 StreamEvent
+```
+
+例如当前公共 `emit_response()` 会把一个完整 `ThinkingBlock` 发成一次 `thinking_delta`，一个完整 `TextBlock` 发成一次 `text_delta`，一个完整 `ToolCallBlock` 发成 `tool_call_start` 后紧接 `tool_call_complete`，最后发出 `usage_update` 和 `done`。它通常不会把真实 Provider 网络片段逐字转发；`tool_call_delta` 虽已进入协议，但当前主要真实 Adapter 通常直接拥有完整参数，因此不一定产生该事件。
+
+Fake Adapter 会按 `extra["chunk_size"]` 把文本拆成多个 `text_delta`，可用于验证调用者逐步消费事件的行为。无论事件粒度如何，最终 `done.response.content` 都必须是相同的规范化完整结果。
 
 ## 7. 请求转换中的差异
 
@@ -131,11 +224,84 @@ ThinkingBlock 在统一内容序列中保留文本、签名、是否脱敏及必
 
 ### 7.4 Extra
 
-请求级和消息级 extra 允许供应商特性先以命名空间形式进入边界，例如缓存锚点。Adapter 只读取自己的命名空间，未知项应被忽略，从而保持 transcript 可跨 Provider 使用。成熟且普遍的能力应提升为明确字段，不能永久堆积在 extra。
+请求级和消息级 `extra` 允许供应商特性先以命名空间形式进入边界，例如缓存锚点。Adapter 只读取自己的命名空间，未知项应被忽略，从而保持 transcript 可跨 Provider 使用。成熟且普遍的能力应提升为明确字段，不能永久堆积在 extra。
+
+#### 缓存锚点是什么
+
+长上下文 Agent 的每次请求通常都会重复携带稳定前缀：固定 system prompt、任务说明、已经完成的代码分析和早期工具结果。缓存锚点是附着在某条 `LLMMessage` 上的 Provider hint，用来告诉支持该能力的 Adapter：
+
+```text
+这条消息的最后一个内容块，可以作为 Prompt Cache 的边界。
+```
+
+项目当前约定的 Anthropic hint 是：
+
+```python
+LLMMessage(
+    role="assistant",
+    content="前面的代码分析已经完成……",
+    extra={"anthropic.cache_breakpoint": True},
+)
+```
+
+Anthropic Adapter 读取自己的命名空间后，会把它翻译为最后一个 wire content block 上的：
+
+```json
+{
+  "type": "text",
+  "text": "前面的代码分析已经完成……",
+  "cache_control": {"type": "ephemeral"}
+}
+```
+
+`ephemeral` 表示 Provider 管理的临时缓存，不是项目的长期 Memory，也不会新增一条模型可见的“缓存指令”。缓存锚点只改变请求的处理提示，不改变 Message 的正文、State 的历史或 ToolCall/ToolResult 的因果关系。
+
+#### 它如何帮助长任务
+
+假设连续三次请求都带有相同的历史前缀：
+
+```text
+请求 1：system + task + 历史分析
+请求 2：system + task + 历史分析 + 新工具结果
+请求 3：system + task + 历史分析 + 新工具结果 + 新问题
+```
+
+可以把 `历史分析` 的最后一个 block 标记为锚点：
+
+```text
+system + task + 历史分析       ← 可复用前缀
+------------------------------  cache breakpoint
+本轮新增内容                   ← 每轮变化部分
+```
+
+在 Provider 支持且实际命中的情况下，后续请求可以复用锚点之前的输入，减少重复处理、延迟或输入成本。项目不把“设置了锚点”解释成“缓存一定命中”：是否写入、命中、过期和计费由 Provider 决定，运行时只能通过规范化后的 `cache_read_tokens` 与 `cache_write_tokens` 观察结果。
+
+#### Provider 不同，行为也不同
+
+```text
+Runtime Message / sidecar["extra"]
+    → Bridge
+LLMMessage.extra["anthropic.cache_breakpoint"]
+    → Anthropic Adapter
+Provider Wire.cache_control = {"type": "ephemeral"}
+```
+
+换成 OpenAI Adapter 时，Anthropic 命名空间不是 OpenAI 的协议字段，Adapter 可以忽略它：消息正文照常发送，只是不带 Anthropic 的 `cache_control`。未知 hint 被忽略是刻意设计，而不是静默改变对话语义。
+
+缓存锚点和以下机制不要混淆：
+
+| 机制 | 解决的问题 | 是否改变项目 State |
+| --- | --- | --- |
+| Prompt Cache 锚点 | Provider 是否复用重复输入前缀 | 否 |
+| Context Compression | 活跃上下文过长时保留什么、摘要什么 | 是，追加事件并重指向活跃索引 |
+| Recall / Memory | 如何取回同一次运行或跨运行的历史信息 | 可能追加可见消息或外部产物 |
+| `sidecar["raw"]` | 保存实际 Provider 请求/响应证据 | 否，主要供 Trace 调试 |
+
+因此锚点是性能和成本提示，不是记忆机制，也不能替代压缩。实际 wire 是否出现 `cache_control` 应通过 raw request 检查；实际缓存效果应通过 `TokenUsage` 的缓存读写字段核对。
 
 ## 8. 响应规范化
 
-Adapter 必须将供应商结果转为：
+不同 Provider 的响应字段不同，但 Adapter 必须将它们转为同一种 `LLMResponse`：
 
 - 有序 Content Block；
 - 统一 StopReason：end_turn、tool_use、max_tokens 或 error；
@@ -143,7 +309,69 @@ Adapter 必须将供应商结果转为：
 - 实际服务模型标识；
 - 可选 raw 请求/响应快照。
 
-LLMResponse.content 是来源，`text`、`thinking_blocks` 和 `tool_calls` 是派生读取方式。Bridge 将其包装为 AssistantMessage，并附加 Runtime 的 sender、target、kind。全零 usage 转成未知值，避免下游误认为零消耗。
+例如：
+
+```python
+LLMResponse(
+    content=(
+        ThinkingBlock(text="需要先读取项目文件"),
+        TextBlock(text="我先读取 README。"),
+        ToolCallBlock(
+            id="call-1",
+            name="read",
+            arguments={"path": "README.md"},
+        ),
+    ),
+    stop_reason="tool_use",
+    usage=TokenUsage(
+        input_tokens=1200,
+        output_tokens=80,
+        cache_read_tokens=300,
+        cache_write_tokens=0,
+    ),
+    model="served-model-id",
+    raw={"request": {...}, "response": {...}},
+)
+```
+
+### 8.1 `content` 是唯一规范化输出来源
+
+`LLMResponse.content` 保存模型输出的有序结构。`response.text`、`response.thinking_blocks` 和 `response.tool_calls` 只是对同一个序列的筛选读取，不是三份可以独立修改的状态：
+
+```text
+LLMResponse.content
+  ├─ response.text             → 提取 TextBlock 文本
+  ├─ response.thinking_blocks  → 筛选 ThinkingBlock
+  └─ response.tool_calls       → 筛选 ToolCallBlock
+```
+
+这样可以保留 Provider 能表达的内容顺序，也避免文本、思考和工具调用三份状态相互矛盾。Runtime 识别工具调用、Trace 展示输出、后续请求重放都应以 `content` 为准。
+
+### 8.2 其他字段分别回答什么
+
+| 字段 | 回答的问题 | 典型读取者 |
+| --- | --- | --- |
+| `stop_reason` | Provider 为什么结束这次生成？ | Agent Bridge、重试与分析层 |
+| `usage` | 本次调用报告了多少输入、输出和缓存 Token？ | ModelResponseEvent、成本与上下文估算 |
+| `model` | 实际服务响应的是哪个模型标识？ | Trace、成本、版本比较 |
+| `raw` | 实际请求和原始响应是什么？ | Wire Debug、Adapter 核对 |
+
+OpenAI 可能把缓存输入包含在 `prompt_tokens` 中，Adapter 会把它规范化为普通 `input_tokens` 与独立 `cache_read_tokens`，避免重复计数。请求使用模型别名时，响应返回的实际模型快照优先进入 `model`；若 Adapter 没有提供，`complete()` 才回退到请求模型标识。`raw` 是 Provider 边界证据，正常 Runtime 不应从 OpenAI/Anthropic 原始对象判断工具调用或停止行为。
+
+### 8.3 从 LLMResponse 回到 State
+
+`make_llm_agent()` 根据 `stop_reason` 为 Runtime Message 补回阶段语义：`end_turn` 映射为 `kind="final"`，其他响应映射为 `kind="step"`。Bridge 将规范内容、usage、model 和 raw 包装为 `AssistantMessage`：
+
+```text
+LLMResponse
+  + sender / target / kind
+  → AssistantMessage
+  → ModelResponseEvent
+  → MessageEvent(AssistantMessage)
+  → State
+```
+
+工具是否实际执行仍由 `AssistantMessage.content` 中的 `ToolCallBlock` 和 Runtime 本地工具注册表决定；不能只依赖 Provider 的原始 stop 字段。全零 usage 在进入 AssistantMessage 时转成未知值，避免下游把“Provider 未提供数据”误解为“本次调用消耗为零”。
 
 ## 9. 两层恢复策略
 
@@ -182,6 +410,83 @@ LLMRequest 的 timeout 限制单次模型调用。Agent 装配可使用调用参
 
 raw 通过 AssistantMessage sidecar 进入调试链路，但 Runtime 不读取它来决定普通控制流。轨迹持久化会将逐轮增长的 raw 请求历史外置并去重，避免主 JSONL 产生平方级膨胀。
 
+### 11.1 Provider Wire、SDK 对象、raw 和 LLMResponse 不是一回事
+
+可以把一次调用经过的对象分成四层：
+
+```text
+Provider HTTP JSON
+  → Provider SDK 对象
+  → Adapter 解析
+  ├─→ LLMResponse              # 核心运行协议
+  └─→ raw 快照                 # 边界调试证据
+```
+
+SDK（Software Development Kit）是 Provider 提供的 API 客户端库，例如：
+
+```python
+client = OpenAI(api_key="...")
+sdk_response = client.responses.create(model="...", input=[...])
+```
+
+这里的 `sdk_response` 是 OpenAI SDK 自己定义的类实例；Anthropic SDK 会返回
+另一种类实例。它们的属性路径、版本行为和可序列化方式都属于 Provider，不能
+进入 `State`，也不能成为 Runtime 的控制协议。Adapter 负责把它转换成项目
+拥有的 `LLMResponse`，并通过 `sdk_dump()` 尽量保存一个可追踪的 raw 快照。
+当前 `sdk_dump()` 优先使用 SDK 的 `model_dump()`；没有该接口或转换失败时
+允许保留原对象作为调试回退，所以 raw 是 best-effort 证据，不是核心数据
+结构的替代品。
+
+错误的控制流是：
+
+```python
+if raw["response"]["choices"][0]["message"]["tool_calls"]:
+    execute_tools()
+```
+
+这会把 Runtime 绑定到 OpenAI Chat 的 `choices → message → tool_calls` 形状。
+Anthropic 的工具请求可能位于 `content[].type="tool_use"`，OpenAI Responses
+则可能位于 `output[].type="function_call"`。正确边界是：
+
+```text
+各 Provider 的工具字段
+  → Adapter
+  → LLMResponse.content 中的 ToolCallBlock
+  → AssistantMessage.tool_calls
+  → Runtime 本地工具注册表与 execute
+```
+
+`raw` 只用于核对“当时跨过边界的请求和响应是什么”；正常工具调度、停止判断
+和重试都读取规范化字段。
+
+### 11.2 OpenAI Responses 推理连续性是受控特例
+
+某些 Responses 推理模型要求下一轮请求重新带上上一轮 reasoning item 的连续
+性数据，例如 item `id`、`summary` 和 `encrypted_content`。这些字段不是
+所有 Provider 都有，因此不提升为通用 `Message.reasoning_id` 一类字段。
+
+当前链路是：
+
+```text
+raw["response"].output 中的 reasoning item
+  → Bridge 提取需要回放的字段
+  → AssistantMessage.sidecar["extra"][
+       "openai_responses.reasoning_items"
+     ]
+  → message_to_llm_message()
+  → OpenAI Responses Adapter
+  → 下一轮 wire 中的 reasoning item
+```
+
+摘要正文仍进入通用 `ThinkingBlock`；原始 item id 会保存在
+`ThinkingBlock.signature`，便于 Adapter 按 ID 配对；加密连续性内容只留在
+命名空间 `extra` 中。Adapter 下一轮会让 reasoning item 排在它所属的
+`function_call` 之前，且没有摘要或加密内容的空 item 会被跳过。
+
+这不是“Runtime 可以随便读取 raw”，而是 Bridge 和特定 Adapter 之间明确写
+出的 Provider 适配契约。换用 Anthropic、OpenAI Chat 或 Fake Provider 时，
+这个 namespaced extra 可以被忽略，通用 `content` 和运行控制仍然不变。
+
 ## 12. 配置与密钥边界
 
 - 模型注册表保存可公开的模型规格，不应把密钥写入设计或轨迹；
@@ -200,6 +505,7 @@ raw 通过 AssistantMessage sidecar 进入调试链路，但 Runtime 不读取�
 - Provider 特有 wire role 不扩张核心 Message role；
 - TokenUsage 在边界统一，缓存不得重复计数；
 - raw 是证据，不是核心控制协议；
+- Provider 连续性特例必须通过命名空间 `extra` 由对应 Adapter 处理；
 - 新 Adapter 不要求修改核心 Runtime。
 
 ## 14. 本篇理解检查

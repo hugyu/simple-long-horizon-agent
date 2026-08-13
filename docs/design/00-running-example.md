@@ -213,7 +213,6 @@ ContextView
 9. [09. 轨迹与可观测性](09-trace-and-observability.md)
 10. [10. 评测与运行体系](10-evaluation-and-operations.md)
 
-面试材料放在 13、14 篇，应该在理解真实运行之后再阅读。
 
 ## 11. 证据与验证
 
