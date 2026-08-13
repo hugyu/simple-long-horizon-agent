@@ -121,7 +121,8 @@ docs/design/
 ├── 12-system-scenarios-and-completeness.md # 已完成
 ├── 14-interview-question-map.md             # 已完成
 ├── 15-resume-project-description.md         # 已完成
-└── 16-interview-questions-and-answers.md    # 已完成
+├── 16-interview-answers.md                  # 已完成
+└── 17-interview-runtime-answers.md          # 已完成
 ```
 
 每篇文档都可以独立阅读；首次了解项目建议仍按编号顺序阅读。第 12 篇用于从完整场景反查前面各专题是否闭环。
@@ -298,11 +299,15 @@ Trace / Eval 和 Benchmark 数字拆成分层问题、潜在追问与压力测�
 并提供口头介绍与 Benchmark 数字口径。内容突出项目作者的实际设计与实现，不把
 模块机制假设写成组件级实验归因。
 
-### 16. [`16-interview-questions-and-answers.md`](16-interview-questions-and-answers.md)——Agent 项目面试问题与参考回答
+### 16. [`16-interview-answers.md`](16-interview-answers.md)——Agent 项目面试问题与回答
 
-逐项回答第 14 篇问题地图中的主要问题，重点解释设计、流程、边界和取舍。答案区分当前
-代码/设计能够支持的事实、需要候选人替换的模拟回答，以及项目尚未实现的合理演进方案；
-每个主题末尾都包含覆盖、事实、逻辑和风险审查。
+保存第 14 篇问题地图中项目定位与个人贡献部分的 10 道问题及参考回答，
+并明确当前代码事实、设计取舍和结果归因边界。
+
+### 17. [`17-interview-runtime-answers.md`](17-interview-runtime-answers.md)——Agent Runtime 面试问题与回答
+
+保存第 14 篇问题地图中一次真实 Agent Run 的 9 道主问题及参考回答，
+覆盖运行时序、模型输入、工具结果、异常边界、惰性执行、`resume()` 和完成判断。
 
 ## 6. 推荐阅读路线
 
