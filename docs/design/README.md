@@ -119,10 +119,7 @@ docs/design/
 ├── 10-evaluation-and-operations.md         # 已完成
 ├── 11-configuration-and-extension.md       # 已完成
 ├── 12-system-scenarios-and-completeness.md # 已完成
-├── 14-interview-question-map.md             # 已完成
-├── 15-resume-project-description.md         # 已完成
-├── 16-interview-answers.md                  # 已完成
-└── 17-interview-runtime-answers.md          # 已完成
+└── 15-resume-project-description.md         # 已完成
 ```
 
 每篇文档都可以独立阅读；首次了解项目建议仍按编号顺序阅读。第 12 篇用于从完整场景反查前面各专题是否闭环。
@@ -287,27 +284,11 @@ docs/design/
 
 本篇不是新的功能设计，而是检查前面是否已经把系统讲完整。若一个关键行为无法通过已有概念和模块解释，就说明前面的文档仍有遗漏。
 
-### 14. [`14-interview-question-map.md`](14-interview-question-map.md)——Agent 项目面试问题地图
-
-站在只能看到简历文字的面试官视角，将简历中的所有权、Runtime、上下文、多 Agent、
-Trace / Eval 和 Benchmark 数字拆成分层问题、潜在追问与压力测试，并标出需要谨慎
-表达的证据边界。
-
 ### 15. [`15-resume-project-description.md`](15-resume-project-description.md)——简历项目描述
 
 将项目定位、核心工作和实验结果整理为可直接用于简历的完整版、精简版和极简版，
 并提供口头介绍与 Benchmark 数字口径。内容突出项目作者的实际设计与实现，不把
 模块机制假设写成组件级实验归因。
-
-### 16. [`16-interview-answers.md`](16-interview-answers.md)——Agent 项目面试问题与回答
-
-保存第 14 篇问题地图中项目定位与个人贡献部分的 10 道问题及参考回答，
-并明确当前代码事实、设计取舍和结果归因边界。
-
-### 17. [`17-interview-runtime-answers.md`](17-interview-runtime-answers.md)——Agent Runtime 面试问题与回答
-
-保存第 14 篇问题地图中一次真实 Agent Run 的 9 道主问题及参考回答，
-覆盖运行时序、模型输入、工具结果、异常边界、惰性执行、`resume()` 和完成判断。
 
 ## 6. 推荐阅读路线
 
@@ -425,6 +406,5 @@ Trace / Eval 和 Benchmark 数字拆成分层问题、潜在追问与压力测�
 6. 后续文档发现新的整体关系时，回到相关文档补充链接和说明；
 7. 全部完成后，用第 12 篇检查端到端场景和遗漏。
 
-当前案例和 15 篇专题形成阅读路径。后续实现变化时，先更新 00 中受影响的事实快照，
-再回补对应专题和第 12 篇场景检查；面试问题和简历口径同步在第 14～15 篇
-校正。
+当前案例和 13 篇专题形成阅读路径。后续实现变化时，先更新 00 中受影响的事实快照，
+再回补对应专题和第 12 篇场景检查；简历口径在第 15 篇校正。

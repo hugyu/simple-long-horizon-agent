@@ -12,14 +12,15 @@ the new documents and their scope are discoverable.
 
 ## Changed Areas
 
-- `docs/design/14-interview-question-map.md`: filter questions by realistic
-  interview priority and add P0/P1/P2 guidance.
-- `docs/design/16-interview-questions-and-answers.md`: remove the superseded
+- Historical file 14-interview-question-map.md: filter questions by realistic
+  interview priority and add P0/P1/P2 guidance. The file was later removed.
+- Historical file 16-interview-questions-and-answers.md: remove the superseded
   monolithic answer guide.
-- `docs/design/16-interview-answers.md`: add project-positioning and ownership
-  answers.
-- `docs/design/17-interview-runtime-answers.md`: add Runtime control-flow,
-  context, tool, stopping, laziness, and resume answers.
+- Historical file 16-interview-answers.md: add project-positioning and ownership
+  answers. The file was later removed.
+- Historical file 17-interview-runtime-answers.md: add Runtime control-flow,
+  context, tool, stopping, laziness, and resume answers. The file was later
+  removed.
 - `docs/design/README.md`: update the design index for the new documents.
 
 ## Verification
