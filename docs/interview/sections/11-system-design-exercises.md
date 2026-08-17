@@ -2,7 +2,7 @@
 
 # 1. 设计一个可以连续运行数小时的软件工程 Agent
 
-> 我的核心目标不是让模型无限循环，而是让任务能够在有限预算下持续推进、接受外部验证、保留完整证据，并在故障后明确恢复或失败。
+我的核心目标不是让模型无限循环，而是让任务能够在有限预算下持续推进、接受外部验证、保留完整证据，并在故障后明确恢复或失败。
 
 整体架构：
 
@@ -43,13 +43,13 @@ wall-clock time
 
 一个符合项目设计的模拟故障是：
 
-> Agent 已运行两小时，模型认为修复完成，但测试仍有一个失败。Goal Loop 不把 final 当成任务完成，而是执行测试，将失败日志追加回 State。上下文已接近上限时，系统先生成 Handoff，保留当前任务、已完成修改、失败测试和下一步，再在新窗口中继续。
+Agent 已运行两小时，模型认为修复完成，但测试仍有一个失败。Goal Loop 不把 final 当成任务完成，而是执行测试，将失败日志追加回 State。上下文已接近上限时，系统先生成 Handoff，保留当前任务、已完成修改、失败测试和下一步，再在新窗口中继续。
 
 当前项目已经具备显式 Runtime、工具、上下文压缩、Recall、Handoff、Goal Loop、Trace 和容器 Eval；跨进程 Checkpoint、幂等副作用和通用持久化调度仍属于生产化缺口。
 
 # 2. 设计 Agent 的上下文压缩与信息恢复系统
 
-> 我会把“发生过什么”和“本轮模型看到什么”彻底分开，不能通过删除历史来控制上下文。
+我会把“发生过什么”和“本轮模型看到什么”彻底分开，不能通过删除历史来控制上下文。
 
 三层数据模型是：
 
@@ -99,13 +99,13 @@ wall-clock time
 
 模拟故障：
 
-> 摘要把错误码 `EACCES` 写成普通权限问题，但后续排查需要原始路径。Agent 使用 Recall 恢复对应 ToolResult，重新取得原始命令、路径和错误码。摘要错误不会覆盖原始证据。
+摘要把错误码 `EACCES` 写成普通权限问题，但后续排查需要原始路径。Agent 使用 Recall 恢复对应 ToolResult，重新取得原始命令、路径和错误码。摘要错误不会覆盖原始证据。
 
 当前项目已经实现完整历史、活跃索引、Tool Compact、模型摘要、Agent Compact、Tiered Strategy 和 Recall。生产化还需要摘要质量评测、Checkpoint 恢复和更精确的跨模型 Token 预算。
 
 # 3. 设计支持 OpenAI 和 Anthropic 的统一模型接口
 
-> 我不会让 Runtime 直接处理 OpenAI 或 Anthropic SDK 对象，而是增加项目拥有的中间协议。
+我不会让 Runtime 直接处理 OpenAI 或 Anthropic SDK 对象，而是增加项目拥有的中间协议。
 
 整体分层：
 
@@ -163,7 +163,7 @@ openai_responses.reasoning_items
 
 # 4. 设计可中止、可恢复、可审计的工具调用系统
 
-> 工具调用不能只是一次函数调用，而应是有身份、有授权、有持久状态的操作。
+工具调用不能只是一次函数调用，而应是有身份、有授权、有持久状态的操作。
 
 状态机可以设计为：
 
@@ -208,7 +208,7 @@ side-effect reference
 
 模拟故障：
 
-> Edit 已经写入文件，但进程在记录 ToolResult 前崩溃。恢复时发现操作状态为 pending，系统读取文件当前 Hash，并根据 expected version 判断修改是否已经完成。如果已完成，就补记原结果；如果状态无法确定，则标记 in_doubt，不能直接再次编辑。
+Edit 已经写入文件，但进程在记录 ToolResult 前崩溃。恢复时发现操作状态为 pending，系统读取文件当前 Hash，并根据 expected version 判断修改是否已经完成。如果已完成，就补记原结果；如果状态无法确定，则标记 in_doubt，不能直接再次编辑。
 
 审计从 ToolExecution Event、Hook Decision 和 Result 派生。敏感参数应脱敏，但调用身份、策略版本和审批结果必须保留。
 
@@ -216,7 +216,7 @@ side-effect reference
 
 # 5. 设计支持主 Agent 和子 Agent 的任务委派系统
 
-> 动态委派适合使用 Task Tool，因为从父模型视角看，委派与调用其他工具具有相同决策形状。
+动态委派适合使用 Task Tool，因为从父模型视角看，委派与调用其他工具具有相同决策形状。
 
 调用协议：
 
@@ -269,7 +269,7 @@ tool_error
 
 # 6. 设计 Agent Trace 与成本统计平台
 
-> 平台应以 Event Stream 为唯一运行事实，Trace、Span、ModelTurn 和 Cost 都是派生视图。
+平台应以 Event Stream 为唯一运行事实，Trace、Span、ModelTurn 和 Cost 都是派生视图。
 
 数据流：
 
@@ -315,11 +315,11 @@ Provider Raw 数据单独放入受限 Sidecar，避免主 Trace 平方增长。�
 
 模拟故障：
 
-> Trace 后台 Writer 写盘失败，但 Agent 仍在运行。Writer 通过错误回调和 Metrics 告警，不把观察层故障伪装成 Agent 行为失败。生产环境可以先写本地 WAL，再异步上传中央存储。
+Trace 后台 Writer 写盘失败，但 Agent 仍在运行。Writer 通过错误回调和 Metrics 告警，不把观察层故障伪装成 Agent 行为失败。生产环境可以先写本地 WAL，再异步上传中央存储。
 
 # 7. 设计可复现的容器化 Agent Benchmark 平台
 
-> 我会把任务语义、执行位置和产物传输设计成三个正交协议：Suite、Backend 和 ArtifactStore。
+我会把任务语义、执行位置和产物传输设计成三个正交协议：Suite、Backend 和 ArtifactStore。
 
 ```text
 Suite
@@ -374,7 +374,7 @@ Dataset 并发时每个实例拥有独立目录和容器。只重试基础设施
 
 # 8. 设计多 Agent 并行执行和结果合并机制
 
-> 首先判断是 Ensemble 还是 Map。Ensemble 是多个 Agent 解决同一问题；Map 是不同 Agent 处理不同子任务。
+首先判断是 Ensemble 还是 Map。Ensemble 是多个 Agent 解决同一问题；Map 是不同 Agent 处理不同子任务。
 
 架构：
 
@@ -417,7 +417,7 @@ Worker 身份
 
 # 9. 设计 Agent 长期 Memory 系统
 
-> 长期 Memory 不应保存全部历史，而应保存少量高价值、可验证、跨任务仍有用的经验。
+长期 Memory 不应保存全部历史，而应保存少量高价值、可验证、跨任务仍有用的经验。
 
 接口保持简单：
 
@@ -459,13 +459,13 @@ Memory 需要容量限制、运行数量限制、Namespace 限制和最旧证据
 
 模拟故障：
 
-> Distiller 返回空内容或试图删除所有既有经验。系统拒绝这次重写，保留原 `MEMORY.md`，写入错误标记，但不让 Memory 失败影响已经完成的主任务。
+Distiller 返回空内容或试图删除所有既有经验。系统拒绝这次重写，保留原 `MEMORY.md`，写入错误标记，但不让 Memory 失败影响已经完成的主任务。
 
 如果未来需要向量检索，应实现另一种 Memory 类型。不能悄悄把 FilesystemMemory 改成每轮自动检索，否则信息出现的原因和 Trace 会变得不可解释。
 
 # 10. 设计带权限审批的 MCP 工具平台
 
-> MCP Server 同时控制工具声明、参数 Schema 和返回内容，因此必须把它看成外部不可信能力，而不是普通可信函数。
+MCP Server 同时控制工具声明、参数 Schema 和返回内容，因此必须把它看成外部不可信能力，而不是普通可信函数。
 
 整体架构：
 
