@@ -15,8 +15,8 @@ complete Agent fundamentals and Skills study guide.
 - `docs/interview/agent-interview-question-bank.md`: add the resume-derived
   interview question bank, system-design prompts, preparation risks, and Agent
   fundamentals questions.
-- `docs/interview/sections/`: add topic-specific interview answer documents,
-  including 162 Agent fundamentals and Skills questions with matching answers.
+- Topic-specific interview answer documents: add 162 Agent fundamentals and
+  Skills questions with matching answers.
 - Historical files `14-interview-question-map.md`,
   `16-interview-answers.md`, and `17-interview-runtime-answers.md`: remove
   superseded interview material from the architecture design directory.
