@@ -138,8 +138,16 @@ Then use `Provider(api="my-api", ...)` like any built-in.
   namespaced bag of options on one request (`extra["seed"] = 1`).
   Adapters read only the keys they recognize; unknown keys are
   silently ignored so a transcript stays portable across providers.
-  The runtime side stashes `extra` under `Message.data["extra"]`; the
-  bridge lifts it to `LLMMessage.extra` so it reaches the adapter.
+  The runtime side stashes per-message hints under
+  `Message.sidecar["extra"]`; the bridge lifts only that sidecar entry to
+  `LLMMessage.extra` so it can reach the adapter. Other sidecar entries such
+  as `raw`, `details`, and `compression` remain runtime-local.
+- **The three main LLM data types have different granularity.** An
+  `LLMMessage` is one role/content item inside `LLMRequest.messages`;
+  `LLMRequest` is the complete input for one provider call; `LLMResponse` is
+  that call's complete normalized output. The response bridge still needs to
+  add runtime routing (`sender`, `target`, `kind`) before the result becomes
+  an `AssistantMessage` that the agent loop can record.
 
 ## What this layer does NOT do
 

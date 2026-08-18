@@ -60,7 +60,49 @@ Provider 描述一次模型访问所需的稳定配置，例如：
 
 Provider 是不可变配置值，不保存对话状态，也不等于 SDK client。模型注册表负责用名称映射 Provider 规格；环境加载器负责将环境变量解析为 Provider。Runtime 只持有已解析 Provider，不自行读取任意环境变量。
 
-## 4. LLMRequest 的组成
+## 4. LLMMessage、LLMRequest 与 LLMResponse
+
+三者共同构成一次供应商无关模型调用，但粒度不同：
+
+```text
+LLMRequest                         # 一次完整调用的输入包
+├── provider / system_prompt
+├── messages
+│   ├── LLMMessage(role="user")   # 一条输入消息
+│   ├── LLMMessage(role="assistant")
+│   └── LLMMessage(role="user")
+├── tools
+└── reasoning / timeout / extra
+
+                 ↓ Adapter / Provider Wire
+
+LLMResponse                        # 这一次调用的完整输出
+├── content
+├── stop_reason
+├── usage
+├── model
+└── raw
+```
+
+| 对象 | 核心字段 | 不拥有的职责 |
+| --- | --- | --- |
+| `LLMMessage` | role、content、消息级 extra | 不选择 Provider，不声明整次调用参数 |
+| `LLMRequest` | provider、messages、tools、system prompt、生成参数、请求级 extra | 不保存模型生成结果 |
+| `LLMResponse` | content、stop reason、usage、实际模型、raw | 不拥有 Runtime 的 sender、target、kind |
+
+`LLMMessage` 只是 `LLMRequest.messages` 中的一项。它可以表达文本、图片、思考、工具调用或工具结果，但单独一条消息不足以发起调用，因为 Provider、其他历史消息、工具声明和超时都属于外层 Request。
+
+`LLMResponse` 则是 Provider 调用结束后的规范化结果。它不是一条 Runtime `AssistantMessage`：模型访问层不知道这条输出在 Agent 系统中由谁发送、发给谁，以及应解释为 `step` 还是 `final`。这些运行语义由 `make_llm_agent()` 和 Response Bridge 在返回核心循环前补回。
+
+一句话记忆：
+
+```text
+LLMMessage  = 完整输入中的一条消息
+LLMRequest  = 一次模型调用的完整输入
+LLMResponse = 一次模型调用的完整输出
+```
+
+### 4.1 LLMRequest 的组成
 
 一次请求包含：
 
@@ -76,7 +118,7 @@ Provider 是不可变配置值，不保存对话状态，也不等于 SDK client
 
 LLMRequest 是纯数据，适合记录和回放。工具声明只保留名称、描述和 JSON Schema；本地执行函数绝不能跨模型边界。
 
-### 4.1 工具声明与本地执行是两条边界
+### 4.2 工具声明与本地执行是两条边界
 
 Runtime 中的 `AgentTool` 同时包含“模型需要知道的声明”和“Runtime 才能使用的执行控制”：
 
@@ -119,7 +161,7 @@ LLMTool(
 
 `AgentTool.execute` 不会序列化到 HTTP，也不由 Provider 执行。模型只能请求 `read(path)`；Runtime 收到规范化的 `ToolCallBlock(name="read")` 后，仍需在本地已注册工具表中查找并调用对应的 `execute`。这既避免发送不可序列化的 Python 函数，也保留了本地权限、超时和并发控制。
 
-### 4.2 一次 LLMRequest 如何跨过 Adapter
+### 4.3 一次 LLMRequest 如何跨过 Adapter
 
 Runtime、State 和 Agent 配置准备好后，先形成供应商无关的纯数据请求：
 
@@ -226,6 +268,56 @@ ThinkingBlock 在统一内容序列中保留文本、签名、是否脱敏及必
 
 请求级和消息级 `extra` 允许供应商特性先以命名空间形式进入边界，例如缓存锚点。Adapter 只读取自己的命名空间，未知项应被忽略，从而保持 transcript 可跨 Provider 使用。成熟且普遍的能力应提升为明确字段，不能永久堆积在 extra。
 
+#### Message sidecar 如何穿过 Bridge
+
+Runtime Message 的 `sidecar` 是消息旁边的本地附加信息，不是模型正文：
+
+```text
+Message
+├── content                 # 模型可见正文
+├── role
+├── sender / target / kind  # Runtime 路由
+└── sidecar                 # 非正文附加信息
+    ├── extra               # 允许进入 LLM 边界的 Provider hint
+    ├── details             # 工具或子 Agent 本地细节
+    ├── raw                 # Provider 原始请求/响应证据
+    └── compression         # 摘要生成的本地元数据
+```
+
+请求 Bridge 只执行受控投影：
+
+```python
+extra = dict(message.sidecar.get("extra") or {})
+
+LLMMessage(
+    role=message.role,
+    content=message.content,
+    extra=extra,
+)
+```
+
+也就是：
+
+```text
+Message.sidecar["extra"]
+    → Bridge 复制
+LLMMessage.extra
+    → 对应 Provider Adapter 选择性翻译
+```
+
+`sender`、`target`、`kind` 和其他 sidecar 字段不会进入普通 `LLMMessage`。其中 `details` 服务于工具、子 Agent 和 Trace；`raw` 保存边界核对材料；`compression` 保存摘要生成的局部元数据。把它们整包发给 Provider 会扩大请求、泄露本地诊断信息，并可能把旧请求/响应再次嵌套进新请求。
+
+因此 Bridge 在这里也是信息防火墙：允许显式 Provider hint 穿过，同时阻止 Runtime 内部状态意外跨线。Response 方向可以把新的 raw 快照放回 `AssistantMessage.sidecar["raw"]` 供本地调试，但 raw 不会因此成为下一轮普通模型输入。
+
+消息级与请求级 extra 的作用域也不同：
+
+```text
+LLMMessage.extra = 只控制某一条消息的 Provider 表达
+LLMRequest.extra = 控制整次模型调用的 Provider 选项
+```
+
+消息级 hint 会随 transcript 跨 Provider 复用，因此应使用 `anthropic.*`、`openai_responses.*` 之类的命名空间，让不相关 Adapter 可以安全忽略。请求级 extra 已经绑定本次 `provider.api`，当前 Adapter 读取的是各自明确列出的白名单键，例如 OpenAI Chat 的 `seed`、Anthropic 的 `top_k`；未知键仍不能原样塞进 wire。两者都属于受控逃生口，不是任意透传字典。
+
 #### 缓存锚点是什么
 
 长上下文 Agent 的每次请求通常都会重复携带稳定前缀：固定 system prompt、任务说明、已经完成的代码分析和早期工具结果。缓存锚点是附着在某条 `LLMMessage` 上的 Provider hint，用来告诉支持该能力的 Adapter：
@@ -287,6 +379,8 @@ Provider Wire.cache_control = {"type": "ephemeral"}
 ```
 
 换成 OpenAI Adapter 时，Anthropic 命名空间不是 OpenAI 的协议字段，Adapter 可以忽略它：消息正文照常发送，只是不带 Anthropic 的 `cache_control`。未知 hint 被忽略是刻意设计，而不是静默改变对话语义。
+
+这里的 `anthropic.cache_breakpoint` 不是原样发给 Anthropic，也不会变成模型阅读的文字。Anthropic Adapter 将其翻译为最后一个 wire content block 的 `cache_control: {"type": "ephemeral"}`；其他 Adapter 不认识这个命名空间时只发送原正文。
 
 缓存锚点和以下机制不要混淆：
 
@@ -511,6 +605,8 @@ raw["response"].output 中的 reasoning item
 ## 14. 本篇理解检查
 
 - Provider、Adapter、LLMRequest 和 SDK client 有什么区别？
+- 为什么 `LLMMessage` 不能独立代表一次模型调用？`LLMResponse` 又为什么不能直接写入 State？
+- `Message.sidecar["extra"]`、`LLMMessage.extra` 与 `LLMRequest.extra` 的作用域分别是什么？
 - 为什么 `make_llm_agent` 不属于纯 LLM 包？
 - 一个工具结果包为何可能变成多个 OpenAI wire message？
 - StreamEvent 与 Runtime Event 是否是同一事件流？

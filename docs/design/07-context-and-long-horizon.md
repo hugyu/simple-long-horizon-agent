@@ -314,6 +314,8 @@ ModelRequestEvent(agent="compressor")
 
 “compressor 生成摘要”不等于“compressor 完成了压缩”。四个角色分别拥有不同责任：
 
+本节关注 SummarizeStrategy 与 compressor 的职责边界；decision 如何由 `core.run()` 交给 Compression Runtime、写入 State 并在同一 Turn 影响 writer 请求，统一见 [Runtime 如何让压缩在同一轮生效](04-agent-runtime.md#5-runtime-如何让压缩在同一轮生效)。
+
 | 参与者 | 负责什么 | 不负责什么 |
 | --- | --- | --- |
 | compressor Agent / Provider | 读取待压缩消息，生成摘要文本 | 不决定主 State 的活跃索引，不写主 State |
@@ -364,6 +366,8 @@ ContextCompressionEvent(agent="writer", strategy="summarize")
 ```
 
 这里要区分“创建事件对象”和“正式写入事件流”：Strategy 创建前两个模型事件和 `CompressionDecision`；Runtime 创建 `MessageEvent`、`ContextCompressionEvent` 并统一调用 `State.record_event_at()`；State 在追加时补齐 index、elapsed 和 UUID。`ContextCompressionEvent` 不能由 compressor 创建，因为 compressor 只看到一批消息，不掌握主 State 的当前活跃索引、替代消息位置、前后 Token 或所属主 Agent。
+
+第四个 Event 被 State 追加时，`StateSnapshot.apply()` 会立即采用其中的 `active_context_indices`。控制权返回 `core.run()` 后，writer 随即从这个新投影构建 ContextView；这里没有独立的提交阶段，也不等待下一个 Turn。
 
 当前 compressor 使用 `self.compressor.generate(...)`，不是 `run(compressor, compressor_state)`。因此不会产生独立的 `AgentStartEvent`、`TurnStartEvent`、工具生命周期或 `AgentEndEvent`；只记录这一次内部模型调用对应的 ModelRequest/Response Event。它仍可被 Trace 层派生为压缩 Span，但 Span 是观察视图，不会反过来驱动主 Runtime。
 

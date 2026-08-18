@@ -262,17 +262,134 @@ AgentStart/AgentEnd 包围整次运行，TurnStart/TurnEnd 只包围其中一次
 
 正常 `final` 不会把 `TurnEndEvent.terminated` 设为 true：`terminated` 专门表达工具终止信号，正常完成由后续 `AgentEndEvent(reason="done")` 表达。这样观察者可以区分“模型认为任务完成”“工具要求停止”“外部中止”和“预算耗尽”。
 
-## 5. 模型请求前为什么先处理上下文
+## 5. Runtime 如何让压缩在同一轮生效
 
-每一轮都重新从 State 构建上下文，而不是复用上一轮列表：
+每一轮都从 State 重新构建上下文，而不是复用上一轮列表。压缩发生在本轮 writer 模型请求之前：如果策略命中，Runtime 先把 decision 转换成主 State 中的正式事实，再从更新后的 Snapshot 读取活跃消息。因此摘要影响的是**当前 Turn 接下来尚未发出的 writer 请求**，不是等到下一个 Turn 才生效。
 
-1. 压缩策略先读取当前活跃上下文；
-2. 若策略给出决定，Runtime 追加替代消息与 ContextCompressionEvent；
-3. ContextView 再按 Agent policy 过滤不可见 kind；
-4. ModelRequestEvent 记录本轮可见数量、估算大小、工具定义和模型消息投影；
-5. `generate` 收到与记录一致的可见 Message 列表。
+### 5.1 从 `core.run()` 到 `CompressionDecision`
 
-因此工具结果、Hook 新消息、摘要和 follow-up 都会在正确的下一轮生效。压缩属于请求前控制，不会在模型生成途中偷偷改变输入。
+请求前控制链如下：
+
+```text
+core.run()
+  → maybe_compress_context(agent, state, policy)
+  → strategy(active, agent_name)
+  → CompressionDecision
+  → compression.runtime._apply_decision(...)
+  → State.record_event_at(...)
+  → StateSnapshot.apply(...)
+  → core.run() 继续构建 writer 的 ContextView
+```
+
+这里有两个不同阶段：
+
+1. Strategy 读取当前活跃消息，选择需要替换的索引，返回 `CompressionDecision`；
+2. Compression Runtime 校验并应用 decision，把结果转换成正式 Event。
+
+`CompressionDecision` 是 Strategy 与 Runtime 之间的临时交接对象，包含目标索引、replacement、策略标签以及可选的内部 trace events。它本身不会写入 `State.events`，也不能直接修改 Snapshot。这样 Strategy 只负责“建议怎样压缩”，State 的修改规则仍集中在 Runtime。
+
+### 5.2 Decision 如何写进主 State
+
+以需要 compressor 模型的 `SummarizeStrategy` 为例，一个 decision 最终按以下顺序记录：
+
+```text
+1. ModelRequestEvent(agent="compressor")
+2. ModelResponseEvent(agent="compressor", usage=...)
+3. MessageEvent(UserMessage(kind="summary"))
+4. ContextCompressionEvent(agent="writer", strategy="summarize")
+```
+
+前两个 Event 来自 `decision.trace_events`，用于保留摘要生成时发生的内部模型调用。第三个 Event 把 replacement 作为普通 summary Message 追加到完整 transcript。第四个 Event 记录哪些旧消息被替代，以及新的活跃顺序。
+
+规则压缩或 Agent-controlled compact 没有额外 compressor 调用时，可以没有前两个 Event；但只要真正改变活跃上下文，就仍然会记录 replacement MessageEvent 和 ContextCompressionEvent。
+
+```mermaid
+sequenceDiagram
+    participant Core as core.run writer Turn
+    participant Strategy as CompressionStrategy
+    participant Runtime as compression.runtime
+    participant State
+    participant Snapshot as StateSnapshot
+    participant Writer as writer.generate
+
+    Core->>Runtime: maybe_compress_context(agent, state, policy)
+    Runtime->>Strategy: 读取当前 active items
+    Strategy-->>Runtime: CompressionDecision
+    Runtime->>State: record_event_at(compressor request/response)
+    State->>Snapshot: apply，消息投影不变
+    Runtime->>State: record_event_at(MessageEvent(summary))
+    State->>Snapshot: messages 追加 summary
+    Runtime->>State: record_event_at(ContextCompressionEvent)
+    State->>Snapshot: 替换 active_context_indices
+    Runtime-->>Core: 返回已记录的压缩 Events
+    Core->>State: active_context_messages()
+    State-->>Core: task + summary + recent
+    Core->>Writer: generate(visible)
+```
+
+### 5.3 `record_event_at()` 为什么就是生效点
+
+每次调用 `State.record_event_at()` 都连续完成两件事：
+
+```python
+self.events.append(stamped)
+self.snapshot.apply(stamped)
+```
+
+因此 Event 一旦进入主 State，对应的当前投影也在同一个调用中更新：
+
+| Event | `state.events` | `state.snapshot` |
+| --- | --- | --- |
+| compressor ModelRequestEvent | 追加生成证据 | 忽略 |
+| compressor ModelResponseEvent | 追加模型、usage 等证据 | 忽略 |
+| summary MessageEvent | 追加摘要消息事实 | 将摘要追加到 `messages` |
+| ContextCompressionEvent | 追加压缩动作事实 | 用事件中的列表替换 `active_context_indices` |
+
+真正改变后续模型输入的是最后一行。summary MessageEvent 只保证摘要存在于完整消息历史中；ContextCompressionEvent 才指定“当前应该按什么顺序读取哪些消息”。
+
+`maybe_compress_context()` 会先完整应用 decision，再把已经记录的压缩 Events 返回给 `core.run()`。核心循环随后才调用：
+
+```python
+context = build_context_view(
+    agent.name,
+    state.active_context_messages(),
+    policy=policy,
+)
+```
+
+所以不需要额外 commit、刷新或下一轮触发。这里的“写入”默认也是写入内存中的 `State`，不是自动写文件或数据库；持久化和 Trace 导出只是后续读取 `state.events` 的外围能力。
+
+### 5.4 完整历史为什么没有被删除
+
+假设压缩前的完整消息为：
+
+```text
+0 task
+1 old A
+2 old B
+3 recent
+```
+
+Strategy 决定用 summary 替换 1、2。Runtime 先把 summary 追加为新消息 4，再记录新的活跃顺序：
+
+```text
+StateSnapshot.messages       = [0 task, 1 old A, 2 old B, 3 recent, 4 summary]
+active_context_indices       = [0, 4, 3]
+```
+
+接下来的 writer ContextView 读取 `[0, 4, 3]`，所以模型看到 `task + summary + recent`；旧消息 1、2 仍留在完整历史中，Trace、Recall 和 Snapshot 重建仍可读取。高索引 summary 被插回旧内容的逻辑位置，因此活跃索引不要求数字单调递增。
+
+压缩完成后的同一 Turn 继续为：
+
+```text
+ContextCompressionEvent(writer)
+  → state.active_context_messages()
+  → build_context_view(writer, ...)
+  → ModelRequestEvent(writer)       # 已包含 summary，不包含 old A / old B
+  → writer.generate(visible)
+```
+
+因此工具结果、Hook 新消息、摘要和 follow-up 都会在下一次尚未发出的模型请求中生效。压缩属于请求前控制，不会在模型生成途中改变已经发出的输入。策略类型、摘要证据和索引保护规则见[上下文与长周期能力](07-context-and-long-horizon.md#5-compression缩小当前运行的工作上下文)。
 
 ## 6. 生成函数的两种实现
 
@@ -282,7 +399,36 @@ AgentStart/AgentEnd 包围整次运行，TurnStart/TurnEnd 只包围其中一次
 
 ### 6.2 LLM-backed Agent
 
-模型 Agent 由装配层创建。其生成函数完成：
+模型 Agent 由装配层创建。`core.run()` 不直接操作 `LLMRequest` 或 Provider SDK；它只调用 `agent.generate(visible)`。对于 `make_llm_agent()` 创建的 Agent，这个 generate 闭包才进入模型访问层：
+
+```text
+core.run()
+  → build_context_view(...)
+  → visible: list[Message]
+  → ModelRequestEvent(writer)           # Runtime 先记录将要调用模型
+  → agent.generate(visible)
+      → Message[] → LLMMessage[]        # Bridge 去掉 Runtime 路由
+      → 组装一个 LLMRequest             # 完整的一次模型调用输入
+      → complete_with_tool_call_retry()
+          → Provider Adapter / Wire
+          → LLMResponse                 # 完整的一次模型调用输出
+      → LLMResponse → AssistantMessage  # Bridge 补回 Runtime 身份
+  → ModelResponseEvent(writer)
+  → MessageEvent(AssistantMessage)
+  → 可选工具调度
+```
+
+这里的三个 LLM 对象不是同一级别：
+
+| 对象 | 粒度 | 回答的问题 |
+| --- | --- | --- |
+| `LLMMessage` | 请求中的一条对话消息 | 某个 role 说了什么？ |
+| `LLMRequest` | 一次完整模型调用 | 调哪个 Provider，发送哪些消息、工具和参数？ |
+| `LLMResponse` | 一次调用的完整结果 | 模型产生了什么、为何停止、用了多少 Token？ |
+
+一个 `LLMRequest` 通常包含多条 `LLMMessage`；`LLMResponse` 不是 `LLMMessage` 的子类型，也不是可以直接写进 State 的 Runtime Message。它还缺少 `sender`、`target` 和 `kind`，所以必须先由 Response Bridge 包装为 `AssistantMessage`。
+
+生成函数内部依次完成：
 
 1. Message 投影为 LLMMessage；
 2. 工具投影为 LLMTool；
@@ -291,7 +437,9 @@ AgentStart/AgentEnd 包围整次运行，TurnStart/TurnEnd 只包围其中一次
 5. 将 LLMResponse 包装成 AssistantMessage；
 6. `stop_reason="end_turn"` 映射为 `kind="final"`，其他可继续形态映射为 `step`。
 
-Runtime 不需要知道哪家 Provider 被调用，只处理返回的统一 Message。
+请求 Bridge 同时构成信息边界：模型正文 `content` 保留，`sender`、`target`、`kind` 等 Runtime 路由字段截止；`Message.sidecar` 中只有明确作为 Provider hint 的 `sidecar["extra"]` 被复制到 `LLMMessage.extra`，`details`、`raw` 和 `compression` 不会随普通请求发给 Provider。对应 Adapter 只处理自己认识的命名空间，未知 hint 被忽略。
+
+Runtime 因而不需要知道哪家 Provider 被调用，只处理返回的统一 Message。三种对象的字段、sidecar 提升规则及 wire 示例见[模型访问边界](05-model-access.md#4-llmmessagellmrequest-与-llmresponse)。
 
 ## 7. 工具调用如何形成下一轮
 
@@ -387,6 +535,7 @@ Runtime 没有后台守护线程替调用者无限推进。谁消费迭代器，
 
 - 为什么 `Agent.run()` 返回的迭代器必须被消费？
 - 一轮中压缩、ContextView、模型请求、响应消息和工具结果的顺序是什么？
+- 为什么只追加 summary Message 还没有完成压缩，必须再记录 ContextCompressionEvent？
 - 程序化 Agent 与模型 Agent 如何共用同一个 Runtime？
 - 为什么 PRE_TOOL_USE Hook 不能追加 Message？
 - `final`、max turns、tool terminate 和 abort 有何区别？
