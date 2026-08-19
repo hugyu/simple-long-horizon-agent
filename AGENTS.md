@@ -29,8 +29,11 @@ Non-goals:
    explicit review checklist. If it does not exist, add the smallest useful one
    alongside the change.
 3. Make the smallest useful change.
-4. Run the narrowest useful check and report the command. The full gate is
-   `bash runs/dev/run_ci.sh`.
+4. Run the narrowest useful check and report the command. For documentation-only
+   changes, do not run the full quality gate; run
+   `uv run python -m scripts.lint_docs` and `git diff --check`. Run
+   `bash runs/dev/run_ci.sh` when source, configuration, tests, runnable
+   examples, or CI behavior changes.
 
 If the task depends on an external architecture idea, capture a local note under
 `docs/reference-architectures/` first (gitignored; only the convention is

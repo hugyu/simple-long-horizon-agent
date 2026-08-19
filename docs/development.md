@@ -24,6 +24,17 @@ It mirrors `.github/workflows/ci.yml` exactly; keep the two in lockstep when
 adding a check, or you get "passes locally, fails in CI". The individual
 commands, when iterating on one of them:
 
+Documentation-only changes use a smaller required check and must not run the
+full gate:
+
+```bash
+uv run python -m scripts.lint_docs
+git diff --check
+```
+
+Run the full gate when a change touches source, configuration, tests, runnable
+examples, dependencies, generated documentation inputs, or CI behavior.
+
 | Check | Command |
 | --- | --- |
 | Format | `uv run ruff format --check .` |

@@ -17,8 +17,16 @@ Read these in order:
 
 ## Local quality gate
 
-Before opening a pull request, the same checks that GitHub Actions runs
-should pass locally:
+For documentation-only changes, do not run the full quality gate. Use the
+focused documentation checks:
+
+```bash
+uv run python -m scripts.lint_docs
+git diff --check
+```
+
+When source, configuration, tests, runnable examples, dependencies, or CI
+behavior changes, run the same checks that GitHub Actions runs:
 
 ```bash
 bash runs/dev/run_ci.sh
