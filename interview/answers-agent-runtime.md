@@ -1,8 +1,8 @@
-# 18. 面试专题回答：Agent Runtime 与核心抽象
+# 面试专题回答：Agent Runtime 与核心抽象
 
-本文覆盖 [`17-interview-question-checklist.md`](17-interview-question-checklist.md)
+本文覆盖 [`question-checklist.md`](question-checklist.md)
 中第 1 个专题的全部问题。每个回答都按
-[`16-interview-answer-guidelines.md`](16-interview-answer-guidelines.md) 使用候选人第一
+[`answer-guidelines.md`](answer-guidelines.md) 使用候选人第一
 人称口吻，并以当前代码和测试为事实边界。
 
 ## 1. 画一下 Runtime 的整体架构和一次 Turn 的完整数据流
@@ -285,9 +285,9 @@ def run(agent, task, max_turns, abort):
 
 ## 核对依据
 
-- [`core.py`](../../src/simple_long_horizon_agent/core.py)
-- [`messages.py`](../../src/simple_long_horizon_agent/messages.py)
-- [`protocols.py`](../../src/simple_long_horizon_agent/protocols.py)
-- [`state.py`](../../src/simple_long_horizon_agent/state.py)
-- [`04-agent-runtime.md`](04-agent-runtime.md)
-- [`tests/unit/test_core.py`](../../tests/unit/test_core.py)
+- [`core.py`](../src/simple_long_horizon_agent/core.py)
+- [`messages.py`](../src/simple_long_horizon_agent/messages.py)
+- [`protocols.py`](../src/simple_long_horizon_agent/protocols.py)
+- [`state.py`](../src/simple_long_horizon_agent/state.py)
+- [`04-agent-runtime.md`](../docs/design/04-agent-runtime.md)
+- [`tests/unit/test_core.py`](../tests/unit/test_core.py)

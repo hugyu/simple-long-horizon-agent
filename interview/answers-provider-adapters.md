@@ -1,6 +1,6 @@
-# 19. 面试专题回答：Provider-neutral 协议与 Adapter
+# 面试专题回答：Provider-neutral 协议与 Adapter
 
-本文覆盖 [`17-interview-question-checklist.md`](17-interview-question-checklist.md)
+本文覆盖 [`question-checklist.md`](question-checklist.md)
 中第 2 个专题的全部问题。回答以当前 OpenAI Chat、OpenAI Responses、Anthropic
 Messages 和 Fake Adapter 的代码与测试为事实依据。
 
@@ -150,10 +150,10 @@ OpenAI-compatible 服务没有系统化兼容矩阵；这部分不能只靠 stub
 
 ## 核对依据
 
-- [`llm/types.py`](../../src/simple_long_horizon_agent/llm/types.py)
-- [`llm/bridge.py`](../../src/simple_long_horizon_agent/llm/bridge.py)
-- [`llm/adapters/`](../../src/simple_long_horizon_agent/llm/adapters/)
-- [`llm/retry.py`](../../src/simple_long_horizon_agent/llm/retry.py)
-- [`05-model-access.md`](05-model-access.md)
-- [`tests/unit/test_real_adapters.py`](../../tests/unit/test_real_adapters.py)
-- [`tests/unit/test_llm_retry.py`](../../tests/unit/test_llm_retry.py)
+- [`llm/types.py`](../src/simple_long_horizon_agent/llm/types.py)
+- [`llm/bridge.py`](../src/simple_long_horizon_agent/llm/bridge.py)
+- [`llm/adapters/`](../src/simple_long_horizon_agent/llm/adapters/)
+- [`llm/retry.py`](../src/simple_long_horizon_agent/llm/retry.py)
+- [`05-model-access.md`](../docs/design/05-model-access.md)
+- [`tests/unit/test_real_adapters.py`](../tests/unit/test_real_adapters.py)
+- [`tests/unit/test_llm_retry.py`](../tests/unit/test_llm_retry.py)

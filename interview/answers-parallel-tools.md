@@ -1,6 +1,6 @@
-# 21. 面试专题回答：并行 Tool Calling、超时与中止
+# 面试专题回答：并行 Tool Calling、超时与中止
 
-本文覆盖 [`17-interview-question-checklist.md`](17-interview-question-checklist.md)
+本文覆盖 [`question-checklist.md`](question-checklist.md)
 中第 4 个专题的全部问题。回答以当前同步 Runtime、线程池调度、协作式 abort 和工具级
 超时实现为事实边界。
 
@@ -156,11 +156,11 @@ Recall 限制索引数和返回字符数。评测场景可以再通过 Docker �
 
 ## 核对依据
 
-- [`core.py`](../../src/simple_long_horizon_agent/core.py)
-- [`tools/__init__.py`](../../src/simple_long_horizon_agent/tools/__init__.py)
-- [`tools/task.py`](../../src/simple_long_horizon_agent/tools/task.py)
-- [`tools/bash.py`](../../src/simple_long_horizon_agent/tools/bash.py)
-- [`mcp/client.py`](../../src/simple_long_horizon_agent/mcp/client.py)
-- [`06-tools-and-integrations.md`](06-tools-and-integrations.md)
-- [`tests/unit/test_core.py`](../../tests/unit/test_core.py)
-- [`tests/unit/test_mcp.py`](../../tests/unit/test_mcp.py)
+- [`core.py`](../src/simple_long_horizon_agent/core.py)
+- [`tools/__init__.py`](../src/simple_long_horizon_agent/tools/__init__.py)
+- [`tools/task.py`](../src/simple_long_horizon_agent/tools/task.py)
+- [`tools/bash.py`](../src/simple_long_horizon_agent/tools/bash.py)
+- [`mcp/client.py`](../src/simple_long_horizon_agent/mcp/client.py)
+- [`06-tools-and-integrations.md`](../docs/design/06-tools-and-integrations.md)
+- [`tests/unit/test_core.py`](../tests/unit/test_core.py)
+- [`tests/unit/test_mcp.py`](../tests/unit/test_mcp.py)

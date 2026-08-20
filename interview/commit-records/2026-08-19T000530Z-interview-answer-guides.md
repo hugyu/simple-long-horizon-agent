@@ -17,20 +17,20 @@ precision.
   practice.
 - `docs/design/15-resume-project-description.md`: reduce the resume description
   to focused full and concise versions used by the question checklist.
-- `docs/design/16-interview-answer-guidelines.md`: define evidence priority,
+- `interview/answer-guidelines.md`: define evidence priority,
   answer structure, factual boundaries, oral style, and balanced Chinese-English
   terminology.
-- `docs/design/17-interview-question-checklist.md`: organize likely interview
+- `interview/question-checklist.md`: organize likely interview
   questions and link the first four topics to their answer guides.
-- `docs/design/18-interview-answers-agent-runtime.md`: answer Runtime, core data,
+- `interview/answers-agent-runtime.md`: answer Runtime, core data,
   stop, resume, and minimal-loop questions.
-- `docs/design/19-interview-answers-provider-adapters.md`: answer provider
+- `interview/answers-provider-adapters.md`: answer provider
   protocol, Adapter, streaming, retry, raw response, and test questions.
-- `docs/design/20-interview-answers-context-engineering.md`: answer context
+- `interview/answers-context-engineering.md`: answer context
   layering, compression, Recall, evidence recovery, and experiment questions.
-- `docs/design/21-interview-answers-parallel-tools.md`: answer parallel
+- `interview/answers-parallel-tools.md`: answer parallel
   scheduling, timeout, cancellation, conflict, retry, and idempotency questions.
-- `docs/design/README.md`: index the checklist and interview answer guides.
+- `interview/README.md`: index the checklist and interview answer guides.
 
 ## Verification
 

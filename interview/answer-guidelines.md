@@ -1,4 +1,4 @@
-# 16. Agent 技术面试回答准则
+# Agent 技术面试回答准则
 
 本文用于模拟“大厂 Agent 应用开发、Agent Infra、LLM Application Engineer”
 岗位的真实技术面试。回答者扮演项目候选人本人，依据简历、项目文档、实际代码、

@@ -1,6 +1,6 @@
-# 20. 面试专题回答：Context Engineering
+# 面试专题回答：Context Engineering
 
-本文覆盖 [`17-interview-question-checklist.md`](17-interview-question-checklist.md)
+本文覆盖 [`question-checklist.md`](question-checklist.md)
 中第 3 个专题的全部问题。回答重点是当前项目真实实现的完整历史、活跃上下文、压缩和
 索引式 Recall，不把 Memory、RAG 或未来方案混为一谈。
 
@@ -271,11 +271,11 @@ Recall 支持 Message 内部的 offset 或范围读取。
 
 ## 核对依据
 
-- [`context_view.py`](../../src/simple_long_horizon_agent/context_view.py)
-- [`compression/`](../../src/simple_long_horizon_agent/compression/)
-- [`tools/recall.py`](../../src/simple_long_horizon_agent/tools/recall.py)
-- [`state.py`](../../src/simple_long_horizon_agent/state.py)
-- [`07-context-and-long-horizon.md`](07-context-and-long-horizon.md)
-- [`tests/unit/test_compression_control.py`](../../tests/unit/test_compression_control.py)
-- [`tests/unit/test_compression_effectiveness.py`](../../tests/unit/test_compression_effectiveness.py)
-- [`tests/unit/test_context_usage.py`](../../tests/unit/test_context_usage.py)
+- [`context_view.py`](../src/simple_long_horizon_agent/context_view.py)
+- [`compression/`](../src/simple_long_horizon_agent/compression/)
+- [`tools/recall.py`](../src/simple_long_horizon_agent/tools/recall.py)
+- [`state.py`](../src/simple_long_horizon_agent/state.py)
+- [`07-context-and-long-horizon.md`](../docs/design/07-context-and-long-horizon.md)
+- [`tests/unit/test_compression_control.py`](../tests/unit/test_compression_control.py)
+- [`tests/unit/test_compression_effectiveness.py`](../tests/unit/test_compression_effectiveness.py)
+- [`tests/unit/test_context_usage.py`](../tests/unit/test_context_usage.py)

@@ -1,7 +1,7 @@
-# 17. Agent 技术面试问题清单
+# Agent 技术面试问题清单
 
 仅根据你的简历描述
-[`15-resume-project-description.md`](15-resume-project-description.md)，面试官会重点
+[`15-resume-project-description.md`](../docs/design/15-resume-project-description.md)，面试官会重点
 验证三件事：
 
 1. 这些系统是否真是你设计并实现的。
@@ -15,7 +15,7 @@
 对应简历第 6-8 行。最高概率是让你从一次用户请求开始，完整讲清运行链路。
 
 专题回答：
-[`18-interview-answers-agent-runtime.md`](18-interview-answers-agent-runtime.md)
+[`answers-agent-runtime.md`](answers-agent-runtime.md)
 
 可能问题：
 
@@ -46,7 +46,7 @@
 对应第 7-8、26-28 行。
 
 专题回答：
-[`19-interview-answers-provider-adapters.md`](19-interview-answers-provider-adapters.md)
+[`answers-provider-adapters.md`](answers-provider-adapters.md)
 
 可能问题：
 
@@ -70,7 +70,7 @@
 对应第 9-11、29-30 行。这会是你简历最容易被深入追问的部分。
 
 专题回答：
-[`20-interview-answers-context-engineering.md`](20-interview-answers-context-engineering.md)
+[`answers-context-engineering.md`](answers-context-engineering.md)
 
 可能问题：
 
@@ -106,7 +106,7 @@
 对应第 12-14 行。
 
 专题回答：
-[`21-interview-answers-parallel-tools.md`](21-interview-answers-parallel-tools.md)
+[`answers-parallel-tools.md`](answers-parallel-tools.md)
 
 可能问题：
 
@@ -129,6 +129,9 @@
 
 对应第 12、31 行。
 
+专题回答：
+[`answers-mcp-and-subagents.md`](answers-mcp-and-subagents.md)
+
 可能问题：
 
 - MCP 在你的架构中处于什么位置？
@@ -148,6 +151,9 @@
 ### 6. Workflow 与完成判断
 
 对应第 13-14、31-32 行。
+
+专题回答：
+[`answers-workflows-and-completion.md`](answers-workflows-and-completion.md)
 
 可能问题：
 
@@ -180,6 +186,9 @@
 
 对应第 15-17 行。
 
+专题回答：
+[`answers-trace-observability.md`](answers-trace-observability.md)
+
 可能问题：
 
 - 为什么使用 JSONL，而不是数据库或普通 JSON？
@@ -202,6 +211,9 @@
 
 对应第 15-20 行。
 
+专题回答：
+[`answers-containerized-evals.md`](answers-containerized-evals.md)
+
 可能问题：
 
 - 描述一次 Eval 从任务输入到最终评分的完整过程。
@@ -223,6 +235,9 @@
 ### 9. Benchmark 与结果可信度
 
 这是最严格的方向，因为你给出了精确数字。
+
+专题回答：
+[`answers-benchmarks.md`](answers-benchmarks.md)
 
 可能问题：
 
@@ -251,6 +266,9 @@
 ### 10. 个人贡献与架构取舍
 
 “核心开发者”一定会被要求明确边界。
+
+专题回答：
+[`answers-contribution-and-tradeoffs.md`](answers-contribution-and-tradeoffs.md)
 
 可能问题：
 
