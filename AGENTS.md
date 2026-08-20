@@ -43,7 +43,7 @@ and its validation in the same change.
 ## Interview Practice
 
 When the user asks an Agent-related interview question, read
-[`interview/answer-guidelines.md`](interview/answer-guidelines.md)
+[`docs/interview/answer-guidelines.md`](docs/interview/answer-guidelines.md)
 before answering and ground the response in the current code, tests, project
 documentation, resume description, and published results.
 

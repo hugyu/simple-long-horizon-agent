@@ -13,6 +13,8 @@ behavior.
 - [`design/00-running-example.md`](design/00-running-example.md) — a concrete,
   deterministic task traced from input through model, tool, state, events, and
   final output. Start here when learning how the system actually runs.
+- [`interview/answer-guidelines.md`](interview/answer-guidelines.md) — rules for
+  code-grounded Agent interview answers.
 
 - [`development.md`](development.md) — the quality gate, and the `ty` false
   positives worth recognizing.

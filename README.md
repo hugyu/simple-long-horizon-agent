@@ -139,7 +139,7 @@ See [.env.example](.env.example) for the supported provider settings.
 - [Runnable demos and experiments](runs/README.md)
 - [Evaluation suites and benchmarks](evals/README.md)
 - [Project documentation](docs/README.md)
-- [Interview preparation](interview/README.md)
+- [Interview answer guidelines](docs/interview/answer-guidelines.md)
 - [Contributing guide](CONTRIBUTING.md)
 
 ## Project Status
