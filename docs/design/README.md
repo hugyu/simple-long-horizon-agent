@@ -2,7 +2,7 @@
 
 > 阅读入口：先看 [00. 用一个真实运行看懂 Agent](00-running-example.md)，再按专题理解设计。
 >
-> 当前状态：本目录包含一篇贯穿式运行案例和 15 篇专题文档；后续以源码、测试和评审结果持续校正。
+> 当前状态：本目录包含一篇贯穿式运行案例和 19 篇专题文档；后续以源码、测试和评审结果持续校正。
 >
 > 本目录通过阅读当前代码、测试和已有说明，反向整理项目的需求与设计。这里不会修改原项目，也不会逐行解释源码。
 
@@ -119,7 +119,13 @@ docs/design/
 ├── 10-evaluation-and-operations.md         # 已完成
 ├── 11-configuration-and-extension.md       # 已完成
 ├── 12-system-scenarios-and-completeness.md # 已完成
-└── 15-resume-project-description.md         # 已完成
+├── 15-resume-project-description.md         # 已完成
+├── 16-interview-answer-guidelines.md        # 已完成
+├── 17-interview-question-checklist.md       # 已完成
+├── 18-interview-answers-agent-runtime.md    # 已完成
+├── 19-interview-answers-provider-adapters.md # 已完成
+├── 20-interview-answers-context-engineering.md # 已完成
+└── 21-interview-answers-parallel-tools.md   # 已完成
 ```
 
 每篇文档都可以独立阅读；首次了解项目建议仍按编号顺序阅读。第 12 篇用于从完整场景反查前面各专题是否闭环。
@@ -286,9 +292,40 @@ docs/design/
 
 ### 15. [`15-resume-project-description.md`](15-resume-project-description.md)——简历项目描述
 
-将项目定位、核心工作和实验结果整理为可直接用于简历的完整版、精简版和极简版，
-并提供口头介绍与 Benchmark 数字口径。内容突出项目作者的实际设计与实现，不把
-模块机制假设写成组件级实验归因。
+将项目定位、核心工作和实验结果整理为可直接用于简历的完整版与精简版，突出项目
+作者的实际设计、实现和可验证结果。
+
+### 16. [`16-interview-answer-guidelines.md`](16-interview-answer-guidelines.md)——Agent 技术面试回答准则
+
+规定候选人模式与面试教练模式的触发方式、事实依据、回答节奏和不同题型的展开重点。
+它要求面试回答优先依据当前代码、测试、项目文档和已发布结果，明确区分实际实现、
+设计取舍与未来工程化方案，并用自然中文讲清逻辑，适度保留常用英文术语和真实代码
+名称。
+
+### 17. [`17-interview-question-checklist.md`](17-interview-question-checklist.md)——Agent 技术面试问题清单
+
+根据简历描述整理高概率问题、压力追问和场景题，覆盖 Runtime、Provider Adapter、
+Context Engineering、并行工具、MCP、Workflow、Trace、Eval、Benchmark 和个人贡献。
+
+### 18. [`18-interview-answers-agent-runtime.md`](18-interview-answers-agent-runtime.md)——Runtime 与核心抽象
+
+逐题回答显式 Agent Loop、`Message / Event / State`、停止语义、进程内续接、故障恢复
+边界和最小循环伪代码。
+
+### 19. [`19-interview-answers-provider-adapters.md`](19-interview-answers-provider-adapters.md)——Provider 协议与 Adapter
+
+逐题回答 OpenAI、Anthropic 和 OpenAI-compatible 的协议差异、统一消息映射、流事件、
+重试、usage 归一化、raw 保存和 Adapter 测试。
+
+### 20. [`20-interview-answers-context-engineering.md`](20-interview-answers-context-engineering.md)——Context Engineering
+
+逐题回答完整历史与 Active Context、三类压缩控制、摘要风险、索引式 Recall、Token
+收益边界和早期信息恢复场景。
+
+### 21. [`21-interview-answers-parallel-tools.md`](21-interview-answers-parallel-tools.md)——并行工具与中止
+
+逐题回答工具并行判断、确定性结果写回、写冲突、Timeout、Cancellation、子 Agent 信号
+传播、资源限制和副作用幂等边界。
 
 ## 6. 推荐阅读路线
 
@@ -325,6 +362,18 @@ docs/design/
 ### 准备扩展项目
 
 先阅读 01～04，再阅读目标模块文档和第 11 篇；最后用第 12 篇检查改动是否仍能融入整体系统。
+
+### 准备 Agent 技术面试
+
+```text
+15 简历项目描述
+  → 16 回答准则
+  → 17 问题清单
+  → 18～21 前四个专题回答
+```
+
+先统一简历事实和回答方式，再按问题清单逐专题练习。答案文档是基于当前代码的口述底稿，
+不是需要逐字背诵的标准答案。
 
 ## 7. 每篇文档的通用结构
 
@@ -406,5 +455,6 @@ docs/design/
 6. 后续文档发现新的整体关系时，回到相关文档补充链接和说明；
 7. 全部完成后，用第 12 篇检查端到端场景和遗漏。
 
-当前案例和 13 篇专题形成阅读路径。后续实现变化时，先更新 00 中受影响的事实快照，
-再回补对应专题和第 12 篇场景检查；简历口径在第 15 篇校正。
+当前案例、系统专题和面试材料共同形成阅读路径。后续实现变化时，先更新 00 中受影响的
+事实快照，再回补对应专题和第 12 篇场景检查；简历口径在第 15 篇校正，面试回答方式在
+第 16 篇维护，问题与专题答案从第 17 篇开始维护。

@@ -40,6 +40,20 @@ If the task depends on an external architecture idea, capture a local note under
 shared). If it changes an architectural boundary, update that subsystem's doc
 and its validation in the same change.
 
+## Interview Practice
+
+When the user asks an Agent-related interview question, read
+[`docs/design/16-interview-answer-guidelines.md`](docs/design/16-interview-answer-guidelines.md)
+before answering and ground the response in the current code, tests, project
+documentation, resume description, and published results.
+
+- Input beginning with `面试官：` enters candidate mode. Answer directly in the
+  first person as the candidate, without evaluating the question.
+- Input beginning with `暂停面试：` enters interview-coach mode. Review factual
+  risk, technical depth, delivery, and likely follow-up questions.
+- Treat consecutive candidate-mode questions as one interview and avoid
+  repeating project background already established in the conversation.
+
 ## Environment and Commands
 
 `uv`-managed project (`[tool.uv] managed = true`). Run **every** command through
