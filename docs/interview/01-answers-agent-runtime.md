@@ -184,6 +184,11 @@ Runtime 会先按模型输出顺序为每个调用记录开始事件，再经过
 
 - `dispatch_tool_calls()` 先按原顺序记录全部 `ToolExecutionStartEvent`，再执行
   `PRE_TOOL_USE` Hook。被阻止的调用直接生成错误结果，不进入线程池。
+- `PRE_TOOL_USE` 是工具执行前的确定性拦截点。Hook 可检查 Agent、State、工具名称、调用编号和
+  参数，返回空决定表示放行，返回 `block_reason` 表示拒绝。
+- 被拒绝的调用会记录 `HookFiredEvent` 和错误 `ToolExecutionEndEvent`，并在结果包中把原因反馈给
+  模型。Hook 不能改写调用参数；此阶段的 `emit_messages` 也会被忽略，以免破坏 Tool Call/Result
+  配对。
 - 若有效调用中存在 `execution_mode="sequential"`，工作线程数为 1；否则使用
   `min(8, 调用数)` 个线程并行执行。
 - 结果暂存在以 `tool_call_id` 为键的字典中；结束事件可按实际完成顺序出现，但最终
@@ -344,14 +349,63 @@ Event Stream 和已经记录的 Message 按契约只追加、不原地修改；S
 
 **追问：如果存在可变投影，如何通过 Event Replay 重建？**
 
-创建空 `StateSnapshot`，按事件顺序调用 `apply()`：MessageEvent 追加消息，压缩事件重设活跃索引。
+从空 `StateSnapshot` 开始，严格按 Event 顺序调用 `apply()`。`MessageEvent` 依次恢复完整消息列表；
+`ContextCompressionEvent` 不删除旧消息，只把 `active_context_indices` 替换成压缩后的可见索引；
+后续新消息再同时追加到完整消息列表和当前活跃索引。这样即使内存 Snapshot 丢失，也能从同一组
+Event 重建出相同的完整 History 和 Active Context。
 
 ### 技术追问补充
 
 - `State.record_event()` 为事件补齐 index、相对 elapsed 和 UUID，然后追加到 `events`，再调用
   `snapshot.apply()`。
 - Snapshot 只处理影响当前消息投影的 Event；生命周期、模型和工具 Event 仍保留在完整历史中。
-- `State.rebuild_snapshot()` 会从空 Snapshot 顺序重放全部 Event，并替换当前缓存。
+- `State.rebuild_snapshot()` 会创建空 Snapshot，顺序重放全部 Event，并用重建结果替换当前缓存。
+- 一个最小 Event Replay 过程可以表示为：
+
+  ```text
+  0. MessageEvent("用户任务")
+  1. MessageEvent("模型回答")
+  2. MessageEvent("很长的工具结果")
+  3. MessageEvent("压缩摘要")
+  4. ContextCompressionEvent(active_context_indices=[0, 3])
+  5. MessageEvent("压缩后的新消息")
+  ```
+
+  重建时不读取旧 Snapshot，而是重新创建一个空投影：
+
+  ```python
+  snapshot = StateSnapshot()
+  for event in state.events:
+      snapshot.apply(event)
+  ```
+
+  按顺序应用这些事件时，Snapshot 的变化是：
+
+  ```text
+  初始：
+    messages = []
+    active_context_indices = None
+
+  重放 Event 0～3：
+    messages = [用户任务, 模型回答, 很长的工具结果, 压缩摘要]
+    active_context_indices = None
+
+  重放 Event 4：
+    messages = [用户任务, 模型回答, 很长的工具结果, 压缩摘要]
+    active_context_indices = [0, 3]
+
+  重放 Event 5：
+    messages = [用户任务, 模型回答, 很长的工具结果, 压缩摘要, 压缩后的新消息]
+    active_context_indices = [0, 3, 4]
+  ```
+
+  其中索引 1、2 对应的模型回答和原始工具结果始终保留在完整 `messages` 中；压缩事件只把下一轮
+  使用的 Active Context 改为索引 0、3。压缩之后的新消息位于索引 4，所以应用新的
+  `MessageEvent` 时，它会同时进入完整消息列表和当前活跃索引。
+- `ContextCompressionEvent.active_context_indices` 在应用时会复制到 Snapshot，避免后续追加新消息
+  修改这条历史 Event 自身保存的索引列表。
+- 只要 Event 顺序和内容相同，重放结果就应一致；现有测试会在压缩后调用
+  `rebuild_snapshot()`，核对重建出的 Active Context 索引。
 - 当前 `state.events` 仍是公开 Python list，因此 append-only 是 Runtime 契约，不是容器级防篡改。
 
 ## 15. Event 是否需要全局唯一 ID？

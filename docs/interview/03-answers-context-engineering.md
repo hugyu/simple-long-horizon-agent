@@ -38,52 +38,87 @@
 
 ### 口述主回答
 
-项目在每次模型请求前检查当前活跃上下文大小，再让配置的压缩策略决定压缩哪些消息。策略只
-提出“替换哪些消息、用什么替代”，运行时负责保护任务和最近消息、校验工具调用配对、写入摘要
-并更新活跃索引。
+项目里不是直接截断 Token，而是把完整历史和模型当前使用的 Active Context 分开。每次模型
+请求前，系统估算活跃上下文大小，再由配置的策略决定哪些旧消息退出活跃视图、用什么内容替代。
 
-我没有直接截断最前面的固定 Token，因为最前面可能包含原始任务，截断点也可能拆开工具调用和
-工具结果。当前方案按消息语义和稳定索引压缩，并保留完整历史，后续还能恢复。
+当前实现主要有三种方式：`ToolCompactStrategy` 用规则折叠旧的工具调用和结果，只保留工具名与
+结果预览；`SummarizeStrategy` 调用独立 compressor，把旧对话总结成 working memory，默认 Agent
+使用的是这一种；`AgentCompactStrategy` 则允许主 Agent 调用 `compact` 工具，并自己提供后续
+需要保留的摘要。还可以用 `TieredStrategy` 组合它们，例如先做成本低、结果确定的工具压缩，
+处理不了时再做模型摘要。
+
+策略只负责提出压缩方案，Runtime 统一校验工具调用配对、写入替代消息和压缩事件，再更新活跃
+索引。所谓移除只是从 Active Context 移除，原始消息仍保留在完整历史中，可以审计或通过 Recall
+找回。我没有采用“截掉最前面 10K Token”，主要是因为它可能误删任务、拆开工具调用与结果，
+而且丢失的内容无法恢复。
 
 ### 追问问题与回答
 
 **追问：你的 Context Management pipeline 是什么？**
 
-每轮模型调用前先估算活跃上下文，压缩策略选择待替换消息，Runtime 校验并写入替代消息和压缩
-事件，最后从新活跃上下文构建模型请求。
+每轮从 `TurnStart` 开始，压缩策略先根据活跃上下文和 Token 阈值产生
+`CompressionDecision`；Runtime 校验并应用它，追加替代消息和 `ContextCompressionEvent`，
+然后基于更新后的 Active Context 构建模型请求。
 
 **追问：为什么不直接截断最前面的 10K tokens？**
 
-固定截断不理解消息语义，可能删除原始任务或拆开工具调用与结果，而且被删除内容无法审计和恢复。
+固定截断不理解消息边界和语义，可能删除原始任务，也可能只保留 Tool Call 或 Tool Result 的
+一侧。当前方案按稳定消息索引压缩，并保留完整历史，因此更容易保证协议完整，也能够审计和恢复。
 
 ### 技术追问补充
 
-- `_active_context_tokens()` 优先使用压缩后仍然有效的最新 Provider usage，并估算其后的新增消息；
-  压缩刚发生时则对全部活跃消息重新估算。
-- `CompressionStrategy` 只返回待压缩索引和替代 Message；`compression.runtime` 负责校验、追加
-  MessageEvent、记录 ContextCompressionEvent 并更新活跃索引。
-- 默认 `preserve_kinds` 包括 task、system、summary 和 context；策略还会保留最近若干消息。
-- 执行顺序是 `TurnStart → maybe_compress_context → build_context_view → ModelRequest`。
+- 默认 Agent 配置使用 `SummarizeStrategy`：阈值优先读取显式配置，否则按模型 Context Window
+  的比例计算；默认保留最近 4 条普通消息。
+- `SummarizeStrategy` 默认原样保护 task、system、summary 和 context；
+  `ToolCompactStrategy` 只折叠较旧的完整工具交换；`AgentCompactStrategy` 在 Agent 调用
+  `compact` 后，于下一轮安全点应用其摘要。
+- `TieredStrategy` 按顺序选择第一个能够产生决策的阶段，它是组合策略，不是另一种摘要算法。
+- `CompressionStrategy` 只返回待压缩索引和替代 Message；`compression.runtime` 负责对齐
+  Tool Call/Tool Result、校验一对一 rewrite、追加 `MessageEvent` 和
+  `ContextCompressionEvent`，并更新活跃索引。
+- `_active_context_tokens()` 优先使用压缩后仍然有效的最新 Provider usage，并估算其后的新增
+  消息；压缩刚发生时则对全部活跃消息重新估算。
+- `model_invisible_kinds` 属于模型可见性过滤，不是压缩策略；执行顺序是
+  `TurnStart → maybe_compress_context → build_context_view → ModelRequest`。
 
 ## 23. 一个工具返回 50K Token 时，如何压缩并保持协议完整？
 
 ### 口述主回答
 
-不能直接按字符把工具结果切掉，因为结果必须继续和原工具调用保持配对。项目的压缩运行时支持
-两种安全方式：把完整工具调用与结果一起折叠成短摘要，或者对单条结果做一对一改写，但改写后
-必须保留原消息角色和调用编号。
+如果工具返回了 50K Token，我会在工具结果写入 State 之后、下一次模型请求之前，增加一个专门的
+Tool Result 压缩策略。它不会删除整条结果消息，而是定位其中超大的 `ToolResultBlock`，把原始
+内容外置到文件或 Artifact Store，再生成一份有界的模型可见内容，包括执行状态、关键结论、必要
+的头尾片段、原始产物引用，以及分页或继续读取方式。
 
-原始 50K 内容仍保存在完整历史中，活跃上下文只使用缩短后的替代消息。需要说明的是，当前核心
-提供了安全改写机制，但不会自动理解任意 50K 输出该保留什么；仍需要配置合适的规则或摘要策略。
+协议完整性靠保持外壳不变：替代消息仍然是同一种 UserMessage，其中每个 `ToolResultBlock` 的
+`tool_call_id`、工具名、顺序和 `is_error` 都与原结果一致，只改写具体的 `content`。这样
+Provider Adapter 仍然能把结果关联到原来的 Tool Call，不会形成悬空调用。
+
+这个设计可以直接复用项目现有的 `CompressionDecision(rewrite=True)`：策略负责生成缩短后的
+Tool Result，Runtime 负责校验消息角色和调用编号、追加替代消息、记录
+`ContextCompressionEvent`，并把 Active Context 指向替代版本。完整结果仍保存在原始 Message
+或外部 Artifact 中，后续通过受限的 Recall、分页读取或范围查询恢复，而不是一次性重新注入
+50K Token。
+
+内容怎么压缩要根据结果类型决定：日志保留错误、统计信息和头尾；JSON 或表格保留 Schema、关键
+字段和异常记录；代码或长文件优先保存路径并按范围读取；只有无法通过规则提取语义时，才做分块
+的模型摘要。即使摘要失败，也至少返回确定性的截断内容和原始产物引用，不能直接丢掉结果。
 
 ### 技术追问补充
 
-- 普通 N→1 折叠调用 `_align_tool_pairs()`，如果只选中 Tool Call 或 Tool Result 一侧，会保守地
-  将该侧移出压缩集合。
-- 一对一改写使用 `CompressionDecision(rewrite=True)`，只允许替换一条消息；消息类型和
-  `tool_call_id` 集合必须与原消息一致。
-- `ToolCompactStrategy` 会把旧工具交换替换为工具名和结果短预览，默认保留最近一次交换。
-- 原始 Tool Result Message 不从 `State.messages` 删除，仍可通过稳定消息索引读取。
+- 新策略可以设计为 `ToolResultRewriteStrategy`，在
+  `TurnStart → maybe_compress_context` 阶段检查单条 `ToolResultBlock` 的估算 Token，超过单结果
+  预算时产生一对一 rewrite。
+- 若一个 UserMessage 包含多个并行工具结果，只缩短超限 Block 的 `content`，但保留全部 Block
+  的数量、顺序、`tool_call_id`、工具名和错误状态。
+- 替代内容应包含 `artifact_id/path`、内容大小、摘要方式、截断范围和 continuation cursor；
+  Recall 也要受单次 Token 或字符预算限制。
+- 对超过 compressor 自身窗口的内容不能单次摘要，应先按结构或固定预算分块，再聚合局部摘要；
+  日志和结构化数据优先使用确定性规则。
+- Runtime 继续使用 `rewrite=True` 校验消息类型和 `tool_call_id` 集合，并通过
+  `ContextCompressionEvent` 记录原消息索引、替代消息索引、压缩前后 Token 和策略名称。
+- 当前代码已经具备 rewrite、稳定消息索引、完整历史和压缩事件这些基础机制；需要扩展的是超限
+  检测、Artifact 外置以及按内容类型生成替代结果的具体策略。
 
 ## 24. 工具结果压缩应该使用规则还是模型摘要？
 
@@ -118,30 +153,49 @@
 
 ### 口述主回答
 
-不应该默认把代码直接总结掉。代码、补丁、错误行和测试结果经常是后续验证需要的精确证据，主
-回答可以总结进度，但关键路径、符号、命令和错误内容应保留原文或保留可恢复入口。
+不应该让模型生成一段自然语言摘要后就替换掉原始代码。代码是后续编辑、执行和验证的精确输入，
+摘要可以帮助模型理解意图，但不能成为唯一事实源。
 
-当前项目的摘要提示会要求精确保留路径、符号、命令、错误和测试名，但还没有按“代码、日志、
-结构化数据”自动选择不同压缩器，所以不能声称已经实现代码感知压缩。
+基于当前设计，我会新增一个内容感知的 Tool Result 策略。它先根据工具类型、结果元数据和内容
+结构判断这是代码、Diff、日志、测试报告还是结构化数据。对代码和补丁，原文写入工作区文件或
+Artifact Store，并记录路径、内容哈希和范围；模型上下文中保留函数签名、相关 Diff hunk、报错
+附近代码和可继续读取的定位信息。模型可以额外生成“改了什么、为什么”的语义摘要，但摘要必须
+引用这些精确片段，不能替代它们。
+
+如果结果超过预算，策略复用 `CompressionDecision(rewrite=True)`，只改写
+`ToolResultBlock.content`，保留原消息角色、`tool_call_id`、工具名、顺序和错误状态。后续 Agent
+可以按路径和范围重新读取原文，验证时则重新运行编译或测试，并用哈希确认读取的是同一份 Artifact。
+
+对于其他输出也采用不同处理：日志保留命令、退出码、首个根因和关键堆栈；测试报告保留汇总以及
+失败用例名称和原始错误；JSON 或表格先做 Schema 投影、字段筛选和确定性聚合。只有规则无法表达
+跨片段语义时才调用模型摘要，摘要失败则退化为确定性截断和原始产物引用。
 
 ### 追问问题与回答
 
 **追问：哪些 Tool 输出不能被直接 summarize？**
 
-后续需要逐字执行或核验的代码、补丁、命令、错误行、测试结果和精确结构化值不能只依赖自然语言
-摘要。
+凡是后续要逐字执行、修改、比较或核验的输出，都不能只保留自然语言摘要，例如代码、补丁、
+命令、堆栈、失败断言、测试用例名、Schema、ID 和精确数值。它们可以附带摘要，但必须保留原始
+Artifact 或可定位的精确片段。
 
 **追问：原始代码、错误日志、测试结果和结构化数据分别应该如何处理？**
 
-代码和补丁保留原文或按文件重读；日志保留关键错误和命令；测试保留用例与结果；结构化数据优先
-做字段筛选或确定性聚合。
+代码和补丁保存原始 Artifact，并在上下文中保留哈希、符号和 Diff hunk；日志保留命令、退出码、
+根因和关键堆栈；测试保留汇总、失败用例名和原始断言；结构化数据先按 Schema 做字段投影和
+确定性聚合，同时保留原始数据引用。
 
 ### 技术追问补充
 
-- 当前 `SummarizeStrategy` 使用统一摘要提示，没有按代码、日志或 JSON 自动选择不同压缩器。
-- 摘要提示要求路径、符号、命令、错误、测试名、ID 和数值保持原样，并记录已尝试但失败的方法。
-- `ToolCompactStrategy` 只生成工具名和固定长度结果预览，不理解代码或结构化数据语义。
-- 被压缩的原始代码和日志仍保存在完整 Message History，可通过 Recall 或重新读取工作区文件恢复。
+- 可以扩展 `ToolResultRewriteStrategy`，根据 `tool_name`、sidecar details 和内容形状路由到
+  code/diff、log、test-report 或 structured-data handler；无法可靠分类时使用保守的通用截断。
+- code/diff handler 先把完整内容写入 Artifact，记录 path、hash、语言、符号或 hunk 范围，再
+  生成包含精确摘录和读取入口的替代 `ToolResultBlock.content`。
+- 模型摘要是第二层语义索引。若调用 compressor，应把请求、响应和 usage 写入 Trace；摘要中的
+  路径、符号和范围还应能在 Artifact 中校验，失败时退化为确定性提取。
+- Runtime 复用 `rewrite=True` 保证消息类型和 `tool_call_id` 集合不变；策略还应保持并行结果
+  Block 的数量、顺序、工具名和错误状态。
+- 当前代码已有统一摘要、rewrite、完整 History、Recall 和工作区重读能力；需要扩展的是内容
+  分类、Artifact 元数据、类型化提取器以及摘要引用校验。
 
 ## 26. 压缩遗漏关键信息时，系统如何发现并恢复？
 
@@ -268,55 +322,85 @@ Runtime 根据 `tool_call_id` 对齐调用与结果；普通折叠不能只压�
 
 ### 口述主回答
 
-我主要通过缩小摘要职责来降低风险：提示要求保留精确标识、禁止编造，最近消息继续保留原文，
-原始历史也不会删除。摘要模型的请求、响应和用量都会进入 Trace，出了问题可以回到证据定位。
+我不会只靠 Prompt 里写“不要编造”，而是把 Summary 设计成带证据、经过接受门禁的压缩结果。
+基于当前 `SummarizeStrategy`，我会让 compressor 输出结构化摘要：每条事实都携带来源 Message
+索引和能够在原文中核对的路径、命令、错误或短锚点，并区分“原文事实”和“模型推断”。
 
-但当前 Runtime 只能校验压缩索引、消息结构和工具配对，不能自动判断摘要内容是否忠于原文。
-所以摘要仍然是有损工作记忆，不能替代原始证据。
+摘要生成后不会立即写入 Active Context。验证层先做确定性检查：引用的索引必须属于本次压缩
+范围，证据锚点必须能在原消息中找到，路径、ID、命令和数值等精确标识不能凭空新增，目标、已完成
+事项、未解决问题和下一步等必需部分也要满足覆盖要求。然后可以再由独立 verifier 检查遗漏、
+矛盾和无证据结论，但模型 Judge 只作为补充，不能替代这些确定性规则。
+
+验证失败时，我会把具体问题反馈给 compressor 重试一次；仍然失败就退化为抽取式摘要，只保留
+原文片段和来源索引，或者取消本次压缩，不能让可疑摘要进入活跃上下文。验证通过后，Runtime 才
+应用 `CompressionDecision` 并记录摘要、验证结果和 `ContextCompressionEvent`。
+
+现有的 task、最近消息和完整 History 继续保留原文，Recall 作为最后恢复手段。这样不能从数学上
+证明摘要绝对正确，但能把“静默产生幻觉”变成有证据、可拒绝、可降级和可回放的过程。
 
 ### 追问问题与回答
 
 **追问：Runtime 能验证 Summary 与原始历史一致吗？**
 
-当前不能。Runtime 只能验证压缩目标和消息结构，无法自动判断摘要是否遗漏、歪曲或编造事实。
+当前 Runtime 还不能做内容一致性验证，只能校验压缩结构。扩展后可以确定性验证来源索引、证据
+锚点和精确标识，再用独立 verifier 检查语义矛盾与遗漏；它仍不能提供绝对证明，但验证失败时
+可以拒绝摘要，不让它进入 Active Context。
 
 ### 技术追问补充
 
-- `compression.runtime` 会校验压缩索引仍在活跃视图、工具调用与结果没有被拆开，以及 rewrite
-  是否保持消息类型和调用编号。
-- Runtime 不比较 summary 文本与原 Message 内容，也没有事实抽取、蕴含判断或独立摘要 Judge。
-- 完整 Message History 不会删除，因此重要事实可以通过 Recall 或重新运行工具核验。
-- 摘要模型的请求与响应进入 Trace，便于事后定位摘要从哪些输入生成，但 Trace 不等于自动验证。
+- 可以把 compressor 输出扩展为结构化 `SummaryPayload`，其中每条 claim 包含文本、事实或推断
+  类型、`source_message_indices` 和短 evidence anchors；最终再渲染为模型可读 Summary Message。
+- 确定性 acceptance gate 校验引用索引属于 `compress_indices`、anchor 能在原文定位，以及摘要
+  新增的路径、命令、错误、测试名、ID 和数值能够在来源中找到。
+- 可选 verifier 读取原消息和候选摘要，输出 unsupported、contradicted 和 missing claims；其请求、
+  响应和判断结果都进入 Trace，但不能把另一个模型的判断当作形式化证明。
+- 失败路径是“带错误重试一次 → 抽取式摘要 → 取消压缩”，任何一步都不能删除原始 History；
+  只有通过门禁的 Summary 才生成替代 `MessageEvent` 和 `ContextCompressionEvent`。
+- 需要增加摘要忠实度测试，例如植入精确路径、数值、否定事实和相互冲突的消息，验证无来源 claim
+  会被拒绝、关键事实遗漏能被发现、降级后 Active Context 仍保持可用。
+- 当前代码已经具备结构安全校验、摘要 Trace、完整 History 和 Recall；需要扩展的是结构化摘要
+  协议、内容 acceptance gate、verifier 以及失败降级策略。
 
 ## 31. Summary 被再次 Summary 时，如何控制信息丢失？
 
 ### 口述主回答
 
-当前默认策略会保护已有 summary，不把它再次交给摘要模型，所以默认不会形成摘要反复摘要的链路。
-只有显式调整保护类型时，才允许级联摘要，这时信息损失风险会更高。
+我控制信息丢失的核心原则是，尽量不做 Summary-of-Summary。项目当前默认把已有 Summary 放在
+`preserve_kinds` 中，所以普通压缩只处理新的旧消息，不会反复改写上一版摘要。
 
-如果摘要有误，原始消息仍在完整历史中，可以通过 Recall 恢复。恢复内容作为有界工具结果进入
-当前上下文，之后仍可按普通规则再次压缩，而不是永久展开全部旧历史。
+如果上下文继续增长，连多个 Summary 也需要合并，我会沿 `ContextCompressionEvent` 中的消息索引
+找到这些摘要对应的原始消息，再用“原始证据加新增消息”重新生成一份 Summary，而不是只把旧摘要
+交给模型继续概括。任务约束、未完成事项、路径、命令、错误和测试结果仍作为必须保留项；新摘要
+没有通过这些检查时，就保留旧摘要并取消本次合并。
+
+这个方案的代价是重新读取原始消息会增加一次压缩成本，但它避免了信息只沿着摘要文本逐代衰减。
+完整 History 仍然不删除，因此摘要出错时也有恢复依据。
 
 ### 追问问题与回答
 
 **追问：如果 Summary 出错，如何从原始历史恢复？**
 
-根据被压缩消息的稳定索引调用 Recall，重新读取完整 Message History 中的原始内容。
+根据产生该 Summary 的 `ContextCompressionEvent` 找到被压缩消息索引，必要时递归展开更早的
+Summary，再从完整 History 读取原始证据并重新生成摘要。
 
 **追问：恢复后的内容如何避免再次撑爆 Active Context？**
 
-Recall 限制索引数量、单条长度和总返回长度；恢复结果之后仍受普通上下文压缩策略管理。
+恢复过程按 Token 预算分批读取原始消息，只把重新生成的有界 Summary 放回 Active Context，不把
+完整历史永久展开；普通 Recall 仍限制索引数量、单条长度和总返回量。
 
 ### 技术追问补充
 
-- `SummarizeStrategy.preserve_kinds` 默认包含 `"summary"`，因此已有摘要默认不会再次进入摘要输入。
-- 调用者可以从 `preserve_kinds` 移除 summary 以允许级联摘要，但当前没有针对多代摘要的信息损失
-  度量或一致性校验。
-- 每次实际压缩都会新增 replacement Message 和 `ContextCompressionEvent`，原始消息及旧摘要仍
-  保存在完整历史中。
-- Recall 默认限制 20 个索引、每条 4000 字符和整次 8000 字符；返回内容作为普通工具结果，后续
-  可以再次被压缩。
+- `SummarizeStrategy.preserve_kinds` 默认包含 `"summary"`，因此当前普通压缩不会产生摘要的摘要。
+- `ContextCompressionEvent` 保存 `summary_message_index` 和 `compressed_message_indices`；扩展策略
+  可以据此递归解析一个 Summary 最终覆盖的原始 Message 索引，不需要新增另一套 History。
+- 合并时按输入预算分批读取原始消息，再复用现有 compressor 生成新 Summary；Runtime 仍通过普通
+  `CompressionDecision`、`MessageEvent` 和 `ContextCompressionEvent` 应用结果。
+- 新摘要至少要检查旧摘要中的任务约束、未完成事项和精确标识是否仍然存在；检查失败时不更新
+  Active Context，继续保留旧 Summary。
+- Recall 默认限制 20 个索引、每条 4000 字符和整次 8000 字符；恢复后只保留有界的新摘要，原始
+  消息仍留在完整 History 中。
+- 当前没有实现这种 source-aware refresh；它可以直接复用现有稳定消息索引、压缩事件、compressor
+  和追加式 State，新增部分主要是索引展开、预算读取和摘要接受检查。
 
 ## 32. Recall 是如何实现的？
 
@@ -350,73 +434,106 @@ Recall 是一个只读工具，它按稳定消息索引读取当前 `State` 的�
 
 ### 口述主回答
 
-模型需要从摘要中的缺口、显式引用或任务中的精确标识意识到自己缺少原始信息，再主动调用 Recall。
-Runtime 当前不会自动判断“模型缺了哪段历史”，因为它无法可靠知道模型内部还记得什么。
+我不会依赖模型自己意识到“我忘了”，因为模型通常不知道自己缺了什么。更可靠的做法是让压缩
+结果显式暴露 Recall 入口：Runtime 应把本次被折叠的稳定消息索引范围确定性地写进模型可见的
+Summary，例如“原始证据在 transcript messages 12-18，需要精确细节时调用 Recall”。
 
-这里还有一个实际边界：压缩事件虽然记录了被折叠的消息索引，但当前摘要正文并不保证自动带上
-这些索引，所以 Recall 的可发现性还不够完整，这是后续可以改进的地方。
+同时我会在 Agent 指令里定义 Recall 的触发条件：当下一步需要精确代码、命令、错误、数值或先前
+决策，但 Summary 中没有原文证据；或者当前信息相互矛盾、模型只能猜测时，必须先 Recall，再继续
+执行。这样模型不是靠模糊的遗忘感知，而是根据“缺少精确证据”这个可观察条件调用工具。
+
+当前项目已经有稳定消息索引、`ContextCompressionEvent` 和 Recall 工具，缺的是把这些索引自动
+投影到 Summary 正文。这个扩展可以放在压缩结果应用阶段完成，不需要让 Runtime 猜测模型内部状态，
+也不需要每轮自动召回全部旧内容。
 
 ### 追问问题与回答
 
 **追问：Runtime 能否自动判断模型缺少了哪段信息？**
 
-当前不能。Runtime 不知道模型内部遗忘了什么，也没有自动上下文缺口检测器。
+不能可靠判断模型内部忘了什么。Runtime 更适合确定性地暴露被压缩范围和召回入口，再由模型根据
+明确的证据缺口选择索引；全自动召回反而可能注入无关历史。
 
 **追问：Summary、索引或显式引用如何为 Recall 提供线索？**
 
-最可靠的线索是摘要或运行说明中的稳定消息索引，以及任务里再次出现的路径、错误、命令等精确
-标识；模型再据此选择要 Recall 的消息。
+Summary 至少应带有被压缩消息的稳定索引范围；关键结论还可以附来源索引。路径、错误、命令等
+标识帮助模型判断缺的是哪类证据，索引则直接成为 Recall 的调用参数。
 
 ### 技术追问补充
 
 - `ContextCompressionEvent` 保存被压缩索引，但事件本身不会自动进入模型上下文。
-- 当前 `SummarizeStrategy` 和 `AgentCompactStrategy` 生成的摘要正文不保证自动附带
-  `compressed_message_indices`，因此模型未必能直接看到可召回索引。
-- Recall 工具描述会告诉模型根据压缩摘要中的 transcript index 取回原文，但索引能否被看到取决于
-  上游摘要或运行说明是否提供。
-- 当前没有自动缺口检测、关键词检索、语义检索或每轮自动召回。
+- 压缩 Runtime 在 `_align_tool_pairs()` 后已经得到最终 `compress_set`，可以使用现有
+  `format_index_ranges()` 生成确定性的模型可见 footer，再附加到 `kind="summary"` 的替代消息。
+- compressor 可以为关键事实生成 `[message 12]` 形式的细粒度引用，但最外层索引范围应由 Runtime
+  写入，不能依赖模型正确复制。
+- Agent 的 system prompt 或 Recall 工具描述应列出触发条件：需要逐字证据、Summary 缺少来源、
+  信息冲突或准备基于不确定事实执行操作时，先调用 Recall。
+- 需要增加测试，验证 Summary footer 使用工具配对对齐后的最终索引、索引能够直接传给 Recall，
+  并且未发生压缩时不会出现虚假的召回提示。
+- 当前没有自动缺口检测、关键词检索或语义检索；最小扩展是打通
+  `ContextCompressionEvent → Summary 索引提示 → Recall(indices)` 这条显式链路。
 
 ## 34. Recall 返回内容如何避免污染或撑爆当前上下文？
 
 ### 口述主回答
 
-Recall 在入口和输出两端都做限制：索引数量有上限，重复索引会去重，每条消息和整次调用都有
-字符预算，超出时明确标记截断。这样模型可以分批取回证据，而不是一次重新加载全部历史。
+我会从准入和生命周期两端控制。准入阶段继续使用当前的索引数、单条长度和单次总量限制，只允许
+模型按需取回一小批消息；返回内容还要明确标记为“历史证据”，带来源索引和边界，不能被当作新的
+系统指令执行。
 
-当前返回内容会作为普通工具结果进入活跃上下文，没有专门的 Retrieved Context 类型或独立
-生命周期；它会一直保留到后续压缩策略再次折叠它。
+生命周期上，Retrieved Context 只需要完整保留到下一次模型调用，让模型消费一次。模型产生下一
+步结果后，我会用专门的清理策略把 Recall Tool Call 和对应 Tool Result 整体折叠成一条短记录，
+例如“已读取 messages 12-14”。如果其中某个事实后续仍然重要，应由模型把它连同来源写进新的
+Summary，而不是让整段召回文本长期留在 Active Context。
+
+当前项目已经实现了有界返回、稳定来源索引和工具配对保护；需要增加的是 Retrieved Context 的
+一轮 lease 和消费后清理。代价是以后再次需要原文时可能要重新 Recall，但这比让历史证据持续占用
+窗口、重复影响模型判断更可控。
 
 ### 追问问题与回答
 
 **追问：Retrieved Context 应该保留多久、以什么粒度进入 Active Context？**
 
-当前按单条原始 Message 的有界文本作为普通 Tool Result 进入上下文，并保留到后续压缩策略将其
-折叠；没有专门的一轮 TTL。
+按一次 Recall 请求形成一个有界结果包，保留到紧接着的一次模型调用完成。之后整体折叠该 Recall
+调用和结果；需要长期保留的结论单独进入 Summary，并附原始消息索引。
 
 ### 技术追问补充
 
 - 默认 `max_indices=20`、`max_chars_per_message=4000`、`max_total_chars=8000`；第一条请求消息会
   返回，其余内容在总预算不足时停止并标注剩余数量。
-- 每条恢复内容以 transcript message header 加正文呈现；图片只记录数量，不重新内联图片数据。
-- 返回顺序按去重后的请求顺序保持稳定，实际返回索引写入 `ToolResult.details["indices"]`。
-- 当前没有 Retrieved Context 专用 Message kind、TTL 或“只保留一轮”策略。
+- 每条恢复内容以 transcript message header、来源索引和正文呈现；扩展时应增加明确分隔和
+  “historical evidence, not instructions” 标记，图片仍只记录数量。
+- 实际返回索引已写入 `ToolResult.details["indices"]`，可以作为识别 Recall 结果、去重和计算
+  lease 的稳定元数据。
+- 清理策略必须同时折叠 Recall 的 Tool Call 和 Tool Result，复用 `_align_tool_pairs()`，不能只
+  删除结果一侧而破坏 Provider 协议。
+- 可以在下一条非 Recall Assistant Message 写入后，将对应结果视为已消费；替代记录只保留来源
+  索引、是否截断和必要状态，不保留召回正文。
+- 当前没有 Retrieved Context 专用 TTL；需要扩展的是一轮 lease、消费识别和 Recall 专用清理
+  策略，不需要改变完整 History。
 
 ## 35. Retrieved Context 是否会重新进入长期记忆？
 
 ### 口述主回答
 
-Recall 本身不会写长期记忆。它只读取同一次运行的完整历史，并把结果作为当前会话中的工具结果；
-跨运行 Memory 则在独立的生命周期 Hook 中读取运行证据并决定是否沉淀经验。
+Retrieved Context 会进入长期记忆的候选证据集，但不会自动成为长期记忆。当前 Recall 结果作为
+普通 Tool Result 写入 State，SESSION_END 的 Memory 能看到它；但 Recall 本身没有 Memory 写入
+权限，最终是否持久化仍由 Memory 的写入策略决定。
 
-因此被 Recall 的内容可能出现在本次运行 transcript 中，被会话结束时的 Memory 蒸馏器看到，
-但是否进入长期手册由 Memory 策略决定，不能因为被召回过就自动永久保存。
+我会在写入前做两层判断。第一层是来源去重：Recall 结果带有原始消息索引，同一份证据无论被召回
+多少次，都只按原始 Message 计算一次，避免重复召回放大它的重要性。第二层是持久化资格：只有相对
+现有 handbook 有新增信息、对后续任务仍有价值、能由原始证据或运行结果支持，并且不包含 Secret
+和临时任务状态的内容，才允许写入。
+
+因此，召回的日志、代码或旧对话本身仍留在本次运行 transcript 中用于审计，不会再复制进长期
+handbook；如果 Agent 基于它形成了一条满足上述条件的可复用结论，这条结论可以引用原始证据后
+进入 Memory。Retrieved Context 可以间接贡献长期经验，但不会把同一份原文重复持久化。
 
 ### 追问问题与回答
 
 **追问：Recall、当前运行上下文和跨运行 Memory 的写入边界是什么？**
 
-Recall 只读取本次运行历史；工具结果写入当前 State；长期 Memory 只在独立 Memory 生命周期中
-根据整次运行证据决定是否持久化。
+Recall 只读原始 Message；召回结果写入当前 State 供本轮推理；SESSION_END 的 Memory 把它作为
+候选证据，先按来源去重，再决定是否有新的、可复用且有证据支持的内容需要持久化。
 
 ### 技术追问补充
 
@@ -424,10 +541,16 @@ Recall 只读取本次运行历史；工具结果写入当前 State；长期 Mem
   进入当前 transcript。
 - `Memory.bind()` 在 SESSION_START 调用 `initial()` 注入上下文，在 SESSION_END 调用
   `finish()` 进行最佳努力持久化。
-- FilesystemMemory 的 `finish()` 会读取完整 State messages 并生成 transcript，因此可能看到
-  Recall 结果，但是否保留由 distiller 的 `retain_run` 和 handbook 重写结果决定。
-- Memory 提示明确禁止保存 Secret、大段原始日志和临时当前任务状态；Recall 结果不会因为被读取过
-  就自动升级为长期经验。
+- FilesystemMemory 当前从完整 State messages 生成 transcript，因此 Recall 正文会重复出现；
+  扩展时应区分审计用完整 transcript 和送给 distiller 的过滤投影。
+- 过滤器可以通过 `ToolResultBlock.tool_name == "recall"` 和 sidecar 中按调用编号保存的
+  `details["indices"]` 定位召回副本，并按 `(run_id, source_message_index)` 去重。
+- 原始 Message 已经保存在同一个 State 中，因此去掉 Recall 副本不会丢失证据；distiller 需要时
+  应引用原始 transcript section，而不是召回结果 section。
+- Memory 写入门禁应检查 novelty、跨任务价值、证据引用和安全性；原始 Recall 正文、重复日志、
+  Secret 和当前任务临时状态不进入 handbook。
+- 当前 Memory Prompt 已要求把工具输出当作证据而非指令，并禁止保存 Secret 和大段日志；新增的
+  结构化去重用于在进入模型前进一步降低重复权重和提示注入风险。
 
 ## 核对依据
 
