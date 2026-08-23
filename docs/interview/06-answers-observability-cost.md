@@ -1,7 +1,7 @@
 # 06. Observability 与 Cost
 
 本文对应 [`question-checklist.md`](question-checklist.md) 中第六部分的问题。每道题包含可直接
-口述的主回答，以及精简的技术追问补充。
+口述的主回答；存在清单子问题时，保留追问原文和简短回答；最后记录整组问题对应的仓库实现。
 
 ## 64. 为什么使用 JSONL 保存 Trace？
 
@@ -13,12 +13,22 @@
 相比单个大 JSON，它不需要每次重写整个数组。代价是查询和关联能力弱，不适合多写者并发、复杂
 检索和事务场景；如果进入生产规模，数据库或日志系统更适合作为集中存储。
 
+### 追问问题与回答
+
+**追问：与单个 JSON、数据库或日志系统相比，JSONL 解决了什么问题，又有哪些限制？**
+
+它适合追加、实时读取和中断后恢复完整前缀；但查询、索引、多写者并发和事务能力弱于数据库或
+日志平台。
+
 ### 技术追问补充
 
-- 当前 v5 格式第一行是 Header，后续每行是一条 Event。
-- 增量 Writer 只追加新增事件，最终 Writer 可以通过临时文件加原子替换重建完整文件。
-- Reader 遇到无法解析的尾部会停止，前面已经完整写入的记录仍可使用。
-- JSONL 仍需要额外索引或导入数据库，才能支持高效条件查询和聚合。
+- `event_stream()` 生成一条 Trace Header 和按 `state.events` 顺序排列的 Event records；主文件中
+  不重复保存 messages、spans 和 cost。
+- `IncrementalTraceWriter` 首次原子写 Header，之后只 append 尚未写入的完整 Event 行；没有新
+  Event 时不写文件。
+- 最终 `write_event_stream()` 使用临时文件和原子替换重建规范文件；Provider raw 写入相邻
+  `*.raw.jsonl`。
+- `read_jsonl()` 使用增量 JSON 解码，遇到无法解析的尾部时停止，已完整读取的前缀仍然保留。
 
 ## 65. Trace Schema 是什么样的？
 
@@ -31,12 +41,25 @@
 消息、Span、模型轮次和成本不在 Header 中重复保存，而是从事件流派生，避免多份事实不一致。
 Schema 变化时必须同步更新 Writer、Reader、Viewer 和固定测试样例。
 
+### 追问问题与回答
+
+**追问：一条 Trace Event 至少需要哪些身份、时间、类型和载荷字段？**
+
+至少需要运行内 index、相对时间 elapsed、全局 UUID、事件 kind，以及该事件自己的领域字段。
+
+**追问：Schema 如何版本化并保持向后兼容？**
+
+文件 Header 使用明确版本号；变更时同步更新序列化器、Reader、Viewer 和 Golden Fixture。当前
+主要依赖兼容读取与测试，没有通用迁移框架。
+
 ### 技术追问补充
 
-- Event 至少包含 `index`、`elapsed`、`uuid`、`kind` 和该事件的领域载荷。
-- `index` 表示追加顺序，`elapsed` 表示运行内相对时间，`uuid` 用于跨文件引用。
-- 当前 Reader 兼容旧的单行或缩进 JSON 记录，但没有通用 Schema 迁移框架。
-- Golden fixture 用于发现序列化格式和 Viewer 之间的漂移。
+- `SCHEMA` 当前为 `simple-long-horizon-agent.trajectory.v5`；Header 还包含 type、trace_id、
+  producer、任务预览和 meta。
+- `event_record()` 将 dataclass 转为 JSON-safe 字典，并移除可重建且体积持续增长的
+  `llm_payload`。
+- Event 的 index 表示追加顺序，elapsed 是单调运行相对时间，UUID 用于跨文件和派生视图引用。
+- `test_trace_fixture_golden` 从真实 Event 类型生成 Viewer 样例，字段变化未同步时测试会失败。
 
 ## 66. 什么是 Span？
 
@@ -48,11 +71,20 @@ Span 是从开始和结束 Event 派生出的一个时间区间，用来表示�
 Event 是原始运行事实，Turn 是 Runtime 的控制循环边界，完整 Run 是一次 Agent 生命周期；Span
 只是把这些事实整理成便于查看的树，不会反向控制 Runtime。
 
+### 追问问题与回答
+
+**追问：Span 与 Runtime Event、Turn 和完整 Run 分别是什么关系？**
+
+Event 是原始事实；Turn 和 Run 是 Runtime 的生命周期边界；Span 把对应的开始与结束 Event 配成
+带父子关系的时间区间。
+
 ### 技术追问补充
 
-- AgentStart/End 形成运行 Span，TurnStart/End 形成 Turn Span。
-- ModelRequest/Response 和 ToolExecutionStart/End 分别形成模型与工具 Span。
-- 耗时按 `end - start` 计算，父节点由开始事件发生时的活动栈确定。
+- `spans_from_events()` 是纯派生函数，通过栈跟踪尚未结束的 Agent Run、Turn 和 Model Call。
+- AgentStart/End 形成 `agent_run`，TurnStart/End 形成 `turn`，ModelRequest/Response 形成
+  `model_call`，工具开始/结束形成 `tool_call`。
+- Span 保存 id、parent_id、start、end、输入、输出和属性；耗时由 `end - start` 计算。
+- Span 不写回 State，Viewer 对 Span 的筛选和展示不会改变 Agent 运行。
 
 ## 67. 模型调用和工具调用是否都应该表示为 Span？
 
@@ -64,12 +96,21 @@ Event 是原始运行事实，Turn 是 Runtime 的控制循环边界，完整 Ru
 项目不会把 Span 当成另一套日志，而是从对应事件配对生成。这样事件仍是事实来源，Span 只负责
 性能分析和层级展示。
 
+### 追问问题与回答
+
+**追问：不同类型 Span 的开始、结束、错误和耗时如何定义？**
+
+模型 Span 由请求和响应事件配对；工具 Span 由同一调用编号的开始和结束事件配对。错误写入属性，
+耗时统一由结束时间减开始时间。
+
 ### 技术追问补充
 
-- 模型 Span 从请求事件开始，在响应事件结束。
-- 工具 Span 通过调用编号匹配开始和结束，支持并行工具交错完成。
-- 工具错误和 `terminate` 写入 Span 属性；模型用量写入模型 Span 输出。
-- 当前缺失结束事件的操作不会形成一个完整闭合 Span，需要回到原始 Event 排查。
+- ModelRequestEvent 入栈时保存规范模型输入和请求属性，ModelResponseEvent 出栈时补充输出类型、
+  模型和 usage。
+- 并行工具的 Event 可以交错，提取器按 `tool_call_id` 在栈中反向查找对应工具开始记录。
+- ToolExecutionEndEvent 的 `is_error` 和 `terminate` 写入 Tool Span 属性；Turn Span 记录
+  `terminated`。
+- 当前只有开始而没有匹配结束的操作不会生成完整 Span，原始 Event Stream 仍保留该异常事实。
 
 ## 68. 父 Span 和子 Span 如何关联？
 
@@ -81,11 +122,23 @@ Event 是原始运行事实，Turn 是 Runtime 的控制循环边界，完整 Ru
 子 Agent 的事件保存在父 `task` 工具结果详情中，合并视图通过工具调用编号找到父工具 Span，再
 把子运行根 Span 挂到下面。普通 Workflow Step 则保留独立 Trace，并用轻量总览组成外层树。
 
+### 追问问题与回答
+
+**追问：Sub-Agent、Workflow Step、Model Call 和 Tool Call 如何形成层级 Trace？**
+
+Run 包含 Turn，Turn 包含模型和工具调用；task 工具对应的子 Agent Run 挂在父 Tool Span 下；
+独立 Workflow Step 保留自己的 Trace，由外层总览引用。
+
 ### 技术追问补充
 
-- 子 Agent 关联键是 `tool_call_id`，不是工具名或完成顺序。
-- 合并时只平移子 Span 时间并重设子根节点父 ID，不修改父子 State。
-- Planner、Critic 等独立 Workflow Step 通常各写一份子 Trace，外层只保存索引和摘要。
+- `task_tool` 将子 State Event 列表保存在父 Tool Result 的
+  `sidecar.details[tool_call_id].sub_events`。
+- `merge_sub_agent_spans()` 先生成父 Span，再通过 tool_call_id 找到父 Tool Span，并单独派生子
+  Span。
+- 子 Span 时间加上父 Tool Span 起点；只把子根 Span 的 parent_id 改为父 Tool Span，子树内部
+  关系保持不变。
+- Workflow Trace helper 为每个不同 Step State 写独立子 Trace，外层组合 State 只保存步骤索引、
+  摘要和子 Trace 路径。
 
 ## 69. 如何通过 Trace 调试失败任务？
 
@@ -98,12 +151,28 @@ Event 是原始运行事实，Turn 是 Runtime 的控制循环边界，完整 Ru
 Trace 可能包含任务、文件内容、命令输出和模型原始报文。当前项目提供原始报文外置和清晰的数据
 边界，但没有完整自动脱敏；敏感内容仍需要在上游最小化，并限制文件权限和保留周期。
 
+### 追问问题与回答
+
+**追问：如何定位模型决策错误、工具失败、上下文缺失和错误停止原因？**
+
+先看停止事件，再回到最后一个 Turn：核对模型请求与响应、工具开始结束和错误结果，以及压缩事件
+和当时可见上下文。
+
+**追问：密钥、用户数据和 Provider 原始响应等敏感信息如何避免进入 Trace？**
+
+优先在采集前避免写入，必要字段在序列化时脱敏，并限制 raw 文件权限与保留期。当前 raw 外置只
+解决体积，不等于脱敏。
+
 ### 技术追问补充
 
-- 模型问题查看请求、响应和对应 Assistant Message；工具问题查看开始、结束和错误结果。
-- 上下文问题查看压缩事件、活跃消息数量和模型请求中的可见上下文。
-- 结束原因从 `AgentEndEvent` 或 Goal 状态事件读取。
-- `raw` 单独写入相邻文件只是体积隔离，不等于安全隔离。
+- 模型决策可通过 ModelRequestEvent 的可见消息统计和请求投影、ModelResponseEvent 与对应
+  Assistant Message 对照；持久化 v5 中完整 Provider Wire 需要按 raw_ref 读取 sidecar。
+- 工具失败通过 ToolExecutionStart/End、`is_error` 和 ToolResult Message 定位；上下文问题通过
+  ContextCompressionEvent 的原索引、新活跃索引和前后 Token 定位。
+- `AgentEndEvent.reason` 区分 done、max_turns、tool_terminate 和 abort；GoalStatusEvent 记录外层
+  complete、blocked、budget_exhausted 和 aborted。
+- 当前 Trace Writer 没有通用自动脱敏；任务、工具正文、details 和 raw 都可能含敏感数据，raw
+  外置只减少主文件体积。
 
 ## 70. Token 使用量如何统计？
 
@@ -115,12 +184,26 @@ Trace 可能包含任务、文件内容、命令输出和模型原始报文。�
 压缩模型调用也会记录模型响应事件，`task` 子 Agent 的事件可以递归统计。字符估算只用于模型调用
 前判断上下文大小，不应当冒充真实计费数据。
 
+### 追问问题与回答
+
+**追问：应该优先使用 Provider 返回的 usage，还是在 Runtime 中自行估算？**
+
+计费和报表优先使用 Provider usage；Runtime 估算只用于调用前判断上下文大小和触发压缩。
+
+**追问：Model Call、压缩调用和 Sub-Agent 调用如何避免漏算或重复计算？**
+
+统一从每次 `ModelResponseEvent` 计数；压缩调用也记录正式事件，task 子 Agent 递归读取子事件，
+同一 usage 的 sidecar 副本不再次计费。
+
 ### 技术追问补充
 
-- 用量统一为输入、输出、缓存读取和缓存写入四个桶；全零表示未知，不计为一次精确调用。
-- 成本聚合只读取模型响应事件，摘要 sidecar 中的重复用量不会再次计费。
-- `task` 子 Agent 通过工具结果中的子事件递归统计；独立 Workflow Step 需要由上层汇总各 State。
-- 当前 Provider 重试的中间尝试没有逐次写入 Runtime Event，重试成本可能被低估。
+- Adapter 将一次调用的 usage 规范化为 `TokenUsage`，同时写入 AssistantMessage 和
+  `ModelResponseEvent`；成本聚合以 Event 上的 model/usage 为正式来源。
+- 全零 TokenUsage 表示 Provider 未提供可信用量，`RunCost` 会跳过，避免把未知调用误报成精确零。
+- `SummarizeStrategy` 将 compressor 的 ModelRequest/Response Event 写入主 State；摘要 sidecar
+  中的 usage 只是就近证据，不会再次聚合。
+- `RunCost.from_run()` 会递归读取 task Tool Result 中的 `sub_events`；独立 Workflow Step 和当前
+  未逐次记录的 Provider 重试需要上层另行汇总，可能存在低估。
 
 ## 71. 不同模型使用不同 Tokenizer 时怎么办？
 
@@ -132,12 +215,22 @@ Trace 可能包含任务、文件内容、命令输出和模型原始报文。�
 为了避免估算误差撑满窗口，还需要预留模型输出空间和安全缓冲。这个估算用于触发压缩，不用于
 声称精确 Token 计费。
 
+### 追问问题与回答
+
+**追问：Runtime 如何在精确计数不可用时估算 Context 大小并保留安全余量？**
+
+优先使用最近一次可信 usage 作为历史基线，再估算新增消息；没有可用基线时按消息字符估算，并从
+模型窗口中预留输出空间和安全缓冲。
+
 ### 技术追问补充
 
-- 文本缺少精确用量时按约 3.5 字符一个 Token 估算。
-- Assistant 已有 `output_tokens` 时优先使用该精确值估算它再次进入上下文的大小。
-- 压缩改变活跃历史后，旧的完整窗口 usage 会失效，系统改为逐消息估算。
-- 模型上下文窗口来自 Provider 配置或模型元数据表。
+- `estimate_message_tokens()` 对带可信 usage 的 AssistantMessage 使用其 `output_tokens`；其他文本
+  按 `ceil(可见字符数 / 3.5)` 估算，图片使用固定等价字符数。
+- `estimate_context_tokens()` 会寻找最近一条可信 Assistant usage，并只估算其后的新增消息。
+- 压缩改变活跃视图后，旧 usage 仍包含已移除历史，`_active_context_tokens()` 会禁用该基线并
+  重新逐消息求和。
+- `effective_token_budget()` 使用 `context_window - output_reserve - safety_buffer`；模型窗口来自
+  Provider 配置或模型元数据表。
 
 ## 72. Cached Token 和 Reasoning Token 如何统计与计费？
 
@@ -150,11 +243,22 @@ Trace 可能包含任务、文件内容、命令输出和模型原始报文。�
 当前统一 `TokenUsage` 没有单独的 Reasoning Token 桶。供应商如果把推理 Token 包含在输出
 Token 中，成本会跟随输出计费；更细的推理明细只能从原始响应查看，当前成本层不会单独定价。
 
+### 追问问题与回答
+
+**追问：不同 Provider 的 usage 字段不一致时，统一协议应该如何表达？**
+
+适配器统一成普通输入、输出、缓存读取和缓存写入四个桶；供应商特有的推理明细保留在 raw，不
+假装成跨 Provider 都一致的字段。
+
 ### 技术追问补充
 
-- 完整上下文占用是普通输入、输出、缓存读取和缓存写入之和。
-- `total_tokens` 不把缓存桶混进去，因为缓存价格与普通输入不同。
-- Reasoning 内容可以作为 ThinkingBlock 保存，但内容保存与 Token 计费是两条边界。
+- `TokenUsage` 字段为 `input_tokens`、`output_tokens`、`cache_read_tokens` 和
+  `cache_write_tokens`；`context_tokens` 是四项之和。
+- OpenAI 报告的输入总量包含缓存子集，Adapter 通过 `from_inclusive_input()` 减掉缓存后转为
+  加法口径；Anthropic 原生缓存字段直接映射。
+- `PriceBook` 为普通输入、输出、缓存读和缓存写分别保存每百万 Token 价格。
+- 当前没有 `reasoning_tokens` 正式字段；ThinkingBlock 保存推理内容，raw 可保留供应商推理用量
+  明细，但成本层不单独聚合。
 
 ## 73. 工具结果是否计入 Input Token？
 
@@ -166,11 +270,21 @@ Token 中，成本会跟随输出计费；更细的推理明细只能从原始�
 因此要区分两种成本：工具执行的时间、外部 API 或计算成本，和工具结果带来的模型输入 Token
 成本。当前 `RunCost` 只计算模型 Token 美元成本，不统计任意外部工具费用。
 
+### 追问问题与回答
+
+**追问：Tool 自身执行成本与 Tool Result 进入后续模型请求产生的 Token 成本如何区分？**
+
+工具执行成本属于外部资源或服务账单；Tool Result 只有在进入下一次模型请求后，才作为输入 Token
+计费。两者需要分开统计。
+
 ### 技术追问补充
 
-- Provider 只报告整次请求的输入总量，Runtime 不会把它反向精确分摊到某条 Tool Result。
-- 下一次 usage 返回前，ContextView 会对新增工具结果做字符近似估算。
-- 工具耗时由 Tool Span 记录；外部服务账单需要工具或调用者另行上报。
+- ToolResult content 被包装进 `kind="tool_result"` UserMessage；下一轮 Bridge 将它投影进模型
+  请求，因此其文本和图片占用输入窗口。
+- Provider 只报告整次请求输入总量，Runtime 不会把精确 input_tokens 反向拆分到单条 Tool Result。
+- 下一次 Provider usage 返回前，ContextView 按 Tool Result 可见正文、调用 ID、工具名和图片
+  等价大小做近似估算。
+- Tool Span 只记录耗时和错误；当前没有统一外部 API 费用、CPU 时间或存储成本字段。
 
 ## 74. 一个任务的最终成本如何计算？
 
@@ -182,12 +296,28 @@ Token 中，成本会跟随输出计费；更细的推理明细只能从原始�
 Planner、Reflection 等独立 Workflow Step 拥有不同 State，需要上层对各步骤成本去重后相加。
 未知模型仍记录调用次数和 Token，但美元成本标记为未定价，因此总金额只是下界。
 
+### 追问问题与回答
+
+**追问：如何汇总主 Agent、Sub-Agent、Planner、Reflection、Compact 和重试产生的成本？**
+
+主 Agent 和 Compact 从同一 Event Stream 聚合，task 子 Agent 递归读取子事件；Planner 和
+Reflection 的独立 State 由 Workflow 去重后相加。未记录的重试尝试当前无法完整汇总。
+
+**追问：模型价格变化或未知价格时如何记录和展示？**
+
+Trace 保留模型和 Token；价格由当前 PriceBook 计算。未知模型标记为 unpriced，总美元成本按下界
+展示；严格审计还需要保存运行时价格表版本。
+
 ### 技术追问补充
 
-- `RunCost.from_run()` 可递归读取 `task` 工具保存的子事件，避免漏掉嵌套子 Agent。
-- Workflow 汇总应按不同 State 去重，避免 Goal Loop 多个 Step 共享同一 State 时重复计算。
-- 当前重试尝试没有完整事件，无法保证把所有重试成本计入。
-- Trace 保存模型和 usage，不冻结历史价格；需要可审计账单时应额外保存当时价格表版本。
+- `RunCost.from_run()` 遍历 `model_response` Event，并递归读取 Tool Result
+  `details[call_id].sub_events`，可覆盖多层 task 子 Agent。
+- `workflow_steps_breakdown()` 通过 State 对象身份去重输出 Token，避免 Goal Loop 多个 Step 共享
+  同一 State 时重复统计；完整美元成本仍需对各独立 State 调用 RunCost 后求和。
+- 未找到价格的模型仍生成 ModelCost 和 Token 汇总，美元字段为 0，并加入
+  `unpriced_models`，因此总额明确是下界。
+- Trace 保存模型与 usage，不保存不可变价格快照；Provider 重试的中间尝试也没有完整 Event，
+  当前无法生成严格账单级总成本。
 
 ## 核对依据
 

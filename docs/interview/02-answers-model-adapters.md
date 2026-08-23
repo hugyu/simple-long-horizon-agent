@@ -18,13 +18,43 @@ OpenAI Chat 把工具调用放在助手消息的专门字段中，参数以 JSON
 
 ### 技术追问补充
 
-- **OpenAI Chat 和 OpenAI Responses 是否相同**：不相同。Chat 使用对话消息列表，
-  工具调用和结果依附在不同角色的消息上；Responses 使用扁平输入项，函数调用和结果是独立
-  条目，固定系统提示通常放在单独的指令字段中。项目为两者分别实现适配器。
-- **并行工具结果怎样返回**：运行时按模型原始调用顺序整理多个结果，每个结果保留调用编号。
-  Anthropic 将它们放在一条用户消息的多个结果块中；OpenAI Chat 拆成多条工具角色消息。
-- **调用配对依靠什么**：模型产生的调用编号是稳定关联键。适配器可以改变报文排列，但不能
-  改写或丢失调用编号。
+假设模型调用 `read(path="README.md")`，调用编号为 `call_1`。
+
+**OpenAI Chat** 的调用参数是 JSON 字符串，结果使用独立的工具角色消息：
+
+```json
+{"role":"assistant","tool_calls":[
+  {"id":"call_1","type":"function",
+   "function":{"name":"read","arguments":"{\"path\":\"README.md\"}"}}
+]}
+{"role":"tool","tool_call_id":"call_1","content":"README content"}
+```
+
+**OpenAI Responses** 使用扁平输入项，调用和结果分别是独立条目：
+
+```json
+{"type":"function_call","call_id":"call_1",
+ "name":"read","arguments":"{\"path\":\"README.md\"}"}
+{"type":"function_call_output","call_id":"call_1",
+ "output":"README content"}
+```
+
+**Anthropic** 把调用放在助手内容块中，参数直接是对象；结果放在用户内容块中：
+
+```json
+{"role":"assistant","content":[
+  {"type":"tool_use","id":"call_1",
+   "name":"read","input":{"path":"README.md"}}
+]}
+{"role":"user","content":[
+  {"type":"tool_result","tool_use_id":"call_1",
+   "content":"README content"}
+]}
+```
+
+**并行调用**时，假设还有一个 `call_2`。Anthropic 可以把两个 `tool_result` 放在同一条
+用户消息中；OpenAI Chat 要拆成两条工具角色消息。无论报文怎样排列，`call_1` 和 `call_2`
+都必须保留，Runtime 才能把每个结果关联回原调用。
 
 ## 19. 你的适配器抽象是什么样的？
 
