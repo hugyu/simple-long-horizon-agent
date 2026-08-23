@@ -156,6 +156,9 @@
 51. Sub-Agent 的 Token Budget 如何分配？
     - Parent 和多个 Child 之间如何设置局部预算与全局预算？
 
+51A. 项目提供了哪些 Workflow？
+    - 这些 Workflow 分别适合什么场景？
+
 52. Planner 和 Executor 为什么需要分开？
     - 两者分别负责什么，哪些状态和决策不应该混在一起？
 53. Planner 输出什么结构？
