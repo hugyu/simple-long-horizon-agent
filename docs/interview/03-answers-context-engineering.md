@@ -682,6 +682,97 @@ summary。这样把开放式的“什么值得记住”交给模型，把并发�
 - 当前 Memory Prompt 已要求把工具输出当作证据而非指令，并禁止保存 Secret 和大段日志；新增的
   结构化去重用于在进入模型前进一步降低重复权重和提示注入风险。
 
+## 35A. 当前项目的 Memory 是怎么实现的？
+
+### 口述主回答
+
+我这里把 Memory 做成了文件系统上的跨运行经验。每次任务开始时，只把已有经验的摘要和存储位置
+告诉 Agent，由它按需读取；任务结束后，再把本次运行的过程和产物保存下来，并提炼成后续任务可以
+复用的经验。
+
+我没有把 Memory 做成每轮自动检索的向量库，主要是希望它保持可检查、可追溯。Memory 只提供历史
+参考，当前代码、测试和工具执行结果始终优先。
+
+### 追问问题与回答
+
+**追问：Memory 在什么时候读取和写入？**
+
+读取发生在任务开始时，只注入摘要、路径和使用规则；写入发生在任务结束时，收集最终对话和关键
+产物后再沉淀。Memory 是增强能力，读写失败不会让主任务失败。
+
+**追问：每个任务都会单独生成一份 `MEMORY.md` 吗？**
+
+不会。项目是每个 Memory Namespace 维护一份 `MEMORY.md`，同一类任务的多个 Run 共同更新这份
+长期经验手册；每次任务自己的 Task、Transcript、Summary 和 Artifact 则单独保存在
+`runs/{run_id}/` 下。这样既能聚合同类经验，也能回到具体 Run 核对原始证据。
+
+**追问：多个 Run 同时写入发生冲突时怎么办？**
+
+同一个 Memory Root 同一时间只允许一个写入者，锁会覆盖“读取旧版本、提炼、提交新版本”整个
+过程，避免两个 Run 相互覆盖。文件提交使用原子替换，重复的 Run ID 也不会再次写入。
+
+**追问：Namespace、运行证据和长期经验如何管理？**
+
+我按任务族划分 Namespace。每个 Namespace 分开保存长期经验、导航索引和每次运行的原始证据；
+Distiller 负责合并和去重长期经验，系统通过数量和容量上限清理最旧的运行记录。
+
+### 技术追问补充
+
+- `Memory` 的当前接口是 `initial(ctx)`、`tools(ctx)` 和 `finish(ctx)`；`bind()` 将它们转换成
+  `SESSION_START`、`SESSION_END` Hook 以及普通 `AgentTool`，核心 Agent Loop 不依赖具体 Memory
+  实现。
+- `FilesystemMemory.initial()` 在指定 `memory_name` 时确保 Namespace 布局存在，并把路径、策略和
+  最多 2000 字符的导航摘要包装成 `sender="memory"`、`kind="context"` 的 Runtime Message。
+- 未指定 `memory_name` 时，启动阶段只注入已有 Namespace 的有限概览，由模型决定读取哪个目录；
+  当前实现不会在每次模型请求前执行向量检索或自动召回。
+- `finish()` 只在 Memory 启用且最终 State 存在时执行。它从 State 生成有界 Task 和 Transcript，
+  收集显式 `memory_artifacts` 或最终 Submission，再写入本次 `runs/{run_id}/`。
+- 配置 Distiller 时，它读取现有 Summary、Index、Handbook 和本次证据，返回完整的新
+  `MEMORY.md`、Namespace 摘要、单次运行摘要和 Index Row；未配置或 Distill 失败时仍保存运行证据
+  和回退摘要。
+- 一个 Namespace 的固定结构是 `MEMORY.md`、`memory_summary.md`、`INDEX.md` 和
+  `runs/{run_id}/`；每个 Run 保存 `task.md`、`transcript.md`、`summary.md`、Artifact 清单及实际
+  Artifact。
+
+```text
+{memory_root}/{namespace}/
+|-- MEMORY.md
+|-- memory_summary.md
+|-- INDEX.md
+`-- runs/
+    `-- {run_id}/
+        |-- task.md
+        |-- transcript.md
+        |-- summary.md
+        |-- artifacts.md
+        `-- artifacts/
+```
+
+| 概念 | 作用 |
+| --- | --- |
+| `memory_name` | 本次 Run 使用的 Namespace 名称，例如 `python-repo-repair`；它决定从哪个目录读取经验，以及任务结束后写回哪个目录。 |
+| `memory_summary.md` | Namespace 的冷启动导航摘要，只帮助 Agent 快速判断这份 Memory 是否相关，不代替完整的 `MEMORY.md`。 |
+| `MEMORY.md` | Namespace 级长期经验手册，保存多个相关 Run 提炼出的高价值经验，不属于某一个任务。 |
+| `INDEX.md` | 运行证据索引，把简短结论、适用范围和关键词关联到具体的 `runs/{run_id}/summary.md` 与 Artifact。 |
+| Distiller | 可选的模型提炼步骤。它在 Run 结束时读取旧 Memory 和本次证据，决定是否保留本次 Run、写入哪个 Namespace，并返回合并去重后的完整 `MEMORY.md`。 |
+| `runs/{run_id}/` | 单次任务的证据目录，用于保存 Task、Transcript、Summary 和 Artifact，支持长期结论回溯。 |
+
+- 调用方可以通过 `memory_name` 明确指定 Namespace；没有指定时，Distiller 可以根据任务和已有
+  Memory 选择 Namespace；既没有指定、也没有 Distiller 时写入 `default`。`memory_summary.md`
+  只负责导航，真正需要使用经验时仍读取 `MEMORY.md` 或通过 `INDEX.md` 回到具体 Run 证据。
+- `_memory_lock(root)` 使用 Root 下共享的 File Lock，覆盖读取旧文件、Distiller 模型调用和写入
+  提交。这个设计避免 Lost Update，代价是同一个 Root 的 Memory 沉淀过程会串行。
+- `_write_text_atomic()` 使用同目录临时文件替换目标文件，保证单文件不会暴露部分写入；它不能替代
+  覆盖整个逻辑事务的 Root Lock。
+- 完整 Run 以 `.complete` 标记；相同 Run ID 已经完成时 `finish()` 是 No-op，避免重试生成重复
+  证据或重复更新 Index。
+- 默认限制为每个 Root 最多 128 个 Namespace，每个 Namespace 最多 64 个 Run、总大小 128 MiB；
+  Task、Transcript 和 Artifact 也分别有限额，写入完成后裁剪最旧 Run。
+- Distiller 对 `MEMORY.md` 做完整重写而不是追加 Delta；空更新保留旧手册，超长、结构为空或会
+  清空全部经验的异常重写会被拒绝，并在对应 Run 下记录 `memory_error.md`。
+- `initial()` 失败会产生模型和 Trace 可见的跳过说明；`finish()` 或 Distill 失败按 Best-effort
+  处理并记录错误，不把 Memory 变成主任务的单点依赖。
+
 ## 核对依据
 
 - [`context_view.py`](../../src/simple_long_horizon_agent/context_view.py)
@@ -690,6 +781,8 @@ summary。这样把开放式的“什么值得记住”交给模型，把并发�
 - [`compression/strategies.py`](../../src/simple_long_horizon_agent/compression/strategies.py)
 - [`compression/agent_control.py`](../../src/simple_long_horizon_agent/compression/agent_control.py)
 - [`tools/recall.py`](../../src/simple_long_horizon_agent/tools/recall.py)
+- [`memory/base.py`](../../src/simple_long_horizon_agent/memory/base.py)
+- [`memory/filesystem.py`](../../src/simple_long_horizon_agent/memory/filesystem.py)
 - [`memory/transcript.py`](../../src/simple_long_horizon_agent/memory/transcript.py)
 - [`memory.md`](../memory.md)
 - [`07-context-and-long-horizon.md`](../design/07-context-and-long-horizon.md)

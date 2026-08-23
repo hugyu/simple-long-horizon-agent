@@ -104,6 +104,12 @@
 35. Retrieved Context 是否会重新进入长期记忆？
     - Recall、当前运行上下文和跨运行 Memory 的写入边界是什么？
 
+35A. 当前项目的 Memory 是怎么实现的？
+    - Memory 在什么时候读取和写入？
+    - 每个任务都会单独生成一份 `MEMORY.md` 吗？
+    - 多个 Run 同时写入发生冲突时怎么办？
+    - Namespace、运行证据和长期经验如何管理？
+
 ## 四、Tools 与集成
 
 对应回答：[`04-answers-tools-integrations.md`](04-answers-tools-integrations.md)
@@ -136,6 +142,12 @@
     - 权限策略应该由 MCP Server、Client、Runtime 还是上层 Session 管理？
 45. Agent 是否可以访问已连接 MCP Server 暴露的全部 Tool？
     - 如何按 Agent、任务或运行环境限制 Tool 的发现范围和调用权限？
+
+45A. Skills 是渐进式加载的吗？如何注入和管理？
+    - Skill 的元数据、正文和附带资源分别在什么时候加载？
+    - 显式提及、预加载和模型按需读取有什么区别？
+    - Repo、User 和 Bundled Skill 如何发现、去重、覆盖和禁用？
+    - 当前是否支持运行中卸载 Skill？如果需要，应该如何实现？
 
 ## 五、Workflow 与完成判断
 
@@ -227,56 +239,10 @@
 
 对应回答：[`07-answers-evaluation-experiments.md`](07-answers-evaluation-experiments.md)
 
-75. 你的 Eval Framework 整体架构是什么？
-    - Dataset、Suite、Backend、Store、Runner 和 Scorer 分别负责什么？
-    - 本地进程、本地 Docker 和远程 Docker 如何复用同一套评测协议？
-76. 一个 Eval Task 包含哪些内容？
-    - 任务输入、环境、Agent 配置、预算、验证器和产物之间如何分离？
-77. Agent Benchmark 最大的问题是什么？
-    - 模型采样、工具环境、网络、依赖和评分器带来的随机性如何控制？
-    - 如何保证不同 Agent 方案使用相同模型、任务和预算进行公平比较？
-78. 同一个任务应该运行几次？
-    - 只运行一次得到 63.20% 时，这个结果是否可靠？
-    - 应该如何报告重复实验、方差、置信区间、失败样本和成本？
-
-79. SWE-bench Pro 的 63.20% 是如何计算出来的？
-    - 总共有多少 Task，Pass 了多少？
-    - 使用 Full Set 还是 Subset，运行了几次，使用什么模型和配置？
-    - 如果缺少逐任务原始产物，哪些数字可以确认，哪些不能现场推断？
-80. Baseline 是什么？
-    - Baseline 与当前实验的 Model、Prompt、Tool、Token Budget 和 Timeout
-      是否完全一致？
-    - 如果条件不一致，结果还能否直接归因于 Agent Runtime？
-81. 4.10 个百分点的提升是否具有统计意义？
-    - 如何报告重复运行、方差、置信区间和配对任务差异？
-82. Benchmark 提升主要来自哪个模块？
-    - 是否做过 Baseline、Context Management、Parallel Tool、Reflection、
-      Recall 和 Goal Loop 的逐项 Ablation？
-    - 如果没有 Ablation，为什么不能把端到端提升归因到某一个模块？
-83. 去掉 Compact 后结果下降多少？Recall 对哪些 Task 类型提升最大？
-    - 如何设计 remove-one 和按任务类型分组的实验回答这两个问题？
-84. 哪些任务因为当前 Runtime 反而下降？
-    - 失败 Case 最大的三个类别是什么？
-    - SWE-bench Pro 中最常见的失败原因是什么？
-85. Terminal-Bench、SWE-bench 和 PostTrainBench 使用的 Agent 策略有什么区别？
-    - 为什么 Terminal-Bench 提升 12.83 个百分点，而 PostTrainBench
-      只提升 1.91 个百分点？
-
-86. 如何证明性能提升来自 Runtime，而不是 Prompt 调整或其他配置变化？
-    - 是否做过逐项 Ablation、remove-one 实验或相同 Prompt 的对照实验？
-    - 没有 Ablation 时，哪些结论不能做因果归因？
-87. 模型版本更新和 Benchmark Contamination 应该如何处理？
-    - 如何固定模型快照、记录运行日期和检测训练数据污染风险？
-    - 新旧模型结果能否直接比较？
-88. 如何保证不同 Agent Config 的实验公平？
-    - Model、Prompt、Tool、Token Budget、Timeout、并发度和重试策略是否一致？
-    - 哪些变量是控制变量，哪些是实验变量？
-89. 如果一个 Agent 使用了两倍 Token，但 Success Rate 更高，应该如何比较？
-    - 如何同时报告成功率、成本、延迟和预算约束下的效率？
-90. Pass@1 和 Pass@k 有什么区别？
-    - Agent Benchmark 中多次采样、选择最佳结果和单次真实运行分别代表什么？
-91. Agent Eval 为什么比普通 LLM Eval 更难？
-    - 模型随机性、环境状态、工具副作用、长时间执行和外部评分如何影响可复现性？
+75. 介绍一下 Terminal-Bench 2.1 和 SWE-bench Pro 这两个任务。
+76. 这两个任务分别怎么判断成功？
+77. 这两个任务的结果是怎么检验的？
+78. Baseline 是什么？
 
 ## 八、Production Agent Platform
 
