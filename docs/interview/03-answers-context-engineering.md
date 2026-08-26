@@ -233,31 +233,47 @@ Artifact 或可定位的精确片段。
 
 ### 口述主回答
 
-项目里有两种触发方式。普通压缩策略由运行时在每轮模型请求前检查 Token 阈值；主动 Compact
-则由主 Agent 自己调用 compact 工具并提交摘要，运行时在下一轮开始、构建模型请求之前安全应用。
+主动 Compact 是主 Agent 的模型主动触发的，不是 Runtime 等 Token 达到阈值后替它决定。比如
+模型判断一个子任务已经结束、旧的搜索和调试过程不再需要逐字保留时，会像调用普通工具一样输出
+`compact(summary=..., keep_recent=2)`。这里的 `summary` 不是一句“请压缩”，而是模型自己写好的
+替代工作记忆，要保留后续仍需要的事实、决策、失败尝试和下一步；`keep_recent` 表示最近多少条
+非保护消息继续原样保留。
 
-默认阈值可以由模型上下文窗口乘配置比例得到，也可以直接覆盖。Agent 主动 Compact 不依赖固定
-阈值，它适合在一个子任务结束、旧过程不再需要逐字保留时主动整理工作记忆。
+这个 Tool Call 不会在工具线程里直接删除上下文。`compact` 工具只校验参数，把摘要封装成
+`compact_request` 放进 ToolResult，Agent Loop 再把它记录到追加式 transcript。到下一轮开始、
+构建模型请求之前，`AgentCompactStrategy` 读取这个最新请求，选出较旧且允许压缩的消息；Runtime
+用 Agent 提交的摘要生成一条 summary Message，并通过 `ContextCompressionEvent` 更新 Active
+Context 的索引。原始消息仍保留在完整 History 中，只是不再默认发给模型。因此“主动”指的是
+压缩时机和摘要内容由主模型决定，真正修改上下文视图仍由 Runtime 在安全点完成。
 
 ### 追问问题与回答
 
 **追问：主动 Compact 基于固定 Token 数、Context Window 使用比例，还是模型主动请求？**
 
-系统控制策略按 Token 阈值触发；主动 Compact 则由模型调用 compact 工具并提交自己写的摘要。
+主动 Compact 本身不看固定 Token 数或使用比例，而是模型根据任务阶段主动调用 `compact` 并提交
+替代摘要。Token 阈值属于系统控制的压缩策略，可以作为没有主动请求时的 fallback。
 
 **追问：触发阈值如何为不同模型配置？**
 
-可以直接配置阈值；未覆盖时根据模型上下文窗口乘压缩比例计算。
+这只影响系统控制策略：可以为模型直接配置阈值；没有显式值时，再用该模型的 context window
+乘压缩比例计算。主动 Compact 不依赖这个阈值。
 
 ### 技术追问补充
 
 - 默认 Agent 压缩阈值由 `_compression_threshold()` 读取显式配置，或使用 Provider/模型元数据中的
   context window 乘配置比例。
-- compact 工具只校验 `summary` 和可选 `keep_recent`，将 `compact_request` 写入 ToolResult
-  details，不在工具线程中修改 State。
-- `AgentCompactStrategy` 在下一轮请求前读取最近请求，生成 summary Message 和
-  `ContextCompressionEvent`。
-- 请求只有在它仍是当前活跃视图最新消息时才生效，因此最多应用一次，也不会延迟压缩后续新消息。
+- 主模型输出 `compact(summary, keep_recent?)` Tool Call；工具只校验参数，并将
+  `compact_request` 写入 ToolResult details，不在并行工具线程中修改 State。
+- 完整执行链是：`compact Tool Call → ToolResult(compact_request) → 下一轮 TurnStart →
+  maybe_compress_context() → AgentCompactStrategy → CompressionDecision → summary Message →
+  ContextCompressionEvent → build_context_view() → ModelRequest`。
+- Strategy 默认保留受保护的 `task/system/summary/context` 消息以及最近 `keep_recent` 条非保护消息，
+  其余候选按消息索引折叠；Runtime 还会对齐 Tool Call/Tool Result，避免只压缩工具交换的一半。
+- `ContextCompressionEvent` 只重写 Active Context 索引，完整 transcript 不删除，因此后续仍可审计
+  或通过 Recall 找回原文。
+- 请求只有在承载它的 ToolResult 仍是当前活跃视图最新消息时才生效；摘要写入后会形成新的最高
+  Message 索引，所以同一请求最多应用一次。若当时没有消息可折叠，请求会失效，不会延迟到未来
+  错压它没有描述的新消息。
 
 ## 28. Compact 的粒度是什么？
 
@@ -322,44 +338,69 @@ Runtime 根据 `tool_call_id` 对齐调用与结果；普通折叠不能只压�
 
 ### 口述主回答
 
-我不会只靠 Prompt 里写“不要编造”，而是把 Summary 设计成带证据、经过接受门禁的压缩结果。
-基于当前 `SummarizeStrategy`，我会让 compressor 输出结构化摘要：每条事实都携带来源 Message
-索引和能够在原文中核对的路径、命令、错误或短锚点，并区分“原文事实”和“模型推断”。
+这里的风险是：主 Agent 把一批旧消息交给另一个 compressor 模型，这个模型如果把“尝试过”总结成
+“已经完成”，或者改写了路径、命令和数值，错误就会作为 working memory 继续影响主 Agent。我
+主要从输入范围、摘要任务和错误影响面三层控制，而不是假设换一个模型就自然可靠。
 
-摘要生成后不会立即写入 Active Context。验证层先做确定性检查：引用的索引必须属于本次压缩
-范围，证据锚点必须能在原消息中找到，路径、ID、命令和数值等精确标识不能凭空新增，目标、已完成
-事项、未解决问题和下一步等必需部分也要满足覆盖要求。然后可以再由独立 verifier 检查遗漏、
-矛盾和无证据结论，但模型 Judge 只作为补充，不能替代这些确定性规则。
+当前 `SummarizeStrategy` 会把选中的原始 Message 直接交给独立 compressor，不先经过主 Agent 的
+二次转述；task、system、context、已有 summary 和最近几条消息默认保留原文，不交给它改写。
+compressor 本身不挂工具，只做一次受限的摘要调用，提示要求按 Goal、Done、State、Facts、Open、
+Next 和 Tried & rejected 整理，并要求路径、符号、命令、错误、测试名和数值保持原样，不确定就
+省略。这样能减少自由发挥，也能避免它把当前任务和最近状态一起压坏。
 
-验证失败时，我会把具体问题反馈给 compressor 重试一次；仍然失败就退化为抽取式摘要，只保留
-原文片段和来源索引，或者取消本次压缩，不能让可疑摘要进入活跃上下文。验证通过后，Runtime 才
-应用 `CompressionDecision` 并记录摘要、验证结果和 `ContextCompressionEvent`。
-
-现有的 task、最近消息和完整 History 继续保留原文，Recall 作为最后恢复手段。这样不能从数学上
-证明摘要绝对正确，但能把“静默产生幻觉”变成有证据、可拒绝、可降级和可回放的过程。
+但我不会说 Prompt 能消除幻觉。当前 Runtime 只校验压缩的消息范围和 Tool Call/Result 结构，
+还不会判断摘要内容是否忠于原文。因此项目把完整 History 保留为追加式事实，记录 compressor 的
+请求、响应以及被折叠的 Message 索引；Summary 只替换 Active Context，原消息没有被删除，必要时
+可以通过 Recall 找回。也就是说，当前做到的是限制 compressor 的输入、职责和错误影响范围，并让
+错误可追溯、可恢复；如果要进一步做发布级保证，我才会再增加逐条来源引用和摘要验收门禁。
 
 ### 追问问题与回答
 
 **追问：Runtime 能验证 Summary 与原始历史一致吗？**
 
-当前 Runtime 还不能做内容一致性验证，只能校验压缩结构。扩展后可以确定性验证来源索引、证据
-锚点和精确标识，再用独立 verifier 检查语义矛盾与遗漏；它仍不能提供绝对证明，但验证失败时
-可以拒绝摘要，不让它进入 Active Context。
+当前不能。Runtime 能确认 `CompressionDecision` 只作用于有效 Message 索引，并保持 Tool Call
+和 Tool Result 配对，但 compressor 返回的自然语言是否遗漏、矛盾或编造事实，目前没有语义门禁。
+现有保障是保留原始 History、记录压缩证据并支持 Recall；如果扩展，我会要求摘要 claim 携带来源
+索引，先验证精确标识和证据锚点，再决定是否接受摘要。
+
+**追问：什么时候应该触发 Recall？**
+
+不是每次生成 Summary 后都自动 Recall。当前由主 Agent 在下一步依赖精确原文、但 Summary 没有
+提供足够证据时主动调用，例如需要核对文件路径、命令、错误、数值、测试结果或先前决策，发现
+摘要与当前信息冲突，或者准备基于不确定事实执行高风险操作。Runtime 不会自动判断模型缺了什么；
+而且当前 Summary 还不会自动附上被压缩的 Message 索引，因此模型还需要已有索引线索才能调用，
+把压缩索引确定性地写进 Summary 是后续需要补齐的链路。
+
+**追问：Recall 具体怎么做？调用时提供什么，返回什么？**
+
+项目把 Recall 实现成绑定当前 `State` 的只读工具。主 Agent 调用时提供要恢复的 0-based Message
+索引数组，例如 `recall(indices=[12, 13])`；工具校验索引后直接从完整的 `State.messages` 读取
+原消息，不做关键词匹配、Embedding 或外部存储查询。返回结果会标明每条消息的索引、role、sender、
+target、kind，并恢复正文以及其中的 Tool Call、Tool Result 和错误状态，再作为普通 ToolResult
+进入下一轮上下文。为了避免一次 Recall 抵消压缩效果，返回的索引数、单条字符数和总字符数都有
+上限。
 
 ### 技术追问补充
 
-- 可以把 compressor 输出扩展为结构化 `SummaryPayload`，其中每条 claim 包含文本、事实或推断
-  类型、`source_message_indices` 和短 evidence anchors；最终再渲染为模型可读 Summary Message。
-- 确定性 acceptance gate 校验引用索引属于 `compress_indices`、anchor 能在原文定位，以及摘要
-  新增的路径、命令、错误、测试名、ID 和数值能够在来源中找到。
-- 可选 verifier 读取原消息和候选摘要，输出 unsupported、contradicted 和 missing claims；其请求、
-  响应和判断结果都进入 Trace，但不能把另一个模型的判断当作形式化证明。
-- 失败路径是“带错误重试一次 → 抽取式摘要 → 取消压缩”，任何一步都不能删除原始 History；
-  只有通过门禁的 Summary 才生成替代 `MessageEvent` 和 `ContextCompressionEvent`。
-- 需要增加摘要忠实度测试，例如植入精确路径、数值、否定事实和相互冲突的消息，验证无来源 claim
-  会被拒绝、关键事实遗漏能被发现、降级后 Active Context 仍保持可用。
-- 当前代码已经具备结构安全校验、摘要 Trace、完整 History 和 Recall；需要扩展的是结构化摘要
-  协议、内容 acceptance gate、verifier 以及失败降级策略。
+- `SummarizeStrategy` 先确定 `compress_indices`，把这些索引对应的原始 Message 加上一条摘要指令
+  直接交给独立 compressor；默认不改写 `task/system/summary/context` 和最近 `keep_recent` 条消息。
+- `context` 不是独立的 Message 类，而是 `Message.kind` 的一个枚举值，表示框架注入的补充上下文，
+  例如子 Agent 委派背景、Session Start Memory、Skill 内容和 Turn Limit 提醒。它通常表现为
+  `RuntimeMessage(kind="context")`，Skill 内容则使用 `UserMessage(kind="context")`；压缩策略按
+  `kind == "context"` 保护它们，不依赖底层的具体 Message 类型。
+- 默认 `context_compressor` 与主 Agent 使用同一 Provider，但拥有独立、窄职责的 system prompt，且
+  `tools=()`；它通过 `generate()` 完成一次模型调用，不运行完整 Agent Loop。
+- compressor 输出的文本当前会直接包装成 `UserMessage(kind="summary")`。Runtime 会记录它的
+  `ModelRequestEvent`、`ModelResponseEvent`、模型与 usage，但目前没有摘要内容 acceptance gate。
+- `ContextCompressionEvent` 保存被压缩索引和新的 Active Context 索引；原 Message 仍在完整 State
+  中，Recall 可以按索引取回，所以 compressor 出错不会破坏原始证据。
+- Recall 的触发条件是“下一步需要精确证据但摘要不足或相互矛盾”，不是压缩后的固定动作；当前由
+  模型显式调用，Runtime 不自动召回。
+- `make_recall_tool(state)` 通过闭包绑定当前 State；输入是 `indices: integer[]`，输出包含消息索引、
+  role、sender、target、kind、正文、Tool Call 和 Tool Result。默认最多请求 20 个索引，单条最多
+  4000 字符，单次合计最多 8000 字符。
+- 若继续增强，可以要求 compressor 返回带 `source_message_indices` 和原文 anchor 的结构化 claim，
+  验证失败时重试、退化为抽取式摘要或取消压缩；这部分是扩展设计，不是当前已实现能力。
 
 ## 31. Summary 被再次 Summary 时，如何控制信息丢失？
 
@@ -535,12 +576,101 @@ handbook；如果 Agent 基于它形成了一条满足上述条件的可复用�
 Recall 只读原始 Message；召回结果写入当前 State 供本轮推理；SESSION_END 的 Memory 把它作为
 候选证据，先按来源去重，再决定是否有新的、可复用且有证据支持的内容需要持久化。
 
+**追问：当前 Memory 是怎么实现的？**
+
+当前实现是 `FilesystemMemory`，不是向量数据库或每轮自动 RAG。每个 Memory namespace 是一个
+Markdown 目录：`MEMORY.md` 保存经过整理的长期 handbook，`memory_summary.md` 用于启动时导航，
+`INDEX.md` 索引各次运行，`runs/<run_id>/` 保存本次任务、完整 transcript、运行摘要和 artifacts。
+
+```text
+~/.simple/memory/                 # 默认 Memory root
+└── <memory_name>/                # 一个任务域或项目的 namespace
+    ├── memory_summary.md         # 启动时使用的简短导航摘要
+    ├── MEMORY.md                 # 跨运行复用的长期经验 handbook
+    ├── INDEX.md                  # 各次运行摘要与证据路径的索引
+    └── runs/
+        └── <run_id>/             # 一次运行的原始证据目录
+            ├── task.md           # 本次任务
+            ├── transcript.md     # 完整 Message transcript
+            ├── summary.md        # 本次运行的压缩证据摘要
+            ├── artifacts.md      # artifacts 清单
+            ├── artifacts/        # 报告、补丁等实际产物
+            ├── memory_error.md   # 可选：Memory/Distillation 失败记录
+            └── .complete         # 该 run 已完整提交的标记
+```
+
+生命周期通过 Hook 接入。`SESSION_START` 时，Memory 只注入一条 `kind="context"` 的导航消息，告诉
+Agent Memory 路径并附带简短 summary；需要具体经验时，由 Agent 使用普通 `read` 或 `bash` 工具
+按需读取文件，不会把全部历史自动塞进上下文。`SESSION_END` 时，`finish()` 从当前 State 生成
+task、transcript 和 artifacts，交给 distiller；distiller 决定是否保留该 run、生成 `summary.md`
+和索引行，并返回完整的新 `MEMORY.md` 做去重、合并和清理。宿主侧再做大小、结构和防误删检查，
+通过后原子写入；Memory 失败按 best-effort 处理，不会让主任务失败。
+
+**追问：Distiller 是怎么设计的？**
+
+Distiller 是 `FilesystemMemory` 在 `SESSION_END` 调用的一次无工具 LLM 任务，通常复用主 Agent 的
+Provider，但使用独立的 Memory system prompt。输入不是只有当前对话，还包括本次 `task`、有界的
+`transcript`、artifacts，以及已有的 `memory_summary.md`、`INDEX.md`、`MEMORY.md` 和可用
+namespace 列表，因此它能判断新证据应该归到哪里、是否与已有经验重复，以及哪些旧经验需要合并
+或淘汰。Transcript 和 Tool Result 在 Prompt 中被明确标记为证据数据，不能当作要执行的指令。
+
+输出被限制为一个固定 JSON：`retain_run` 决定本次运行是否值得保留，`memory_name` 选择 namespace，
+`summary_md` 是单次运行摘要，`index_row` 提供 Summary、Scope、Signals、Keywords 和 Artifacts，
+`memory_summary_md` 更新导航摘要，`memory_md` 则是完整的新 handbook，而不是增量 Patch。没有新的
+可复用经验时，允许返回 `retain_run=false`；本次 run 仍值得保留、但不需要改变 handbook 时，
+`memory_md` 返回空字符串即可。
+
+例如，这次运行发现“修改认证回调前必须先执行一个特定回归测试”，而且这条经验以后仍然有用，
+Distiller 可以返回：
+
+```json
+{
+  "retain_run": true,
+  "memory_name": "authentication",
+  "memory_summary_md": "v1\n\nAuthentication tasks: callback debugging, regression checks, and known failure modes.",
+  "summary_md": "## Task\n修复登录回调失败\n\n## Reusable Lessons\n修改回调前先运行 test_login_callback。",
+  "index_row": {
+    "summary": "定位并修复登录回调失败",
+    "scope": "authentication callback",
+    "signals": "redirect_uri mismatch",
+    "keywords": "login, callback, redirect_uri, test_login_callback",
+    "artifacts": "runs/run-42/artifacts/auth-fix.patch"
+  },
+  "memory_md": "# Memory Handbook\n\n## Authentication\n\n- 修改登录回调前先运行 `test_login_callback`；此前失败由 `redirect_uri mismatch` 引起。证据：runs/run-42/transcript.md ## 12。"
+}
+```
+
+这会把运行证据保存到 `authentication/runs/run-42/`，更新 `INDEX.md` 和导航摘要，并用返回的
+完整 `memory_md` 替换旧 `MEMORY.md`。如果运行值得留作证据，但没有新的长期经验，可以仍返回
+`retain_run=true`，同时令 `memory_md=""`，这样保存 Run 而不改 Handbook；如果连运行证据都没有
+复用价值，则返回 `retain_run=false`，本次不创建持久化 Run。
+
+职责上，模型只负责语义筛选、去重和重写，不直接写文件。宿主会解析 JSON、补齐索引字段，并拒绝
+过大、格式异常或会把既有经验全部清空的 handbook；模型调用失败时仍可保存本次原始证据和 fallback
+summary。这样把开放式的“什么值得记住”交给模型，把并发、完整性和灾难性输出保护留给确定性代码。
+
 ### 技术追问补充
 
 - Recall 工具没有 Memory 依赖，也不会调用 Memory API；它的结果通过普通 Tool Result Message
   进入当前 transcript。
 - `Memory.bind()` 在 SESSION_START 调用 `initial()` 注入上下文，在 SESSION_END 调用
   `finish()` 进行最佳努力持久化。
+- `FilesystemMemory` 按 `{root}/{memory_name}` 建 namespace，核心文件是 `MEMORY.md`、
+  `memory_summary.md`、`INDEX.md` 和 `runs/<run_id>/`；默认根目录是 `~/.simple/memory`。
+- `initial()` 不做语义检索，只注入 Memory 路径、namespace 概览或简短 summary；Agent 再通过普通
+  文件工具按需读取 handbook、索引和运行证据。
+- `finish()` 把 task、完整 transcript 和 artifacts 交给可选 distiller。模型负责返回是否保留、
+  namespace、运行摘要、索引行和完整 handbook rewrite；空 rewrite 表示保留旧 handbook。
+- `make_filesystem_distiller()` 构造一个 `tools=[]` 的单次 LLM Request；默认输出上限 32000 Token、
+  Timeout 600 秒，temperature 未显式指定时沿用 Provider 默认值。
+- `FilesystemMemoryPayload` 包含 task、有界 transcript、artifacts、现有 index/handbook/navigation
+  summary、run path、可用 namespace 和 `MemoryContext`；完整 transcript 仍单独落盘，送入 distiller
+  的版本会按预算保留头尾并截断中段。
+- `FilesystemDistillation` 输出 `retain_run`、`memory_name`、`memory_summary_md`、`summary_md`、
+  `index_row` 和 `memory_md`；Prompt 要求长期 lesson 引用 transcript section、artifact、路径、符号、
+  命令或错误字符串等可检索证据，并禁止保存 Secret、大段日志和临时任务状态。
+- 整个 read-distill-commit 在 Memory root 的跨进程锁内串行执行，文件通过临时文件替换原子写入；
+  过大、结构异常或会清空既有经验的 handbook rewrite 会被拒绝。
 - FilesystemMemory 当前从完整 State messages 生成 transcript，因此 Recall 正文会重复出现；
   扩展时应区分审计用完整 transcript 和送给 distiller 的过滤投影。
 - 过滤器可以通过 `ToolResultBlock.tool_name == "recall"` 和 sidecar 中按调用编号保存的
