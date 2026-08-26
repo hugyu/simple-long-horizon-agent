@@ -246,6 +246,14 @@ Runtime 会先按模型输出顺序为每个调用记录开始事件，再经过
   `core.run()` 统一产生。
 - 核心循环直接使用 `range(max_turns)`，因此预算一定生效；当前没有针对“重复调用同一工具”的
   专门检测器。
+- `ToolResult(terminate=True)` 只表示工具要求结束当前这段 `run()`，不表示任务已经成功。Runtime
+  仍会先把工具结果写入 State，并记录 `ToolExecutionEndEvent(terminate=True)` 和
+  `TurnEndEvent(terminated=True)`，然后以 `AgentEndEvent(reason="tool_terminate")` 退出，不再发起
+  下一次模型调用。
+- 当前 `run()` 不会因为 `tool_terminate` 自动恢复。调用者或 Goal Loop 需要读取工具结果的
+  `details`，再结合 `CompletionCheck` 或实际验证器判断是否完成；如果没有完成，可以在同一个 State
+  上追加 follow-up 并调用 `resume(state, followup, max_turns=...)`。之前的停止事件会保留，新的运行会
+  继续追加到同一份 State。
 - `max_turns` 只表示截断，不表示成功。调用者可以通过 `resume(state, followup)` 在原 State
   上增加预算继续，旧的停止事件仍保留。
 - Goal Loop 可以在外层加入 Token、墙钟时间和完成检查，但同样不会把预算耗尽标记为完成。
