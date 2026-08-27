@@ -333,11 +333,48 @@ Session 和 Toolset 负责在完整运行期间打开和关闭连接。
 拒绝调用，MCP Server 仍负责最终授权。但当前配置中的凭据直接绑定连接，也没有统一的资源级策略
 和审批状态。
 
-如果继续完善，我会让会话签发一份有时效的能力授权，明确允许的服务、工具、操作类型和资源范围；
-Runtime 在调用前使用同一份授权检查规范化后的参数。凭据由连接层保管并尽量使用最小权限，不能
-进入模型上下文。拒绝、审批和放行都记录事件，便于审计。即使本地策略配置错误，服务端仍必须再次
-校验，不能信任来自 Agent 的工具参数。
+如果继续完善，我会先定义一个本次 Run 专用的 `CapabilityGrant`，由 `AgentSession` 在组装时签发，
+例如：
 
+```json
+{
+  "grant_id": "grant-8f2",
+  "run_id": "run-42",
+  "agent": "release-agent",
+  "server": "github",
+  "tools": {
+    "list_issues": {"actions": ["read"], "repos": ["org/app"]},
+    "create_issue": {"actions": ["write"], "repos": ["org/app"], "approval": "required"}
+  },
+  "expires_at": "2026-08-27T12:00:00Z"
+}
+```
+
+具体链路是：Session 打开 MCP 连接并发现全部工具后，先用 Grant 过滤出 Agent 真正可见的工具，
+只把这份最小集合发给模型；每次 Tool Call 到达 `PRE_TOOL_USE` 时，Runtime 再把参数规范化成真实
+资源，例如把 repo、文件路径、租户和 URL 解析成 canonical resource，然后按同一份 Grant 做
+`allow / deny / require_approval` 判断。`deny` 直接生成错误 ToolResult；`require_approval` 则把
+Run 标为 `waiting_approval`，记录待审批请求并暂停执行，批准后只能恢复同一个 `operation_id`，
+且重新计算参数哈希，参数有任何变化都要重新审批。
+
+凭据不放进 Grant 的明文参数，也不让模型看到。Grant 只引用 `credential_ref`，连接层或 credential
+broker 在真正调用 MCP Server 时短暂取出最小权限凭据；Server 端仍用自己的租户、用户和资源 ACL
+再次校验，不能信任 Runtime 的 allow 结果。放行、拒绝、审批申请、批准/拒绝、实际调用和服务端
+结果都记录事件，并保存策略版本、资源摘要和参数哈希而不是 Secret。这样 Session 管工具可见性，
+Runtime 管逐调用决策和审批状态，连接层管凭据，MCP Server 才是最终资源安全边界。
+调用流程是：
+模型提出 Tool Call
+→ Runtime 根据 grant 找到 credential_ref
+→ Credential Broker / 连接层取出真实 Token
+→ 连接层把 Token 放入 MCP 请求的认证 Header
+→ MCP Server 用 Token 验证用户、租户和资源权限
+→ 返回结果给 Runtime
+→ 模型只看到脱敏后的 ToolResult
+创建 Session
+→ 校验 credential_ref 是否存在
+→ 校验它是否允许绑定 github Server
+→ 校验 Agent、工具、资源和操作范围
+→ 创建带有效期的 CapabilityGrant
 ### 追问问题与回答
 
 **追问：权限策略应该由 MCP Server、Client、Runtime 还是上层 Session 管理？**
@@ -353,13 +390,22 @@ Server 负责对真实资源做最终授权。四层职责不同，不能只依�
 - `PRE_TOOL_USE` Hook 可以根据 Agent、State 和 Tool Call 阻止调用，并生成模型可见错误结果。
 - 可以增加结构化能力授权，至少包含 Agent、服务、工具、允许操作、资源范围、运行环境、过期时间
   和是否需要审批；默认拒绝未明确授权的组合。
+- 授权对象还应绑定 `run_id`、`grant_id`、工具版本、`credential_ref`、数据分类和策略版本；令牌
+  只能在有效期内使用，不能由 Agent 自己扩大范围。
 - 授权检查必须基于规范化后的参数，例如把相对文件路径解析到工作区真实路径，再判断是否越过允许
   根目录，避免只按工具名授权。
-- 高风险调用在 `PRE_TOOL_USE` 阶段进入待审批状态；批准后还要绑定本次调用编号和参数摘要，防止
-  模型修改参数后复用旧批准。
+- 当前 `PRE_TOOL_USE` 只能返回 `block_reason`，没有 `waiting_approval` 状态；完整审批需要扩展
+  Runtime 状态机和 `resume()` 入口：申请时记录 `operation_id + canonical_args_hash`，恢复时重新
+  校验 Grant、有效期和哈希后才进入工具线程。
+- 高风险调用的审批记录至少包含操作编号、工具、规范化资源、参数摘要、申请者、审批者、策略版本、
+  有效期和一次性状态，防止模型修改参数后复用旧批准。
 - 服务凭据不应作为 Tool 参数或 Message 进入模型；连接层使用短期、最小权限凭据，并负责更新和
   吊销。
+- `MCPToolset` 可以保留“连接发现全部工具”的能力，但 `AgentSession` 应在构造 `Agent` 前生成
+  工具可见快照；执行端也要检查同一 Grant，不能只隐藏工具声明而保留后门调用。
 - Runtime 的拒绝是本地防线，不替代 MCP Server 对租户、用户和具体资源的最终校验。
+- 允许、拒绝、审批和实际执行应分别记录审计事件；事件中只保留 Secret-free 的资源摘要、策略版本
+  和参数哈希，便于追责和重放检查。
 - 当前没有统一的角色权限、用户审批、资源级策略或凭据代理；扩展可以复用 Session 组装、
   `PRE_TOOL_USE` 和 `HookFiredEvent`，新增授权对象、审批状态和审计事件。
 
