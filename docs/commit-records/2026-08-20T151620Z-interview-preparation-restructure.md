@@ -18,9 +18,9 @@ follow-up notes.
 - `docs/interview/question-checklist.md`: organize the current interview
   question set across runtime, adapters, context, tools, workflows,
   observability, evaluation, production design, and security.
-- `docs/interview/01-answers-agent-runtime.md` through
-  `docs/interview/09-answers-agent-security.md`: add code-grounded oral answers
-  and concise technical follow-up material.
+- `docs/interview/01-answers-agent-runtime.md` through the original security
+  answer guide: add code-grounded oral answers and concise technical follow-up
+  material.
 - `AGENTS.md`, `README.md`, `docs/README.md`, and `docs/design/README.md`: update
   documentation paths and remove stale interview-index references.
 - `interview/`: remove the superseded root-level interview documentation.

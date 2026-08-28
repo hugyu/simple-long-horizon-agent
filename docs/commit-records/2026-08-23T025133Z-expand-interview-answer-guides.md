@@ -22,9 +22,9 @@ follow-up questions, and implementation evidence.
 - `docs/interview/08-answers-production-agent-platform.md`: expand production
   platform, durability, scheduling, recovery, fencing, and idempotency answers
   without claiming those designs are implemented.
-- `docs/interview/09-answers-agent-security.md`: expand prompt injection, tool
-  capability, delegation, MCP, sandbox, secret, and trace security answers with
-  explicit current-project limitations.
+- Original security answer guide: expand prompt injection, tool capability,
+  delegation, MCP, sandbox, secret, and trace security answers with explicit
+  current-project limitations.
 
 ## Verification
 

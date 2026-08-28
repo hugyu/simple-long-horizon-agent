@@ -273,7 +273,7 @@
 
 ## 九、Agent 安全
 
-对应回答：[`09-answers-agent-security.md`](09-answers-agent-security.md)
+对应回答：已移除独立回答文档，保留题目清单用于后续整理。
 
 100. Prompt Injection 应该如何防御？
      - Tool Output、网页内容、文档和外部检索结果是否可信？

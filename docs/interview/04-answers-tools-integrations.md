@@ -220,6 +220,56 @@ Session 和 Toolset 负责在完整运行期间打开和关闭连接。
   关闭全部资源。
 - 核心 `core.run()` 不导入 MCP 模块，也不拥有 MCP 连接生命周期。
 
+#### MCP 连接生命周期
+
+当前设计是“一次 `AgentSession` 持有一条长期 MCP 连接”，不是每次 Tool Call 都重新连接。
+
+连接建立和工具发现的顺序是：
+
+```text
+进入 AgentSession
+    ↓
+MCPToolset.__enter__()
+    ↓
+MCPConnection.open()
+    ↓
+建立传输并完成 initialize 握手
+    ↓
+调用 list_tools()
+    ↓
+保存工具清单并包装成 AgentTool
+    ↓
+开始运行 Agent
+```
+
+连接成功后会立即获取工具。`list_tools()` 只在初始化阶段调用一次，结果保存在
+`MCPConnection.tools`；后续多个模型回合和多个 Tool Call 都复用同一条连接，不会为每次调用
+重新连接或重新发现工具。当前实现没有运行中的动态工具刷新。
+
+#### 正常关闭
+
+连接通常持续到 `AgentSession` 退出：
+
+```python
+with agent_session(..., mcp_servers=[config]) as session:
+    state, events = session.run(task)
+    for event in events:
+        pass
+# 退出 with 后关闭 MCP 连接
+```
+
+退出时，`AgentSession` 通过 `ExitStack` 调用 `MCPToolset.__exit__()`，再调用
+`MCPConnection.close()`，关闭 `ClientSession`、后台事件循环和传输资源。对于 stdio MCP Server，
+还会结束由连接启动的服务进程。调用方也可以显式执行 `connection.close()`。
+
+#### 连接失败和异常断开
+
+- **建立失败**：握手、`list_tools()` 或初始化超时会使 `open()` 清理已经启动的线程和传输资源，
+  然后抛出 `MCPError`。
+- **运行中断开**：服务进程退出或传输失效后，`is_connected` 变为 `False`；后续调用返回错误
+  `ToolResult` 并设置 `terminate=True`，避免继续调用失效服务。
+- **自动恢复**：当前实现不会自动重连；连接失效后的恢复由上层重新建立 Session 或连接处理。
+
 ## 42. MCP Server 如何发现和注册工具？
 
 ### 口述主回答
@@ -273,20 +323,19 @@ Session 和 Toolset 负责在完整运行期间打开和关闭连接。
 
 ### 口述主回答
 
-我会先按故障发生的位置和结果是否确定来分类。连接建立或工具发现失败，说明这个服务还没有成功
-注册，当前会话应清理已启动资源，并根据它是不是必需能力决定启动失败还是降级运行。执行期间，
-服务端明确返回的业务错误直接作为错误工具结果交给模型；单次超时或传输中断则要进一步判断连接
-状态，以及这次操作是否可能已经产生副作用。
+遇到 MCP Server 不可用、连接中断或工具执行失败，我会先区分连接阶段和调用阶段。连接阶段由
+`MCPConnection` 完成握手和工具发现；如果初始化或 `list_tools()` 失败，就在 `MCPToolset` 进入
+会话时直接报错，并由 `AgentSession` 清理已经打开的资源，避免把未完成注册的工具交给模型。
 
-当前代码已经做到：每次 MCP 调用都会形成 `ToolResult`；连接仍然存活时，普通错误和超时不会终止
-整个 Agent；连接死亡时会设置 `terminate=True`，避免继续调用失效服务。如果进一步完善，我会给
-每个服务维护连接状态和熔断状态：连续传输失败后暂停新调用，后台按退避策略重连并重新发现工具；
-恢复成功后再从下一轮模型请求开始重新暴露。
+调用阶段，服务端明确返回的 `isError=true` 属于业务错误，包装层把它转换成
+`ToolResult(is_error=True, terminate=False)` 返回模型，让模型根据错误信息修正参数或调整计划。
+调用超时或被取消时，客户端取消本地等待并返回错误结果，但不会把“没有收到响应”当成“远端一定
+没有执行”。工具捕获异常后会检查连接状态：连接仍然存活时，错误结果不会终止整个 Run；连接已经
+死亡时，结果设置 `terminate=True`，停止继续调用这个失效服务。
 
-重试不能只看错误类型，还要看调用语义。只读或带幂等键的调用可以在重连后有限重试；已经发出但
-结果未知的写操作不能直接重放，要先查询外部状态或进入人工确认。备用服务也应由会话或 Workflow
-按“能力”预先配置，并确认参数和结果语义兼容，不能让 Runtime 看到连接失败就随意换一个同名工具。
-无论最终选择重试、降级还是停止，每个原始 Tool Call 都必须得到明确结果，保持工具协议完整。
+Runtime 不会因为连接失败就静默替换成另一个同名工具；备用能力必须在 Session 或 Workflow 组装
+时明确注册，并保持参数、结果和错误语义一致。这样既保证模型能看到可修正的工具错误，也避免在
+连接失效或写操作结果未知时产生重复副作用，同时每个 Tool Call 都能得到明确的 `ToolResult`。
 
 ### 追问问题与回答
 
@@ -324,107 +373,161 @@ Session 和 Toolset 负责在完整运行期间打开和关闭连接。
 
 ### 口述主回答
 
-我会把权限控制分成三道关。第一道在会话组装时，只给 Agent 暴露当前任务允许使用的服务和工具；
-第二道在每次执行前，根据 Agent 身份、工具参数、目标资源和运行环境重新授权，高风险写操作还要
-经过用户审批；第三道由 MCP Server 使用真实身份凭据校验资源权限。前两道控制 Agent 能请求什么，
-最后一道才是真正的数据安全边界。
+我会把 MCP 的访问分成四层：服务端发现、Agent 可见、Runtime 执行和资源授权。`MCPConnection`
+连接服务后通过 `list_tools()` 获取工具；`MCPToolset` 把发现到的工具包装成 `AgentTool`；
+`AgentSession` 再把显式配置的 Toolset 和本地工具一起注册给 Agent。因此按默认路径，连接一个
+MCP Server 后，模型会看到这个服务发现到的工具，工具名前缀用于避免不同服务之间的名称冲突。
 
-当前项目已经具备部分基础：`AgentSession` 决定绑定哪些工具，`PRE_TOOL_USE` Hook 可以在执行前
-拒绝调用，MCP Server 仍负责最终授权。但当前配置中的凭据直接绑定连接，也没有统一的资源级策略
-和审批状态。
+权限管理的入口在 Session 的工具组装，而不是让模型自己决定。Session 根据 Agent、任务和环境确定
+可见工具集合，这份集合同时用于生成模型的工具声明和 Runtime 的分发表，避免工具虽然对模型隐藏，
+却仍然可以被后台调用。进入执行阶段后，`PRE_TOOL_USE` 再根据 Agent、工具名、参数和目标资源做
+一次检查，拒绝就返回错误 `ToolResult`。Runtime 的允许也不等于最终拥有资源权限，MCP Server 仍然
+使用真实凭据校验用户、租户和具体资源。不同 Agent 按任务隔离 Session、凭据和工作区，不能因为
+共享一个连接就共享全部能力。这样 Session 管工具可见性，Hook 和 Runtime 管逐调用授权，MCP Server
+管最终资源权限。
 
-如果继续完善，我会先定义一个本次 Run 专用的 `CapabilityGrant`，由 `AgentSession` 在组装时签发，
-例如：
+我会按这几个依据筛选：
+1. Agent 角色或 Workflow 节点：例如代码审查节点只声明 read、search，发布节点才声明 deploy。
+2. 任务类型：把用户任务先归类为需要读取、修改、查询外部系统还是发布等能力，再映射到对应工具。
+3. 运行环境和授权：开发环境可以使用测试工具，生产环境还要叠加用户权限、审批状态和资源范围。
+4. 工具清单和参数 Schema：从 MCP 的 list_tools() 得到候选工具，再按名称、参数能力和风险标签过滤。
 
-```json
-{
-  "grant_id": "grant-8f2",
-  "run_id": "run-42",
-  "agent": "release-agent",
-  "server": "github",
-  "tools": {
-    "list_issues": {"actions": ["read"], "repos": ["org/app"]},
-    "create_issue": {"actions": ["write"], "repos": ["org/app"], "approval": "required"}
-  },
-  "expires_at": "2026-08-27T12:00:00Z"
-}
-```
-
-具体链路是：Session 打开 MCP 连接并发现全部工具后，先用 Grant 过滤出 Agent 真正可见的工具，
-只把这份最小集合发给模型；每次 Tool Call 到达 `PRE_TOOL_USE` 时，Runtime 再把参数规范化成真实
-资源，例如把 repo、文件路径、租户和 URL 解析成 canonical resource，然后按同一份 Grant 做
-`allow / deny / require_approval` 判断。`deny` 直接生成错误 ToolResult；`require_approval` 则把
-Run 标为 `waiting_approval`，记录待审批请求并暂停执行，批准后只能恢复同一个 `operation_id`，
-且重新计算参数哈希，参数有任何变化都要重新审批。
-
-凭据不放进 Grant 的明文参数，也不让模型看到。Grant 只引用 `credential_ref`，连接层或 credential
-broker 在真正调用 MCP Server 时短暂取出最小权限凭据；Server 端仍用自己的租户、用户和资源 ACL
-再次校验，不能信任 Runtime 的 allow 结果。放行、拒绝、审批申请、批准/拒绝、实际调用和服务端
-结果都记录事件，并保存策略版本、资源摘要和参数哈希而不是 Secret。这样 Session 管工具可见性，
-Runtime 管逐调用决策和审批状态，连接层管凭据，MCP Server 才是最终资源安全边界。
-调用流程是：
-模型提出 Tool Call
-→ Runtime 根据 grant 找到 credential_ref
-→ Credential Broker / 连接层取出真实 Token
-→ 连接层把 Token 放入 MCP 请求的认证 Header
-→ MCP Server 用 Token 验证用户、租户和资源权限
-→ 返回结果给 Runtime
-→ 模型只看到脱敏后的 ToolResult
-创建 Session
-→ 校验 credential_ref 是否存在
-→ 校验它是否允许绑定 github Server
-→ 校验 Agent、工具、资源和操作范围
-→ 创建带有效期的 CapabilityGrant
 ### 追问问题与回答
 
 **追问：权限策略应该由 MCP Server、Client、Runtime 还是上层 Session 管理？**
 
-会话负责签发本次任务的最小权限，连接层负责安全持有凭据，Runtime 负责逐调用检查和审批，MCP
-Server 负责对真实资源做最终授权。四层职责不同，不能只依赖其中一层。
+会话负责确定本次 Run 的最小权限，Runtime 负责逐调用检查，连接层负责安全传递凭据，MCP Server
+负责对真实资源做最终授权。四层职责不同，不能只依赖其中一层。
 
 ### 技术追问补充
 
-- `MCPServerConfig` 只保存 stdio 进程参数或 HTTP URL/headers、初始化超时和调用超时，不实现业务
-  授权决策。
-- `AgentSession` 只收集调用者明确传入的 Toolset 和静态工具，因此工具暴露范围属于组装边界。
-- `PRE_TOOL_USE` Hook 可以根据 Agent、State 和 Tool Call 阻止调用，并生成模型可见错误结果。
-- 可以增加结构化能力授权，至少包含 Agent、服务、工具、允许操作、资源范围、运行环境、过期时间
-  和是否需要审批；默认拒绝未明确授权的组合。
-- 授权对象还应绑定 `run_id`、`grant_id`、工具版本、`credential_ref`、数据分类和策略版本；令牌
-  只能在有效期内使用，不能由 Agent 自己扩大范围。
-- 授权检查必须基于规范化后的参数，例如把相对文件路径解析到工作区真实路径，再判断是否越过允许
-  根目录，避免只按工具名授权。
-- 当前 `PRE_TOOL_USE` 只能返回 `block_reason`，没有 `waiting_approval` 状态；完整审批需要扩展
-  Runtime 状态机和 `resume()` 入口：申请时记录 `operation_id + canonical_args_hash`，恢复时重新
-  校验 Grant、有效期和哈希后才进入工具线程。
-- 高风险调用的审批记录至少包含操作编号、工具、规范化资源、参数摘要、申请者、审批者、策略版本、
-  有效期和一次性状态，防止模型修改参数后复用旧批准。
-- 服务凭据不应作为 Tool 参数或 Message 进入模型；连接层使用短期、最小权限凭据，并负责更新和
-  吊销。
-- `MCPToolset` 可以保留“连接发现全部工具”的能力，但 `AgentSession` 应在构造 `Agent` 前生成
-  工具可见快照；执行端也要检查同一 Grant，不能只隐藏工具声明而保留后门调用。
-- Runtime 的拒绝是本地防线，不替代 MCP Server 对租户、用户和具体资源的最终校验。
-- 允许、拒绝、审批和实际执行应分别记录审计事件；事件中只保留 Secret-free 的资源摘要、策略版本
-  和参数哈希，便于追责和重放检查。
-- 当前没有统一的角色权限、用户审批、资源级策略或凭据代理；扩展可以复用 Session 组装、
-  `PRE_TOOL_USE` 和 `HookFiredEvent`，新增授权对象、审批状态和审计事件。
+#### 设计示例：发布 GitHub Release
+
+假设 Agent 的任务是“把 `org/app` 仓库发布为 `v1.2.0`”，一次调用会经过四层控制：
+
+1. **Session / Workflow 决定本次 Run 的能力范围**
+
+   创建 Agent 时，根据任务类型配置允许使用的工具，例如 `get_release` 和 `create_release`；
+   资源范围限定为 `org/app`，`create_release` 需要审批。模型只会收到经过筛选的工具声明。
+
+2. **Runtime 检查每一次具体调用**
+
+   模型提出调用：
+
+   ```json
+   {
+     "name": "github_create_release",
+     "arguments": {
+       "repo": "org/app",
+       "tag": "v1.2.0"
+     }
+   }
+   ```
+
+   Runtime 在执行前检查工具名、仓库、Tag 和审批状态。如果模型把仓库改成 `org/other-app`，
+   Runtime 直接拒绝，并返回错误 `ToolResult`。
+
+3. **MCP Client / 连接层负责携带凭据**
+
+   连接层取得本次会话的短期 Token，并把它放进 MCP HTTP 请求的认证 Header。它负责连接和传输，
+   不根据工具名称推断 Agent 是否有业务权限。
+
+4. **MCP Server 对真实资源做最终授权**
+
+   GitHub MCP Server 收到请求后，根据 Token 对应的身份、组织、仓库和操作权限再次校验。即使
+   Runtime 判断允许，如果 Token 没有 `org/app` 的发布权限，Server 仍然拒绝请求。
+
+完整链路是：
+
+```text
+Session / Workflow
+  决定本次 Run 能使用哪些能力
+        ↓
+Runtime
+  检查每一次具体调用和参数
+        ↓
+MCP Client / 连接层
+  携带凭据发送 MCP 请求
+        ↓
+MCP Server
+  对真实资源执行最终 ACL 校验
+```
+
+“模型不能签发或扩大自己的权限”是指：模型可以提出调用，但不能通过修改参数、伪造工具名，
+或在提示词中声明“已经获得批准”，获得原本没有的仓库、文件或发布权限。
+
+#### Token 的获取
+
+Session 不把用户名和密码交给 Agent，而是传递一个凭据引用，例如 `github-release-bot`。连接层
+或 Credential Broker 根据这个引用，向 OAuth 服务申请短期 access token。具体方式取决于部署场景：
+
+| 场景 | 获取方式 |
+| --- | --- |
+| 用户授权 | Authorization Code + PKCE |
+| 后台服务 | Client Credentials |
+| 云环境 | Workload Identity 或服务账号换取 Token |
+
+Token 通常包含签发方、受众、主体、权限范围和过期时间：
+
+```text
+iss   = https://auth.example.com
+aud   = github-mcp
+sub   = release-bot
+scope = repo:read repo:release
+exp   = 过期时间
+```
+
+#### Token 如何进入 MCP 请求
+
+连接层取得 Token 后，在 HTTP 请求中加入：
+
+```http
+Authorization: Bearer eyJ...
+```
+
+同一个 HTTP 客户端负责发送 `initialize`、`list_tools` 和 `tools/call` 请求。Token 不能进入模型的
+Tool 参数、Prompt 或普通消息。
+
+#### MCP Server 如何校验
+
+Server 收到请求后，先验证 Token 本身：
+
+- 签名是否正确，或通过 introspection 确认 Token 有效；
+- `iss` 是否为信任的签发方；
+- `aud` 是否确实面向当前 MCP Server；
+- `exp` 是否尚未过期；
+- `scope` 是否包含当前操作所需的权限。
+
+以 `create_release` 为例，Server 还要结合请求参数做资源级校验：
+
+```text
+用户身份：release-bot
+操作：    create_release
+仓库：    org/app
+所需范围：repo:release
+```
+
+最后再通过仓库 ACL 判断 `release-bot` 是否真的可以在 `org/app` 创建 Release。Token 校验通过，
+不代表它自动拥有所有仓库和所有操作的权限。
 
 ## 45. Agent 可以访问已连接 MCP Server 的全部工具吗？
 
 ### 口述主回答
 
-按当前默认实现，可以。`MCPToolset` 会把连接时发现的全部工具包装后交给 `AgentSession`，因此
-只要连接了这个服务，模型默认就能看到它的全部工具。执行前 Hook 虽然可以拒绝调用，但不能消除
-模型看到无权使用工具所带来的误导和攻击面。
+默认情况下，Agent 可以看到已连接 MCP Server 暴露的全部工具，但“模型能看到”不等于“调用一定
+会被允许”。
 
-更合理的设计是把“服务端发现结果”和“Agent 可见工具集”分开。服务连接可以发现全部工具，但
-会话根据 Agent 身份、任务类型、运行环境和能力授权生成一份最小工具快照，只把允许的工具声明
-发送给模型。例如代码审查 Agent 只能看到读取和搜索工具，发布 Agent 才能看到部署工具，并且只在
-生产审批通过后可调用。
+`MCPConnection` 建立连接后通过 `list_tools()` 获取工具清单，`MCPToolset` 会把这些工具包装成
+`AgentTool`，再由 `AgentSession` 和本地工具一起注册给 Agent，所以默认模型看到的是该服务的完整
+工具集合，名称通过服务名前缀隔离。
 
-隐藏工具和执行授权必须使用同一份策略：未授权工具既不出现在下一次模型请求中，即使模型伪造
-工具名，Runtime 也会在执行前拒绝。不同 Agent 还应使用独立会话、凭据和工作区，避免通过共享连接
-间接扩大权限。
+权限控制不能只依赖执行前 Hook。Hook 可以在 `PRE_TOOL_USE` 阶段根据 Agent、任务、环境和调用参数
+拒绝执行，但这时模型已经看到了工具声明。更严格的做法是在 Session 组装工具时，就从服务端发现
+快照中过滤出最小可见集合，并用同一份集合构造模型声明和 Runtime 分发表；这样未授权工具既不会
+暴露给模型，即使模型伪造调用，也会在执行前被拒绝。
+
+不同 Agent 应使用独立的 Session、工具快照和授权上下文；MCP 连接、凭据和工作区也按任务边界隔离，
+不能因为共享一个 Server 连接，就默认共享全部能力。
 
 ### 追问问题与回答
 
@@ -432,24 +535,6 @@ Server 负责对真实资源做最终授权。四层职责不同，不能只依�
 
 先根据 Agent、任务和环境从服务端工具快照中过滤出最小可见集合，再用同一授权策略在执行前复查
 工具名和资源参数。不同权限范围使用独立会话和凭据。
-
-### 技术追问补充
-
-- `MCPConnection.agent_tools()` 和 `MCPToolset.tools()` 默认调用 `make_mcp_tools()`，包装连接时
-  发现的全部工具。
-- 当前 `MCPToolset` 没有 allowlist/denylist 参数，也不会按任务动态重新执行 `list_tools()`。
-- 可以为 `MCPToolset` 增加工具选择函数，在连接发现完成后、包装成 `AgentTool` 前，根据当前能力
-  授权筛选原始工具；筛选结果形成不可变的会话工具快照。
-- 过滤条件至少可以读取 Agent、任务类别、部署环境、服务名、工具名和工具风险标签；资源范围仍需
-  在调用参数确定后由执行前策略检查。
-- 工具快照既用于构造下一次模型请求中的工具声明，也用于 Runtime 的分发表；不能只隐藏模型声明，
-  却把未授权工具保留在可执行字典中。
-- 权限变化时生成新快照并只对下一次模型请求生效；已经发出的调用仍按原快照和执行前授权处理，
-  防止一个 Turn 中途出现工具集合不一致。
-- 对多个 Agent，应分别建立 `AgentSession`，使用不同的工具快照、连接凭据和工作区；共享底层连接
-  时也必须保留独立的授权上下文。
-- 当前 Hook 只能在调用时阻止，不能从已发送给模型的工具声明中隐藏工具；因此最小权限应先在会话
-  组装时完成，再由 `PRE_TOOL_USE` 做第二次校验。
 
 ## 45A. Skills 是渐进式加载的吗？如何注入和管理？
 
@@ -495,35 +580,125 @@ Repo、User、Bundled 的覆盖优先级。可以通过指定 Roots 或 Skills �
 
 ### 技术追问补充
 
-- `default_skill_roots()` 始终加入包内 Bundled Library，并从当前目录向上扫描
-  `.agents/skills` 和 `.simple_long_horizon_agent/skills`，直到 Git Root；最后加入 Home 下的
-  同名目录。
-- `discover_skills()` 使用 `realpath` 对相同文件去重，再按
-  `repo > user > bundled` 处理同名 Skill，最终按名称排序，保证菜单稳定。
-- 发现实现会打开整个 `SKILL.md` 解析 Frontmatter，但只保存名称、描述、绝对路径、Base Directory
-  和 Scope，不把正文常驻内存或注入 Context。因此它是上下文渐进加载，不是严格的文件 I/O 懒读。
-- 缺少 `description` 的 Skill 会被跳过；描述最长保留 1024 个字符。默认扫描深度上限为 6，
-  Skill 目录被视为叶子目录，不继续把其中的 `references/` 或 `scripts/` 误识别成独立 Skill。
-- `init_state_with_skills()` 先解析 `/skill-name` 与 `/no-skills`，再记录菜单和
-  Mention/Preload 命中的正文，最后写入 Task Message。正文以 `<skill>` Context Message 注入，
-  菜单以 System-kind Runtime Message 注入。
-- `skill_body_messages()` 注入正文时只枚举最多 50 个、最多两层深度的附带文件路径，不读取这些
-  文件内容；后续内容加载仍通过普通 Read Tool，脚本执行通过 Bash Tool。
-- `SkillConfig.skills` 可以直接传入预发现或过滤后的列表，并优先于 Roots；这就是当前按 Agent
-  限定 Skill 集合的方式，没有独立的 per-agent Skill 目录。
-- `make_skill_agent()` 和 `AgentSession(skills=...)` 通过 `Agent.init_state` 接入 Skills；启用
-  Skills 会同时提供 Read Tool，因为模型需要读取 `SKILL.md` 和附带资源。
-- 默认初始化路径每次 Run 都会重新发现文件；显式传入固定的 `SkillMetadata` 列表时则复用该列表。
-  当前没有文件 Watcher、注册表版本、Skill 锁文件或运行中的原子热切换。
-- `/no-skills` 在创建初始 State 前生效，`SkillConfig(enabled=False)` 在构建 Agent 时不安装
-  Skills 初始化器；二者都是运行前禁用，不是对已注入 Skill 的卸载。
-- Skill 不持有连接、线程或子进程等生命周期资源，因此卸载不涉及资源关闭。需要处理的是后续可见
-  Skill 集合和 Active Context，而不是像 MCP Toolset 一样调用 `close()`。
-- 若增加运行中卸载，应记录一个显式的 Skill 禁用状态或事件；下一次模型请求重新生成菜单，并让
-  Context View 排除对应的菜单和正文消息。原始 Event 和 Message 仍保留，避免为了卸载破坏审计
-  历史。
-- `bash_skills` 会在构建 Agent 时把菜单写入 System Prompt；这条路径若要卸载，当前只能重新构建
-  不包含该 Skill 的 Agent，不能在原 System Prompt 上原地撤回。
+目前代码实现了 Repo、User、Bundled 三层 Skill 的发现、去重和覆盖。
+
+#### 1. 扫描哪些目录
+
+`default_skill_roots(cwd)` 会生成三类扫描根目录：
+
+- **Bundled**：包内固定的 `skills/library` 目录。
+- **Repo**：从当前 `cwd` 开始向父目录逐级查找，直到 Git 根目录；每一级检查：
+  - `.agents/skills`
+  - `.simple_long_horizon_agent/skills`
+- **User**：当前操作系统用户主目录下的：
+  - `~/.agents/skills`
+  - `~/.simple_long_horizon_agent/skills`
+
+这里的 `~` 表示当前用户的 Home Directory，不是项目目录。在本机上当前用户是 `hgy`，所以：
+
+```text
+~                                   = /Users/hgy
+~/.agents/skills                    = /Users/hgy/.agents/skills
+~/.simple_long_horizon_agent/skills = /Users/hgy/.simple_long_horizon_agent/skills
+```
+
+项目目录则是另一层路径，例如：
+
+```text
+项目目录：     /Users/hgy/Desktop/simple-long-horizon-agent
+项目级 Skill： /Users/hgy/Desktop/simple-long-horizon-agent/.agents/skills
+用户级 Skill： /Users/hgy/.agents/skills
+```
+
+换一台机器或换一个操作系统用户，`~` 会自动解析成对应用户自己的 Home Directory；代码通过
+`os.path.expanduser("~")` 获取它，不会把 `/Users/hgy` 写死。
+
+#### 2. 如何发现 Skill
+
+每个扫描根目录会递归查找 `SKILL.md`。发现时解析文件 frontmatter 中的 `name` 和 `description`：
+
+```yaml
+---
+name: pdf
+description: Read and generate PDF files
+---
+```
+
+随后构造 `SkillMetadata`，保存：
+
+- `name`
+- `description`
+- `path_to_skill_md`
+- `base_dir`
+- `scope`
+
+`SkillMetadata` 保存的是元数据和文件路径，不保存完整正文；正文需要通过 `read_body()` 读取。
+
+#### 3. 同名 Skill 如何覆盖
+
+代码使用 `SCOPE_RANK` 定义优先级：
+
+```text
+repo    = 0
+user    = 1
+bundled = 2
+```
+
+因此同名 Skill 的覆盖顺序是：
+
+```text
+Repo > User > Bundled
+```
+
+例如三层都存在名为 `pdf` 的 Skill，最终只保留 Repo 版本。这个选择由 scope 优先级决定，
+不依赖扫描目录的先后顺序。
+
+#### 4. 如何去重和排序
+
+代码先用 `realpath` 对同一个实际文件去重，避免符号链接造成重复发现；同名文件再按 scope 优先级
+选择版本。最终结果按 Skill 名称排序，保证注入模型的菜单顺序稳定。
+
+#### 5. 正文和附属资源何时加载
+
+任务开始时，`init_state_with_skills()` 会：
+
+1. 发现 Skill 并生成包含名称、描述和路径的菜单。
+2. 对用户在任务中显式提到的 Skill，或配置在 `preload` 中的 Skill，提前读取 `SKILL.md`。
+3. 对其他 Skill 保留菜单信息，模型需要时再通过 Read Tool 读取正文。
+4. 对脚本、模板和 `references` 只生成浅层文件清单，具体内容按任务需要再读取。
+
+#### 6. 不同 Agent 如何限制 Skill 范围
+
+`init_state_with_skills()` 和 `run_with_skills()` 支持直接传入筛选后的 `skills` 列表：
+
+```python
+run_with_skills(
+    agent,
+    task,
+    skills=[pdf_skill, git_skill],
+)
+```
+
+传入 `skills` 后，运行时优先使用这份列表，不再按默认目录重新发现。这样不同 Agent 可以使用
+不同的 Skill 集合。
+
+当前实现可以概括为：
+
+```text
+扫描 Repo / User / Bundled 目录
+        ↓
+读取 SKILL.md 元数据
+        ↓
+按真实路径去重
+        ↓
+按 Repo > User > Bundled 解决同名冲突
+        ↓
+按名称排序生成 Skill 菜单
+        ↓
+显式提及或 preload 的 Skill 加载正文
+        ↓
+其他 Skill 由模型按需通过 Read Tool 读取
+```
 
 ## 核对依据
 

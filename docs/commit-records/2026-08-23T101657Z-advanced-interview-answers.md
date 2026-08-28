@@ -23,9 +23,8 @@ keep implementation facts separate from proposed production mechanisms.
 - `docs/interview/08-answers-production-agent-platform.md`: refine durable
   execution, scheduling, tool separation, fault tolerance, checkpointing,
   concurrent recovery, and external-side-effect designs.
-- `docs/interview/09-answers-agent-security.md`: strengthen prompt injection,
-  capability, delegation, MCP trust, sandbox, credential, and trace-data
-  security answers.
+- Original security answer guide: strengthen prompt injection, capability,
+  delegation, MCP trust, sandbox, credential, and trace-data security answers.
 - `docs/interview/question-checklist.md`: add the workflow overview question
   without renumbering the existing global checklist.
 
