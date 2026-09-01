@@ -363,23 +363,6 @@ Next 和 Tried & rejected 整理，并要求路径、符号、命令、错误、
 现有保障是保留原始 History、记录压缩证据并支持 Recall；如果扩展，我会要求摘要 claim 携带来源
 索引，先验证精确标识和证据锚点，再决定是否接受摘要。
 
-**追问：什么时候应该触发 Recall？**
-
-不是每次生成 Summary 后都自动 Recall。当前由主 Agent 在下一步依赖精确原文、但 Summary 没有
-提供足够证据时主动调用，例如需要核对文件路径、命令、错误、数值、测试结果或先前决策，发现
-摘要与当前信息冲突，或者准备基于不确定事实执行高风险操作。Runtime 不会自动判断模型缺了什么；
-而且当前 Summary 还不会自动附上被压缩的 Message 索引，因此模型还需要已有索引线索才能调用，
-把压缩索引确定性地写进 Summary 是后续需要补齐的链路。
-
-**追问：Recall 具体怎么做？调用时提供什么，返回什么？**
-
-项目把 Recall 实现成绑定当前 `State` 的只读工具。主 Agent 调用时提供要恢复的 0-based Message
-索引数组，例如 `recall(indices=[12, 13])`；工具校验索引后直接从完整的 `State.messages` 读取
-原消息，不做关键词匹配、Embedding 或外部存储查询。返回结果会标明每条消息的索引、role、sender、
-target、kind，并恢复正文以及其中的 Tool Call、Tool Result 和错误状态，再作为普通 ToolResult
-进入下一轮上下文。为了避免一次 Recall 抵消压缩效果，返回的索引数、单条字符数和总字符数都有
-上限。
-
 ### 技术追问补充
 
 - `SummarizeStrategy` 先确定 `compress_indices`，把这些索引对应的原始 Message 加上一条摘要指令
@@ -575,79 +558,6 @@ handbook；如果 Agent 基于它形成了一条满足上述条件的可复用�
 
 Recall 只读原始 Message；召回结果写入当前 State 供本轮推理；SESSION_END 的 Memory 把它作为
 候选证据，先按来源去重，再决定是否有新的、可复用且有证据支持的内容需要持久化。
-
-**追问：当前 Memory 是怎么实现的？**
-
-当前实现是 `FilesystemMemory`，不是向量数据库或每轮自动 RAG。每个 Memory namespace 是一个
-Markdown 目录：`MEMORY.md` 保存经过整理的长期 handbook，`memory_summary.md` 用于启动时导航，
-`INDEX.md` 索引各次运行，`runs/<run_id>/` 保存本次任务、完整 transcript、运行摘要和 artifacts。
-
-```text
-~/.simple/memory/                 # 默认 Memory root
-└── <memory_name>/                # 一个任务域或项目的 namespace
-    ├── memory_summary.md         # 启动时使用的简短导航摘要
-    ├── MEMORY.md                 # 跨运行复用的长期经验 handbook
-    ├── INDEX.md                  # 各次运行摘要与证据路径的索引
-    └── runs/
-        └── <run_id>/             # 一次运行的原始证据目录
-            ├── task.md           # 本次任务
-            ├── transcript.md     # 完整 Message transcript
-            ├── summary.md        # 本次运行的压缩证据摘要
-            ├── artifacts.md      # artifacts 清单
-            ├── artifacts/        # 报告、补丁等实际产物
-            ├── memory_error.md   # 可选：Memory/Distillation 失败记录
-            └── .complete         # 该 run 已完整提交的标记
-```
-
-生命周期通过 Hook 接入。`SESSION_START` 时，Memory 只注入一条 `kind="context"` 的导航消息，告诉
-Agent Memory 路径并附带简短 summary；需要具体经验时，由 Agent 使用普通 `read` 或 `bash` 工具
-按需读取文件，不会把全部历史自动塞进上下文。`SESSION_END` 时，`finish()` 从当前 State 生成
-task、transcript 和 artifacts，交给 distiller；distiller 决定是否保留该 run、生成 `summary.md`
-和索引行，并返回完整的新 `MEMORY.md` 做去重、合并和清理。宿主侧再做大小、结构和防误删检查，
-通过后原子写入；Memory 失败按 best-effort 处理，不会让主任务失败。
-
-**追问：Distiller 是怎么设计的？**
-
-Distiller 是 `FilesystemMemory` 在 `SESSION_END` 调用的一次无工具 LLM 任务，通常复用主 Agent 的
-Provider，但使用独立的 Memory system prompt。输入不是只有当前对话，还包括本次 `task`、有界的
-`transcript`、artifacts，以及已有的 `memory_summary.md`、`INDEX.md`、`MEMORY.md` 和可用
-namespace 列表，因此它能判断新证据应该归到哪里、是否与已有经验重复，以及哪些旧经验需要合并
-或淘汰。Transcript 和 Tool Result 在 Prompt 中被明确标记为证据数据，不能当作要执行的指令。
-
-输出被限制为一个固定 JSON：`retain_run` 决定本次运行是否值得保留，`memory_name` 选择 namespace，
-`summary_md` 是单次运行摘要，`index_row` 提供 Summary、Scope、Signals、Keywords 和 Artifacts，
-`memory_summary_md` 更新导航摘要，`memory_md` 则是完整的新 handbook，而不是增量 Patch。没有新的
-可复用经验时，允许返回 `retain_run=false`；本次 run 仍值得保留、但不需要改变 handbook 时，
-`memory_md` 返回空字符串即可。
-
-例如，这次运行发现“修改认证回调前必须先执行一个特定回归测试”，而且这条经验以后仍然有用，
-Distiller 可以返回：
-
-```json
-{
-  "retain_run": true,
-  "memory_name": "authentication",
-  "memory_summary_md": "v1\n\nAuthentication tasks: callback debugging, regression checks, and known failure modes.",
-  "summary_md": "## Task\n修复登录回调失败\n\n## Reusable Lessons\n修改回调前先运行 test_login_callback。",
-  "index_row": {
-    "summary": "定位并修复登录回调失败",
-    "scope": "authentication callback",
-    "signals": "redirect_uri mismatch",
-    "keywords": "login, callback, redirect_uri, test_login_callback",
-    "artifacts": "runs/run-42/artifacts/auth-fix.patch"
-  },
-  "memory_md": "# Memory Handbook\n\n## Authentication\n\n- 修改登录回调前先运行 `test_login_callback`；此前失败由 `redirect_uri mismatch` 引起。证据：runs/run-42/transcript.md ## 12。"
-}
-```
-
-这会把运行证据保存到 `authentication/runs/run-42/`，更新 `INDEX.md` 和导航摘要，并用返回的
-完整 `memory_md` 替换旧 `MEMORY.md`。如果运行值得留作证据，但没有新的长期经验，可以仍返回
-`retain_run=true`，同时令 `memory_md=""`，这样保存 Run 而不改 Handbook；如果连运行证据都没有
-复用价值，则返回 `retain_run=false`，本次不创建持久化 Run。
-
-职责上，模型只负责语义筛选、去重和重写，不直接写文件。宿主会解析 JSON、补齐索引字段，并拒绝
-过大、格式异常或会把既有经验全部清空的 handbook；模型调用失败时仍可保存本次原始证据和 fallback
-summary。这样把开放式的“什么值得记住”交给模型，把并发、完整性和灾难性输出保护留给确定性代码。
 
 ### 技术追问补充
 

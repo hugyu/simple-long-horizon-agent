@@ -556,6 +556,37 @@ Generator。只有检查缺失、失败原因需要语义判断，或者任务�
 - Critic 与 Generator 使用相同模型时错误相关性可能较高；更换模型、增加证据或使用确定性检查是否
   能改善结果，需要分别做对照，不能默认“多一个模型调用”就更可靠。
 
+## 60. 如何判断一个 Agent 任务真的完成了？
+
+### 口述主回答
+
+我会区分三层：模型输出 `final`，只代表它声明当前回答结束；Runtime 停止，只说明循环因为终止工具、
+预算或 abort 结束；任务客观完成，则需要测试、命令或其他外部检查通过。
+
+项目用 Goal Loop 把完成判断放在内层 Agent Loop 之外。每次运行结束后，完成检查读取当前 State 和环境；
+检查未通过就继续同一会话，直到验证成功、阻塞、预算耗尽或被中止。
+
+### 追问问题与回答
+
+**追问：为什么不能只依赖模型输出 `Done`？**
+
+模型可能遗漏要求、误判工具结果，或者没有真正执行验证，所以 `Done` 只能算声明，不能算完成证据。
+
+**追问：Agent 声明完成、Runtime 停止和任务客观完成有什么区别？**
+
+Agent 声明是模型判断；Runtime 停止是控制流状态；客观完成是外部检查确认目标已经满足。
+
+### 技术追问补充
+
+- 核心 Runtime 收到当前 Agent 的 `kind="final"` 后记录 `AgentEndEvent(reason="done")`，只结束当前
+  内层运行。
+- Goal 模式可由 Agent 调用 `update_goal` 声明 `complete` 或 `blocked`；`model_declared_check()`
+  从工具结果的 `details` 中读取该声明。
+- `run_goal_loop()` 在每段 `run/resume` 后调用独立 `CompletionCheck`；未通过时在同一 State 上追加
+  继续任务。
+- Goal 终态包括 `complete`、`blocked`、`budget_exhausted` 和 `aborted`；相同 blocker 连续三次才
+  进入 `blocked`。
+
 ## 61. 什么是外部验证信号？
 
 ### 口述主回答
@@ -587,6 +618,37 @@ Generator。只有检查缺失、失败原因需要语义判断，或者任务�
   相同原因，未完成则检查预算后 resume。
 - 回合与输出 Token 耗尽返回 budget_exhausted，墙钟截止和调用者 abort 返回 aborted。
 - 每次继续和终止都会追加 `GoalStatusEvent`，记录 objective、状态、回合、Token 和原因。
+
+## 62. SWE 类任务可以使用哪些 Validation Signal？
+
+### 口述主回答
+
+单元测试证明被覆盖的行为是否通过，静态检查发现类型或格式问题，构建结果证明项目能够编译或打包，
+Patch 只能证明产生了修改，官方评分器才最接近 Benchmark 的最终成功定义。任何单一信号都可能覆盖不完整。
+
+如果测试通过但实现仍不符合用户要求，我会把用户验收条件、针对性复现、回归测试、构建结果和必要的
+语义审查组合起来，不能把单个测试通过当成全部要求满足。
+
+### 追问问题与回答
+
+**追问：单元测试、静态检查、构建结果、Patch 和官方评分器分别能证明什么？**
+
+单测证明覆盖行为，静态检查发现类型和格式问题，构建证明可编译打包，Patch 只证明产生修改，官方评分器
+最接近 Benchmark 的最终标准。
+
+**追问：如果测试通过，但实现不符合用户要求，如何组合多个验证信号？**
+
+同时检查用户验收条件、针对性复现、回归测试、构建结果和必要的语义审查，不能把单个测试通过当作全部
+要求满足。
+
+### 技术追问补充
+
+- `command_verifier_check(command)` 直接执行固定命令，退出码为 0 才返回 `done`。
+- `executed_completion_check()` 先读取 Agent 的 complete 声明和 `verify_command`，再重新执行该非空
+  命令；命令失败或缺失时保持未完成。
+- `default_check(verifier=...)` 允许外部 verifier 否决模型的 complete 声明，调用者也可以实现组合多个
+  信号的自定义 `CompletionCheck`。
+- SWE 官方 scorer 位于 Eval/Host 边界，不是 Goal Loop 每轮默认调用的检查器。
 
 ## 63. 没有确定性验证器时如何判断完成？
 
