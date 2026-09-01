@@ -512,7 +512,7 @@ Critic 接收原任务、验收条件、当前草稿和可用证据，输出带�
 - 同一个模型也可以承担两个角色，但角色分离并不等于判断独立；高风险任务可使用不同提示、模型或
   外部检查降低相关错误，是否有效仍需评测。
 
-## 59. 如何判断 Reflection 是否值得？
+## 59. Reflection 会增加 Token、延迟和调用成本，如何判断是否值得？
 
 ### 口述主回答
 
@@ -587,7 +587,7 @@ Agent 声明是模型判断；Runtime 停止是控制流状态；客观完成是
 - Goal 终态包括 `complete`、`blocked`、`budget_exhausted` 和 `aborted`；相同 blocker 连续三次才
   进入 `blocked`。
 
-## 61. 什么是外部验证信号？
+## 61. 什么是 External Validation Signal？
 
 ### 口述主回答
 
@@ -650,7 +650,7 @@ Patch 只能证明产生了修改，官方评分器才最接近 Benchmark 的最
   信号的自定义 `CompletionCheck`。
 - SWE 官方 scorer 位于 Eval/Host 边界，不是 Goal Loop 每轮默认调用的检查器。
 
-## 63. 没有确定性验证器时如何判断完成？
+## 63. 没有 deterministic verifier 的任务如何判断完成？
 
 ### 口述主回答
 

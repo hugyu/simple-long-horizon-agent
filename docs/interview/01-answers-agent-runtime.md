@@ -6,6 +6,8 @@
 
 ## 1. 用 3 分钟介绍一下 Simple Long Horizon Agent，它解决的核心问题是什么？
 
+### 口述主回答
+
 Simple Long Horizon Agent 解决的是：怎样让模型在多个回合里持续操作真实环境，而不是只
 生成一次答案。比如修复代码时，模型需要读取仓库、修改文件、运行测试，再根据真实结果继续
 调整。模型只负责决定下一步，Runtime 负责把行动执行、结果反馈、状态连续性和停止控制组成
@@ -29,6 +31,8 @@ PostTrainBench 45.88%。这些是完整配置的端到端结果，目前没有�
 
 ## 2. 为什么自己做 Agent Runtime，而不是直接使用成熟框架？
 
+### 口述主回答
+
 因为这个项目要研究和展示的对象就是 Runtime 本身，而不只是使用 Runtime 构建一个业务
 Agent。项目里实际把主循环直接写在 `core.run()` 中，由它按顺序完成上下文构建、模型调用、
 工具执行、State 更新和停止判断；`Message / Event / State` 也使用项目自己的协议。
@@ -40,6 +44,8 @@ AutoGen 和 OpenAI Agents SDK 更适合快速构建已有框架覆盖的应用�
 
 ## 3. 你怎么定义 Long Horizon？
 
+### 口述主回答
+
 我不按固定的 Turn、Token 或执行时间阈值定义 Long Horizon。核心标准是：任务不能通过一次
 模型响应完成，后续决策必须依赖前面行动产生的真实反馈，需要持续经历“观察、行动、检查和
 修正”才能得到可验证结果。
@@ -49,7 +55,9 @@ AutoGen 和 OpenAI Agents SDK 更适合快速构建已有框架覆盖的应用�
 再增加 Token、时间预算和外部完成检查。一个 Agent 即使循环很多次，如果没有有效状态推进，
 也不能说明它具备 Long Horizon 能力。
 
-## 4. Runtime 的核心架构和完整数据流是什么？
+## 4. 整个 Agent Runtime 的核心架构是什么？能不能画一下从 `User Input → Model → Tool → State → Model → Stop` 的完整数据流？
+
+### 口述主回答
 
 Runtime 的核心是一个小型控制循环，外围分别负责模型适配、工具执行和上下文策略。项目里
 实际的数据流是：用户任务先进入 `State`；Runtime 从 Active Context 构建模型输入；模型输出
@@ -80,6 +88,8 @@ flowchart LR
 任务是否真正成功仍由测试、Goal Loop 或 Eval scorer 等外部检查确认。
 
 ## 5. Runtime 里面最核心的 abstraction 是什么？
+
+### 口述主回答
 
 如果必须只选一个，我会选以 `State` 为中心的追加式运行事实协议。项目里每条 Message 都通过
 Event 写入 State，模型请求、工具执行、上下文压缩和停止原因也分别记录为 Event；
@@ -195,7 +205,7 @@ Runtime 会先按模型输出顺序为每个调用记录开始事件，再经过
   `ToolResultBlock` 按原始 Tool Call 顺序组装。
 - 未知工具、执行异常和超时仍会生成保留原调用编号的错误结果，维持调用与结果一一配对。
 
-## 9. 工具执行失败后，系统应该如何处理？
+## 9. Tool 执行失败后，系统应该重试、把错误返回给模型、中断运行，还是执行 fallback？这个决策由 Tool、Runtime、模型还是 Workflow 负责？
 
 ### 口述主回答
 

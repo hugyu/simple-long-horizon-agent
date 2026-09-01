@@ -3,7 +3,7 @@
 本文对应 [`question-checklist.md`](question-checklist.md) 中第八部分的问题。本篇是基于当前
 Runtime 边界给出的生产化设计方案，不代表仓库已经实现这些平台能力。
 
-## 92. 如何设计支持 10 万个同时运行任务的 Agent 平台？
+## 92. 设计一个支持 10 万个同时运行 Agent Task 的 Production Agent Platform。
 
 ### 口述主回答
 
