@@ -279,10 +279,37 @@ class RecoverableRuntimeTest(unittest.TestCase):
             )
             scheduler.start()
             self.assertTrue(started.wait(1))
-            scheduler.stop(join_timeout=1)
+            self.assertTrue(scheduler.stop(join_timeout=1))
             stopped.set()
             self.assertFalse(scheduler.running)
             self.assertTrue(stopped.is_set())
+
+    def test_scheduler_stop_does_not_start_remaining_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            store = FileRunStore(Path(raw_root))
+            store.create(RunRecord("first", status="runnable"))
+            store.create(RunRecord("second", status="runnable"))
+            started = threading.Event()
+            release = threading.Event()
+            attempted: list[str] = []
+
+            def recover(record: RunRecord) -> None:
+                attempted.append(record.run_id)
+                started.set()
+                release.wait(1)
+
+            scheduler = RecoveryScheduler(
+                RecoveryScanner(store),
+                worker_id="worker-1",
+                recover=recover,
+                poll_interval_seconds=1,
+            )
+            scheduler.start()
+            self.assertTrue(started.wait(1))
+            self.assertFalse(scheduler.stop(join_timeout=0.01))
+            release.set()
+            self.assertTrue(scheduler.stop(join_timeout=1))
+            self.assertEqual(attempted, ["first"])
 
     def test_executor_writes_independent_event_journal(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:

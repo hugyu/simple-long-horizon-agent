@@ -392,6 +392,8 @@ class RecoveryScheduler:
         attempted: list[str] = []
         self.last_errors = []
         for record in self.scanner.runnable():
+            if self._stop.is_set():
+                break
             attempted.append(record.run_id)
             try:
                 self.recover(record)
@@ -437,12 +439,17 @@ class RecoveryScheduler:
         )
         self._thread.start()
 
-    def stop(self, *, join_timeout: float | None = None) -> None:
-        """Request shutdown and wait briefly for a started thread."""
+    def stop(self, *, join_timeout: float | None = None) -> bool:
+        """Request shutdown and report whether the scheduler fully stopped.
+
+        A running recovery callback is allowed to finish; a finite timeout can
+        therefore return ``False`` while that callback is still in progress.
+        """
 
         self._stop.set()
         if self._thread is not None:
             self._thread.join(join_timeout)
+        return not self.running
 
 
 __all__ = [
