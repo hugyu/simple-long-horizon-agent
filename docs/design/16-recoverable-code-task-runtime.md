@@ -313,9 +313,13 @@ fencing 语义完成、释放或等待接管。
 
 ### Phase 3：长任务证据与 Skill 观测
 
-- 增加 `SkillInvokedEvent`，记录 Skill 版本、输入摘要、工具和验证结果；
-- 将 Checkpoint、Trace、result 和 verification 组织成 evidence pack；
+- 已增加 `SkillInvokedEvent`，记录 Skill 内容版本、任务输入摘要、来源和触发方式；
+- 已增加 `EvidencePack` 派生函数，汇总 Skill、工具错误、工作区引用、验证元数据和停止原因；
 - 在 SWE-bench 或 Terminal-Bench 风格任务上加入故障注入运行。
+
+当前证据包是从 `State.events` 和 `State.data` 派生的纯内存值，不参与恢复决策，也不
+把原始任务或 Skill 正文重复写入观测数据。后续可由 Trace/Evidence writer 持久化
+`EvidencePack.as_dict()`，并补充验证命令、补丁摘要和人工核对结果。
 
 本阶段不要求引入数据库。文件系统实现先验证协议和恢复语义，跨进程部署时再替换为具备条件更新能力的存储后端。
 

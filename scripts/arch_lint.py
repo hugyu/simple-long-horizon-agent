@@ -66,6 +66,7 @@ MODULE_ZONES = {
     "event_journal": CORE,
     "reconciliation": CORE,
     "workspace": CORE,
+    "evidence": CORE,
     "core": CORE,
     "hooks": CORE,
     "llm_agent": CORE,

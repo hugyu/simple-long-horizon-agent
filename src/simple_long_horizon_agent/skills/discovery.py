@@ -7,6 +7,7 @@ so the always-present menu stays cheap even with many skills.
 
 from __future__ import annotations
 
+import hashlib
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +26,11 @@ class SkillMetadata:
     def read_body(self) -> str:
         with open(self.path_to_skill_md, "r", encoding="utf-8") as handle:
             return handle.read()
+
+    def content_sha256(self) -> str:
+        """Return a stable content fingerprint for the current skill body."""
+
+        return hashlib.sha256(self.read_body().encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)

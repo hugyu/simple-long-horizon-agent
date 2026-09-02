@@ -41,6 +41,7 @@ from .protocols import (
     Event,
     GoalStatusEvent,
     HookFiredEvent,
+    SkillInvokedEvent,
     MessageEvent,
     ModelRequestEvent,
     ModelResponseEvent,
@@ -272,6 +273,15 @@ def _event_from_record(record: Any) -> Event:
             reason=str(record.get("reason") or ""),
             **base,
         )
+    if kind == "skill_invoked":
+        return SkillInvokedEvent(
+            skill_name=str(record.get("skill_name") or ""),
+            version=str(record.get("version") or ""),
+            input_sha256=str(record.get("input_sha256") or ""),
+            source=str(record.get("source") or ""),
+            trigger=str(record.get("trigger") or "mention"),
+            **base,
+        )
     raise ValueError(f"Unsupported checkpoint event kind: {kind!r}")
 
 
@@ -443,7 +453,8 @@ def _validate_event_prefix(events: Sequence[Event], payload: Mapping[str, Any]) 
             raise ValueError(
                 f"Checkpoint event index is not contiguous at {expected}: {event.index}"
             )
-    covered = int(payload.get("covered_event_index", -1) or -1)
+    raw_covered = payload.get("covered_event_index")
+    covered = int(raw_covered) if raw_covered is not None else -1
     if covered != (events[-1].index if events else -1):
         raise ValueError("Checkpoint covered_event_index does not match events")
     covered_uuid = str(payload.get("covered_event_uuid") or "")

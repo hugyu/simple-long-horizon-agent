@@ -4,6 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from simple_long_horizon_agent import SkillInvokedEvent
+
 from simple_long_horizon_agent.skills.discovery import (
     BUNDLED_LIBRARY_DIR,
     SkillMetadata,
@@ -275,6 +277,13 @@ class RunWithSkillsTest(unittest.TestCase):
         context_msgs = [m for m in state.messages if m.kind == "context"]
         self.assertTrue(context_msgs)
         self.assertIn("<name>echo-fixture</name>", context_msgs[0].content[0].text)
+        skill_events = [
+            event for event in state.events if isinstance(event, SkillInvokedEvent)
+        ]
+        self.assertEqual(len(skill_events), 1)
+        self.assertEqual(skill_events[0].skill_name, "echo-fixture")
+        self.assertEqual(skill_events[0].trigger, "mention")
+        self.assertEqual(len(skill_events[0].version), 64)
 
     def test_no_skills_directive_suppresses_everything(self) -> None:
         agent = make_bash_agent(provider=FAKE_PROVIDER, cwd=str(FIXTURES))

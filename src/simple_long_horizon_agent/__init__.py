@@ -49,6 +49,7 @@ from .reconciliation import (
     reconcile_pending,
 )
 from .workspace import FileWorkspaceManager, WorkspaceManager, WorkspaceRef
+from .evidence import EvidencePack, evidence_pack_from_state
 from .llm_agent import make_llm_agent
 from .messages import make_message
 from .protocols import (
@@ -58,6 +59,7 @@ from .protocols import (
     Event,
     EventKind,
     HookFiredEvent,
+    SkillInvokedEvent,
     MessageEvent,
     ModelRequestEvent,
     ModelResponseEvent,
@@ -172,6 +174,7 @@ __all__ = [
     "HookContext",
     "HookDecision",
     "HookFiredEvent",
+    "SkillInvokedEvent",
     "HookPoint",
     "MessageEvent",
     "ModelRequestEvent",
@@ -230,6 +233,8 @@ __all__ = [
     "FileWorkspaceManager",
     "WorkspaceManager",
     "WorkspaceRef",
+    "EvidencePack",
+    "evidence_pack_from_state",
     "RecoveryScanner",
     "RecoveryScheduler",
     "CompactControl",

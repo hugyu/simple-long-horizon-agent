@@ -12,12 +12,13 @@ scripts (the ``bash`` tool) are ordinary tool calls.
 
 from __future__ import annotations
 
+import hashlib
 import os
 from collections.abc import Iterator, Sequence
 
 from simple_long_horizon_agent.core import Agent, run
 from simple_long_horizon_agent.messages import Message, user_message
-from simple_long_horizon_agent.protocols import Event
+from simple_long_horizon_agent.protocols import Event, SkillInvokedEvent
 from simple_long_horizon_agent.state import State
 from simple_long_horizon_agent.tools import AbortFlag
 
@@ -115,12 +116,29 @@ def init_state_with_skills(
     directives = parse_skill_directives(task, [s.name for s in discovered])
 
     state = State(task=directives.cleaned_task)
+    input_sha256 = hashlib.sha256(directives.cleaned_task.encode("utf-8")).hexdigest()
     if directives.skills_enabled and discovered:
         menu = skills_menu_message(discovered, target=agent.name)
         if menu is not None:
             state.record(menu)
         inject_names = set(directives.mentions) | set(preload)
         inject = [s for s in discovered if s.name in inject_names]
+        for skill in inject:
+            try:
+                version = skill.content_sha256()
+            except OSError:
+                continue
+            state.record_event(
+                SkillInvokedEvent(
+                    skill_name=skill.name,
+                    version=version,
+                    input_sha256=input_sha256,
+                    source=skill.scope,
+                    trigger=(
+                        "mention" if skill.name in directives.mentions else "preload"
+                    ),
+                )
+            )
         for message in skill_body_messages(inject, target=agent.name):
             state.record(message)
 

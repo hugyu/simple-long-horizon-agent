@@ -36,6 +36,7 @@ class EventKind(str, Enum):
     TOOL_EXECUTION_END = "tool_execution_end"
     HOOK_FIRED = "hook_fired"
     GOAL_STATUS = "goal_status"
+    SKILL_INVOKED = "skill_invoked"
 
     def __str__(self) -> str:
         return self.value
@@ -272,6 +273,25 @@ class GoalStatusEvent(_BaseEvent):
     reason: str = ""
 
 
+@dataclass(frozen=True, kw_only=True)
+class SkillInvokedEvent(_BaseEvent):
+    """Record a skill body made available to the model for this Run.
+
+    ``version`` is a content fingerprint supplied by the skill loader, while
+    ``input_sha256`` identifies the task context without storing raw input in
+    the event stream.  The event is observe-only and is not added to context.
+    """
+
+    kind: Literal[EventKind.SKILL_INVOKED] = field(
+        default=EventKind.SKILL_INVOKED, init=False
+    )
+    skill_name: str
+    version: str
+    input_sha256: str
+    source: str = ""
+    trigger: str = "mention"
+
+
 Event: TypeAlias = (
     MessageEvent
     | AgentStartEvent
@@ -286,4 +306,5 @@ Event: TypeAlias = (
     | ToolExecutionEndEvent
     | HookFiredEvent
     | GoalStatusEvent
+    | SkillInvokedEvent
 )
