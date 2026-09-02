@@ -35,6 +35,7 @@ from .recoverable_runtime import (
     RecoverableRun,
     RecoverableRunExecutor,
     RecoveryScanner,
+    RecoveryScheduler,
 )
 from .event_journal import (
     EventJournal,
@@ -226,6 +227,7 @@ __all__ = [
     "ReconcileResult",
     "reconcile_pending",
     "RecoveryScanner",
+    "RecoveryScheduler",
     "CompactControl",
     "CompressionDecision",
     "CompressionStrategy",

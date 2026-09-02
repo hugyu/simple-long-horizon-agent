@@ -13,6 +13,7 @@ from simple_long_horizon_agent import (
     RecoverableRun,
     RecoverableRunExecutor,
     RecoveryScanner,
+    RecoveryScheduler,
     LeaseLostError,
     State,
     assistant_message,
@@ -231,6 +232,56 @@ class RecoverableRuntimeTest(unittest.TestCase):
                 for record in RecoveryScanner(store, clock=lambda: now[0]).runnable()
             }
             self.assertEqual(found, {"runnable", "expired"})
+
+    def test_scheduler_attempts_candidates_and_keeps_running_after_one_error(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            store = FileRunStore(Path(raw_root))
+            store.create(RunRecord("first", status="runnable"))
+            store.create(RunRecord("second", status="runnable"))
+            attempted: list[str] = []
+            errors: list[tuple[str | None, str]] = []
+
+            def recover(record: RunRecord) -> None:
+                attempted.append(record.run_id)
+                if record.run_id == "first":
+                    raise RuntimeError("transient")
+
+            scheduler = RecoveryScheduler(
+                RecoveryScanner(store),
+                worker_id="worker-1",
+                recover=recover,
+                on_error=lambda record, error: errors.append(
+                    (record.run_id if record else None, str(error))
+                ),
+            )
+            self.assertEqual(scheduler.run_once(), ["first", "second"])
+            self.assertEqual(attempted, ["first", "second"])
+            self.assertEqual(errors, [("first", "transient")])
+
+    def test_scheduler_stop_ends_background_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            store = FileRunStore(Path(raw_root))
+            store.create(RunRecord("loop", status="runnable"))
+            started = threading.Event()
+            stopped = threading.Event()
+
+            def recover(record: RunRecord) -> None:
+                started.set()
+
+            scheduler = RecoveryScheduler(
+                RecoveryScanner(store),
+                worker_id="worker-1",
+                recover=recover,
+                poll_interval_seconds=0.01,
+            )
+            scheduler.start()
+            self.assertTrue(started.wait(1))
+            scheduler.stop(join_timeout=1)
+            stopped.set()
+            self.assertFalse(scheduler.running)
+            self.assertTrue(stopped.is_set())
 
     def test_executor_writes_independent_event_journal(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:

@@ -45,10 +45,10 @@
 token、Operation Ledger，以及 `RecoverableRunExecutor` 的基本接管流程。
 剩余缺口主要是生产化边界：
 
-- 没有后台恢复扫描器和持久化队列，Worker 需要由调用方显式触发接管；
+- 已增加可停止的 `RecoveryScheduler`，周期扫描候选 Run 并交给调用方的恢复回调；它不替代租约竞争，也不持有 Agent 内存状态；
 - 已增加 `FileEventJournal`，按 Run 追加 JSONL 事件并校验 index 连续性；生产环境仍需共享存储和事务边界；
 - 工作区生命周期、快照和垃圾回收还没有纳入 Run 控制面；
-- `RecoveryScanner` 已能发现 runnable、reconciling 和过期租约 Run，但尚未形成常驻后台调度循环；
+- `RecoveryScanner` 能发现 runnable、reconciling 和过期租约 Run，`RecoveryScheduler` 可将扫描接入常驻后台循环；
 - 文件系统存储还没有替换为带条件更新和事务边界的共享数据库；
 - 优雅停机已覆盖单个执行器的释放语义，但尚未形成多 Worker 的服务级停机编排。
 
@@ -284,10 +284,30 @@ created -> intent_recorded -> started -> confirmed
 - 恢复执行时先加载 Checkpoint，再读取 Journal；Checkpoint 覆盖的事件必须逐条相等，Journal 超出的尾部事件会合并回新的 `State`，前缀冲突或 Journal 缺失则拒绝继续。
 - 恢复执行前会查询 `started/unknown` 操作；有适配器时执行显式核对，确认成功才继续，无法判断的操作会将 Run 置为 `blocked`，不会盲目重试。
 
-当前还没有常驻调度线程、跨机器通知或数据库级 Journal。服务器重启后的最小流程是：新 Worker 扫描候选 Run，再使用自己的 Worker ID 调用执行器竞争租约。
+当前还没有跨机器通知或数据库级 Journal。服务器重启后的最小流程是：新 Worker 启动
+`RecoveryScheduler`，扫描候选 Run，再使用自己的 Worker ID 调用执行器竞争租约。
+调度器停止时不再领取新的 Run；当前执行器仍按已有的 checkpoint、lease 和 fencing
+语义完成或释放自己的 Run。
 
 当前提供了 `OperationReconciler` 协议和 `EditOperationReconciler` 文件哈希实现。
 `bash` 等无法可靠推断结果的工具必须注册自己的核对器，否则恢复会失败关闭。
+
+### Phase 2.7：常驻恢复调度
+
+状态：已完成最小文件系统实现。
+
+`RecoveryScheduler` 将 `RecoveryScanner` 接入可停止的后台循环。每轮扫描把候选
+Run 交给调用方提供的恢复回调；回调应使用自己的 Worker ID 构造
+`RecoverableRun`，再调用 `RecoverableRunExecutor.execute()` 竞争租约。调度器本身
+不修改 Run 状态、不绕过 fencing，也不保存 Agent 的内存对象。
+
+单个 Run 的恢复失败会通过 `on_error` 记录并继续处理同一轮的其他候选，避免一个
+损坏工作区阻塞整个恢复循环。服务停机时调用 `stop()`，调度器停止新的扫描；已
+领取的 Run 仍由执行器按 lease、checkpoint 和 fencing 语义完成、释放或等待接管。
+
+这仍是进程内调度线程，没有跨机器唤醒、持久化队列、并发度配额或退避策略。生产
+部署应在共享 RunStore 上实现同样的条件租约语义，并由服务生命周期统一启动和停止
+调度器。
 
 ### Phase 3：长任务证据与 Skill 观测
 

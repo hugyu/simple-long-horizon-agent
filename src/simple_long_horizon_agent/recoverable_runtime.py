@@ -31,6 +31,8 @@ from .tools import AbortFlag
 
 
 StateFactory = Callable[[], State]
+RecoveryHandler = Callable[[RunRecord], None]
+RecoveryErrorHandler = Callable[[RunRecord | None, BaseException], None]
 
 
 class LeaseLostError(RunControlError):
@@ -313,9 +315,105 @@ class RecoveryScanner:
         return False
 
 
+class RecoveryScheduler:
+    """Continuously hand recoverable Runs to a caller-owned worker callback.
+
+    The scheduler only discovers candidates.  The callback remains responsible
+    for constructing a ``RecoverableRun`` and invoking the executor, which keeps
+    lease acquisition and fencing as the single concurrency boundary.
+    """
+
+    def __init__(
+        self,
+        scanner: RecoveryScanner,
+        *,
+        worker_id: str,
+        recover: RecoveryHandler,
+        poll_interval_seconds: float = 5.0,
+        sleep_fn: Callable[[float], None] | None = None,
+        on_error: RecoveryErrorHandler | None = None,
+    ) -> None:
+        if not worker_id:
+            raise ValueError("worker_id must not be empty")
+        if poll_interval_seconds <= 0:
+            raise ValueError("poll_interval_seconds must be greater than zero")
+        self.scanner = scanner
+        self.worker_id = worker_id
+        self.recover = recover
+        self.poll_interval_seconds = poll_interval_seconds
+        self.sleep_fn = sleep_fn
+        self.on_error = on_error
+        self.last_errors: list[tuple[str, BaseException]] = []
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def run_once(self) -> list[str]:
+        """Scan and attempt each candidate once, returning attempted Run IDs."""
+
+        attempted: list[str] = []
+        self.last_errors = []
+        for record in self.scanner.runnable():
+            attempted.append(record.run_id)
+            try:
+                self.recover(record)
+            except Exception as exc:
+                self.last_errors.append((record.run_id, exc))
+                if self.on_error is not None:
+                    self.on_error(record, exc)
+        return attempted
+
+    def run_forever(self, *, stop_event: threading.Event | None = None) -> None:
+        """Run scan cycles until ``stop()`` or the optional event is set."""
+
+        external_stop = stop_event
+        while not self._stop.is_set() and not (
+            external_stop is not None and external_stop.is_set()
+        ):
+            try:
+                self.run_once()
+            except Exception as exc:
+                if self.on_error is not None:
+                    self.on_error(None, exc)
+                else:
+                    raise
+            if self._stop.is_set() or (
+                external_stop is not None and external_stop.is_set()
+            ):
+                break
+            if self.sleep_fn is None:
+                self._stop.wait(self.poll_interval_seconds)
+            else:
+                self.sleep_fn(self.poll_interval_seconds)
+
+    def start(self) -> None:
+        """Start a daemon scan thread; repeated starts are harmless."""
+
+        if self.running:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self.run_forever,
+            name=f"recovery-scheduler-{self.worker_id}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self, *, join_timeout: float | None = None) -> None:
+        """Request shutdown and wait briefly for a started thread."""
+
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(join_timeout)
+
+
 __all__ = [
     "LeaseLostError",
     "RecoverableRun",
     "RecoverableRunExecutor",
     "RecoveryScanner",
+    "RecoveryScheduler",
 ]
