@@ -41,6 +41,12 @@ from .event_journal import (
     FileEventJournal,
     merge_checkpoint_with_journal,
 )
+from .reconciliation import (
+    EditOperationReconciler,
+    OperationReconciler,
+    ReconcileResult,
+    reconcile_pending,
+)
 from .llm_agent import make_llm_agent
 from .messages import make_message
 from .protocols import (
@@ -215,6 +221,10 @@ __all__ = [
     "EventJournal",
     "FileEventJournal",
     "merge_checkpoint_with_journal",
+    "EditOperationReconciler",
+    "OperationReconciler",
+    "ReconcileResult",
+    "reconcile_pending",
     "RecoveryScanner",
     "CompactControl",
     "CompressionDecision",

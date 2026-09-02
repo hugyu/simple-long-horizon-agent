@@ -16,9 +16,11 @@ from typing import Callable, cast
 from .checkpoint import CheckpointStore
 from .core import Agent, run
 from .event_journal import EventJournal, merge_checkpoint_with_journal
+from .reconciliation import OperationReconciler, reconcile_pending
 from .protocols import AgentEndEvent, Event
 from .run_control import (
     OperationLedger,
+    OperationRecord,
     RunControlError,
     RunRecord,
     RunStatus,
@@ -124,6 +126,8 @@ class RecoverableRunExecutor:
         checkpoint_store: CheckpointStore,
         operation_ledger: OperationLedger | None = None,
         event_journal: EventJournal | None = None,
+        reconciler_for: Callable[[OperationRecord], OperationReconciler | None]
+        | None = None,
         lease_seconds: float = 30.0,
         lease_renew_interval_seconds: float | None = None,
         checkpoint_every_events: int = 10,
@@ -136,6 +140,7 @@ class RecoverableRunExecutor:
         self.checkpoint_store = checkpoint_store
         self.operation_ledger = operation_ledger
         self.event_journal = event_journal
+        self.reconciler_for = reconciler_for
         self.lease_seconds = lease_seconds
         self.lease_renew_interval_seconds = (
             lease_renew_interval_seconds
@@ -186,6 +191,21 @@ class RecoverableRunExecutor:
             state = agent._default_init_state(task)
         state.data["run_id"] = handle.run_id
         state.data["fencing_token"] = lease.fencing_token
+        if self.operation_ledger is not None and self.operation_ledger.list_pending(
+            handle.run_id
+        ):
+            lease = self.run_store.transition(lease, "reconciling")
+            outcomes = reconcile_pending(
+                self.operation_ledger,
+                handle.run_id,
+                self.reconciler_for or (lambda operation: None),
+            )
+            if any(outcome.status != "confirmed" for _, outcome in outcomes):
+                lease = self.run_store.transition(lease, "blocked")
+                self.run_store.release_lease(lease, status="blocked")
+                raise RunControlError(
+                    f"Run {handle.run_id!r} has an operation that could not be reconciled"
+                )
         lease = self.run_store.transition(lease, "running")
         return state, self._events(
             handle, agent, state, max_turns=max_turns, abort=abort

@@ -19,11 +19,90 @@ from simple_long_horizon_agent import (
     FileEventJournal,
     merge_checkpoint_with_journal,
 )
+from simple_long_horizon_agent.reconciliation import EditOperationReconciler
+from simple_long_horizon_agent.run_control import (
+    FileOperationLedger,
+    OperationRecord,
+    operation_args_digest,
+)
 from simple_long_horizon_agent.protocols import TurnStartEvent
 from simple_long_horizon_agent.run_control import RunRecord
 
 
 class RecoverableRuntimeTest(unittest.TestCase):
+    def test_edit_reconciler_confirms_existing_post_image(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            path = root / "note.txt"
+            path.write_text("after", encoding="utf-8")
+            import hashlib
+
+            record = __import__(
+                "simple_long_horizon_agent", fromlist=["OperationRecord"]
+            ).OperationRecord(
+                operation_id="op-1",
+                run_id="run-1",
+                tool_call_id="edit-1",
+                tool_name="edit",
+                idempotency_key="run-1:edit-1",
+                args_digest="digest",
+                status="started",
+                metadata={
+                    "path": str(path),
+                    "new_sha256": hashlib.sha256(b"after").hexdigest(),
+                },
+            )
+            result = EditOperationReconciler(workspace=root).reconcile(record)
+            self.assertEqual(result.status, "confirmed")
+
+    def test_executor_reconciles_pending_edit_before_resuming(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            path = root / "note.txt"
+            path.write_text("after", encoding="utf-8")
+            ledger = FileOperationLedger(root / "ledger")
+            record = ledger.create_intent(
+                OperationRecord(
+                    operation_id="op-edit",
+                    run_id="recover",
+                    tool_call_id="edit-1",
+                    tool_name="edit",
+                    idempotency_key="recover:edit-1",
+                    args_digest=operation_args_digest({"path": "note.txt"}),
+                    status="created",
+                    metadata={
+                        "path": str(path),
+                        "new_sha256": __import__("hashlib")
+                        .sha256(b"after")
+                        .hexdigest(),
+                    },
+                )
+            )
+            ledger.transition(record, "intent_recorded")
+            ledger.transition(ledger.get("op-edit"), "started")
+            run_store = FileRunStore(root / "runs")
+            executor = RecoverableRunExecutor(
+                run_store=run_store,
+                checkpoint_store=FileCheckpointStore(root / "checkpoints"),
+                operation_ledger=ledger,
+                reconciler_for=lambda operation: EditOperationReconciler(
+                    workspace=root
+                ),
+            )
+            executor.create("recover", State("continue"), worker_id="worker")
+            _, events = executor.execute(
+                RecoverableRun("recover", "recover", "worker"),
+                Agent(
+                    "writer",
+                    lambda visible: assistant_message(
+                        "done", sender="writer", target="user", kind="final"
+                    ),
+                ),
+            )
+            list(events)
+            self.assertEqual(ledger.get("op-edit").status, "confirmed")
+            self.assertEqual(run_store.get("recover").status, "complete")
+
     def test_long_run_renews_lease_before_it_expires(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)

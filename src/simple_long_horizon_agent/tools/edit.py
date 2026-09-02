@@ -22,6 +22,7 @@ mutates the workspace and concurrent writes to the same file would race.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -142,7 +143,47 @@ def make_edit_tool(
         execute=execute,
         execution_mode=execution_mode,
         side_effecting=True,
+        side_effect_metadata=lambda args: _edit_operation_metadata(root, args),
     )
+
+
+def _edit_operation_metadata(
+    root: Path, args: dict[str, Any]
+) -> dict[str, object] | None:
+    raw_path = str(args.get("path", "")).strip()
+    old_string = args.get("old_string")
+    new_string = args.get("new_string")
+    if (
+        not raw_path
+        or not isinstance(old_string, str)
+        or not isinstance(new_string, str)
+    ):
+        return None
+    candidate = Path(raw_path)
+    path = candidate if candidate.is_absolute() else root / candidate
+    try:
+        current = (
+            path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+        )
+    except OSError:
+        return None
+    replace_all = bool(args.get("replace_all", False))
+    if old_string == "":
+        expected = new_string
+        mode = "create"
+    elif replace_all:
+        expected = current.replace(old_string, new_string)
+        mode = "replace_all"
+    elif current.count(old_string) == 1:
+        expected = current.replace(old_string, new_string, 1)
+        mode = "replace"
+    else:
+        return None
+    return {
+        "path": str(path),
+        "mode": mode,
+        "new_sha256": hashlib.sha256(expected.encode("utf-8")).hexdigest(),
+    }
 
 
 def edit_file(

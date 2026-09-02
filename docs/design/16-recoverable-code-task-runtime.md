@@ -282,8 +282,12 @@ created -> intent_recorded -> started -> confirmed
 - `RecoveryScanner` 扫描 `RunStore.list()`，返回 runnable、等待核对以及租约已过期的 Run；
 - 扫描与抢租约分离，实际接管仍由 `RecoverableRunExecutor.execute()` 通过条件租约完成。
 - 恢复执行时先加载 Checkpoint，再读取 Journal；Checkpoint 覆盖的事件必须逐条相等，Journal 超出的尾部事件会合并回新的 `State`，前缀冲突或 Journal 缺失则拒绝继续。
+- 恢复执行前会查询 `started/unknown` 操作；有适配器时执行显式核对，确认成功才继续，无法判断的操作会将 Run 置为 `blocked`，不会盲目重试。
 
 当前还没有常驻调度线程、跨机器通知或数据库级 Journal。服务器重启后的最小流程是：新 Worker 扫描候选 Run，再使用自己的 Worker ID 调用执行器竞争租约。
+
+当前提供了 `OperationReconciler` 协议和 `EditOperationReconciler` 文件哈希实现。
+`bash` 等无法可靠推断结果的工具必须注册自己的核对器，否则恢复会失败关闭。
 
 ### Phase 3：长任务证据与 Skill 观测
 

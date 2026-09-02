@@ -621,6 +621,11 @@ def _prepare_operation(
             tool_name=tool.name,
             idempotency_key=idempotency_key,
             args_digest=operation_args_digest(arguments),
+            metadata=(
+                tool.side_effect_metadata(arguments)
+                if tool.side_effect_metadata is not None
+                else None
+            ),
         )
     )
     if record.status == "created":

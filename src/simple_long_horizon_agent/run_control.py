@@ -41,6 +41,7 @@ OperationStatus = Literal[
     "started",
     "confirmed",
     "unknown",
+    "blocked",
     "reconciled",
 ]
 
@@ -285,12 +286,15 @@ class OperationRecord:
     status: OperationStatus = "created"
     version: int = 0
     result: Mapping[str, object] | None = None
+    metadata: Mapping[str, object] | None = None
 
 
 class OperationLedger(Protocol):
     def create_intent(self, record: OperationRecord) -> OperationRecord: ...
 
     def get(self, operation_id: str) -> OperationRecord: ...
+
+    def list_pending(self, run_id: str) -> builtins.list[OperationRecord]: ...
 
     def transition(
         self,
@@ -352,6 +356,17 @@ class FileOperationLedger:
             raise FileNotFoundError(f"Operation not found: {operation_id}") from None
         return _operation_from_payload(payload)
 
+    def list_pending(self, run_id: str) -> builtins.list[OperationRecord]:
+        self.root.mkdir(parents=True, exist_ok=True)
+        pending: builtins.list[OperationRecord] = []
+        for path in sorted(self.root.glob("*.json")):
+            if path.name == "idempotency.json":
+                continue
+            record = self.get(path.stem)
+            if record.run_id == run_id and record.status in {"started", "unknown"}:
+                pending.append(record)
+        return pending
+
     def transition(
         self,
         record: OperationRecord,
@@ -393,9 +408,10 @@ class FileOperationLedger:
 _ALLOWED_OPERATION_TRANSITIONS: dict[OperationStatus, tuple[OperationStatus, ...]] = {
     "created": ("intent_recorded",),
     "intent_recorded": ("started", "unknown"),
-    "started": ("confirmed", "unknown"),
+    "started": ("confirmed", "unknown", "blocked"),
     "confirmed": ("reconciled",),
-    "unknown": ("reconciled", "confirmed"),
+    "unknown": ("reconciled", "confirmed", "blocked"),
+    "blocked": (),
     "reconciled": (),
 }
 
@@ -459,6 +475,9 @@ def _operation_from_payload(payload: object) -> OperationRecord:
         status=cast(OperationStatus, status),
         version=int(values.get("version", 0)),
         result=dict(result) if isinstance(result, dict) else None,
+        metadata=dict(values["metadata"])
+        if isinstance(values.get("metadata"), Mapping)
+        else None,
     )
 
 
