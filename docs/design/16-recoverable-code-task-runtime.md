@@ -311,6 +311,13 @@ fencing 语义完成、释放或等待接管。
 部署应在共享 RunStore 上实现同样的条件租约语义，并由服务生命周期统一启动和停止
 调度器。
 
+服务级验收已覆盖三个生命周期场景：新服务启动后自动扫描并接管多个 `runnable` Run；
+两个服务实例同时扫描时，只有一个 Worker 能通过租约和 fencing 推进每个 Run；服务
+停机时停止领取新的 Run，允许当前恢复回调排空，未领取的 Run 保持 `runnable` 并由下
+一次服务启动继续处理。该验收仍使用本地文件系统存储，测试位于
+`tests/unit/test_recoverable_runtime.py` 的 `test_scheduler_recovers_*`、
+`test_two_service_schedulers_*` 和 `test_service_shutdown_*` 用例。
+
 ### Phase 3：长任务证据与 Skill 观测
 
 - 已增加 `SkillInvokedEvent`，记录 Skill 内容版本、任务输入摘要、来源和触发方式；

@@ -315,6 +315,191 @@ class RecoverableRuntimeTest(unittest.TestCase):
             self.assertTrue(scheduler.stop(join_timeout=1))
             self.assertEqual(attempted, ["first"])
 
+    def test_scheduler_recovers_multiple_runs_after_service_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            run_store = FileRunStore(root / "runs")
+            checkpoints = FileCheckpointStore(root / "checkpoints")
+            first = RecoverableRunExecutor(
+                run_store=run_store,
+                checkpoint_store=checkpoints,
+            )
+            for run_id in ("restart-a", "restart-b", "restart-c"):
+                first.create(run_id, State("resume"), worker_id="old-service")
+
+            resumed: list[str] = []
+            resumed_lock = threading.Lock()
+
+            def recover(record: RunRecord) -> None:
+                executor = RecoverableRunExecutor(
+                    run_store=run_store,
+                    checkpoint_store=checkpoints,
+                )
+                _, events = executor.execute(
+                    RecoverableRun(record.run_id, record.run_id, "new-service"),
+                    Agent(
+                        "writer",
+                        lambda visible: assistant_message(
+                            "recovered", sender="writer", target="user", kind="final"
+                        ),
+                    ),
+                )
+                list(events)
+                with resumed_lock:
+                    resumed.append(record.run_id)
+
+            scheduler = RecoveryScheduler(
+                RecoveryScanner(run_store),
+                worker_id="new-service",
+                recover=recover,
+            )
+            self.assertEqual(
+                scheduler.run_once(), ["restart-a", "restart-b", "restart-c"]
+            )
+            self.assertEqual(set(resumed), {"restart-a", "restart-b", "restart-c"})
+            self.assertTrue(
+                all(run_store.get(run_id).status == "complete" for run_id in resumed)
+            )
+
+    def test_two_service_schedulers_race_but_only_one_worker_advances_each_run(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            run_store = FileRunStore(root / "runs")
+            checkpoints = FileCheckpointStore(root / "checkpoints")
+            seed = RecoverableRunExecutor(
+                run_store=run_store,
+                checkpoint_store=checkpoints,
+            )
+            for run_id in ("race-a", "race-b"):
+                seed.create(run_id, State("race"), worker_id="seed")
+
+            generated: dict[str, int] = {"race-a": 0, "race-b": 0}
+            generated_lock = threading.Lock()
+            first_callbacks = threading.Barrier(2)
+            errors: list[tuple[str, str]] = []
+
+            def make_recover(worker_id: str):
+                def recover(record: RunRecord) -> None:
+                    if record.run_id == "race-a":
+                        first_callbacks.wait(timeout=2)
+
+                    def generate(visible):
+                        del visible
+                        with generated_lock:
+                            generated[record.run_id] += 1
+                        time.sleep(0.03)
+                        return assistant_message(
+                            "done", sender="writer", target="user", kind="final"
+                        )
+
+                    executor = RecoverableRunExecutor(
+                        run_store=run_store,
+                        checkpoint_store=checkpoints,
+                        lease_seconds=1,
+                        lease_renew_interval_seconds=0.1,
+                    )
+                    _, events = executor.execute(
+                        RecoverableRun(record.run_id, record.run_id, worker_id),
+                        Agent("writer", generate),
+                    )
+                    list(events)
+
+                return recover
+
+            def run_scheduler(worker_id: str) -> None:
+                scheduler = RecoveryScheduler(
+                    RecoveryScanner(run_store),
+                    worker_id=worker_id,
+                    recover=make_recover(worker_id),
+                    on_error=lambda record, error: errors.append(
+                        (record.run_id if record else "<scan>", type(error).__name__)
+                    ),
+                )
+                scheduler.run_once()
+
+            threads = [
+                threading.Thread(target=run_scheduler, args=("service-a",)),
+                threading.Thread(target=run_scheduler, args=("service-b",)),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(3)
+
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(generated, {"race-a": 1, "race-b": 1})
+            self.assertTrue(
+                all(run_store.get(run_id).status == "complete" for run_id in generated)
+            )
+            self.assertTrue(
+                errors, "the losing scheduler should report lease conflicts"
+            )
+
+    def test_service_shutdown_drains_current_run_and_next_service_resumes_pending_run(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            run_store = FileRunStore(root / "runs")
+            checkpoints = FileCheckpointStore(root / "checkpoints")
+            executor = RecoverableRunExecutor(
+                run_store=run_store,
+                checkpoint_store=checkpoints,
+            )
+            executor.create("drain-a", State("first"), worker_id="seed")
+            executor.create("drain-b", State("second"), worker_id="seed")
+            started = threading.Event()
+            release = threading.Event()
+
+            def recover(record: RunRecord) -> None:
+                def generate(visible):
+                    del visible
+                    started.set()
+                    release.wait(1)
+                    return assistant_message(
+                        "done", sender="writer", target="user", kind="final"
+                    )
+
+                _, events = executor.execute(
+                    RecoverableRun(record.run_id, record.run_id, "service-a"),
+                    Agent("writer", generate),
+                )
+                list(events)
+
+            scheduler = RecoveryScheduler(
+                RecoveryScanner(run_store),
+                worker_id="service-a",
+                recover=recover,
+                poll_interval_seconds=1,
+            )
+            scheduler.start()
+            self.assertTrue(started.wait(1))
+            self.assertFalse(scheduler.stop(join_timeout=0.01))
+            release.set()
+            self.assertTrue(scheduler.stop(join_timeout=1))
+            self.assertEqual(run_store.get("drain-a").status, "complete")
+            self.assertEqual(run_store.get("drain-b").status, "runnable")
+
+            restarted = RecoveryScheduler(
+                RecoveryScanner(run_store),
+                worker_id="service-b",
+                recover=lambda record: list(
+                    executor.execute(
+                        RecoverableRun(record.run_id, record.run_id, "service-b"),
+                        Agent(
+                            "writer",
+                            lambda visible: assistant_message(
+                                "done", sender="writer", target="user", kind="final"
+                            ),
+                        ),
+                    )[1]
+                ),
+            )
+            self.assertEqual(restarted.run_once(), ["drain-b"])
+            self.assertEqual(run_store.get("drain-b").status, "complete")
+
     def test_executor_writes_independent_event_journal(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
