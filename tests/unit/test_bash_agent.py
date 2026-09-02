@@ -33,6 +33,7 @@ from simple_long_horizon_agent.trace.spans import _collect_sub_events, _tree_sor
 from simple_long_horizon_agent.tools.bash import (
     MAX_BASH_TIMEOUT_SECONDS,
     NON_INTERACTIVE_BASH_ENV,
+    bash_command_may_modify,
     _resolve_timeout,
     bash_execution_to_tool_result,
     detect_blocked_sleep_pattern,
@@ -67,6 +68,22 @@ def _fake_bash_trace(label: str) -> RunTrace:
 
 
 class BashToolTest(unittest.TestCase):
+    def test_bash_side_effect_detector_is_conservative_for_writes(self) -> None:
+        cases = {
+            "printf 'hello'": False,
+            "rg TODO src": False,
+            "uv run python -m unittest": False,
+            "echo hi > output.txt": True,
+            "rm output.txt": True,
+            "git reset --hard HEAD": True,
+            "sed -i 's/a/b/' file.txt": True,
+        }
+        for command, expected in cases.items():
+            with self.subTest(command=command):
+                self.assertEqual(
+                    bash_command_may_modify({"command": command}), expected
+                )
+
     def test_runs_command_and_returns_structured_details(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tool = make_bash_tool(cwd=tmp)

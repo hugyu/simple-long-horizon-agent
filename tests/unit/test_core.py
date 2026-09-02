@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import unittest
+import tempfile
 from typing import Any
+from pathlib import Path
 
 import simple_long_horizon_agent
 from simple_long_horizon_agent import (
@@ -40,6 +42,8 @@ from simple_long_horizon_agent.tools import (
     text_result,
     tool_result_text,
 )
+from simple_long_horizon_agent.run_control import FileOperationLedger
+from simple_long_horizon_agent.tools.edit import make_edit_tool
 
 REAL_PROVIDER = Provider(id="test", api="openai-chat", model="test-model")
 
@@ -144,6 +148,108 @@ def _idle_writer(visible: list[Message]) -> Message:
 
 
 class CoreTest(unittest.TestCase):
+    def test_side_effecting_tool_is_recorded_in_operation_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            target = root / "note.txt"
+            target.write_text("before", encoding="utf-8")
+            ledger = FileOperationLedger(root / "ledger")
+            tool = make_edit_tool(cwd=root)
+            calls = 0
+
+            def writer(visible: list[Message]) -> Message:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    return assistant_message(
+                        [
+                            ToolCallBlock(
+                                "edit-1",
+                                "edit",
+                                {
+                                    "path": "note.txt",
+                                    "old_string": "before",
+                                    "new_string": "after",
+                                },
+                            )
+                        ],
+                        sender="writer",
+                        target="user",
+                        kind="step",
+                    )
+                return assistant_message(
+                    "done", sender="writer", target="user", kind="final"
+                )
+
+            state = State("update note")
+            state.data.update({"run_id": "run-1", "operation_ledger": ledger})
+            state.send("task", "user", "writer", state.task)
+            _run(Agent("writer", writer, tools=(tool,)), state)
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "after")
+            operation = ledger.get(
+                "op-"
+                + simple_long_horizon_agent.operation_args_digest(
+                    {"idempotency_key": "run-1:edit-1"}
+                )[:32]
+            )
+            self.assertEqual(operation.status, "confirmed")
+
+    def test_replayed_side_effecting_tool_requires_reconciliation(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            ledger = FileOperationLedger(root / "ledger")
+            tool = make_edit_tool(cwd=root)
+            record = ledger.create_intent(
+                simple_long_horizon_agent.OperationRecord(
+                    operation_id="op-replay",
+                    run_id="run-1",
+                    tool_call_id="edit-1",
+                    tool_name="edit",
+                    idempotency_key="run-1:edit-1",
+                    args_digest=simple_long_horizon_agent.operation_args_digest(
+                        {"path": "note.txt"}
+                    ),
+                )
+            )
+            ledger.transition(record, "intent_recorded")
+            started = ledger.transition(ledger.get("op-replay"), "started")
+            self.assertEqual(started.status, "started")
+
+            state = State("retry")
+            state.data.update({"run_id": "run-1", "operation_ledger": ledger})
+            state.send("task", "user", "writer", state.task)
+            state.record(
+                assistant_message(
+                    [
+                        ToolCallBlock(
+                            "edit-1",
+                            "edit",
+                            {
+                                "path": "note.txt",
+                                "old_string": "",
+                                "new_string": "x",
+                            },
+                        )
+                    ],
+                    sender="writer",
+                    target="user",
+                    kind="step",
+                )
+            )
+            events = list(
+                __import__(
+                    "simple_long_horizon_agent.core", fromlist=["dispatch_tool_calls"]
+                ).dispatch_tool_calls(state.messages[-1], {"edit": tool}, state)
+            )
+            self.assertTrue(
+                any(
+                    event.kind.value == "tool_execution_end" and event.is_error
+                    for event in events
+                )
+            )
+            self.assertFalse((root / "note.txt").exists())
+
     def test_records_request_and_response_events(self) -> None:
         state = State("write one sentence")
         state.send("task", "user", "writer", state.task)
@@ -427,6 +533,11 @@ class CoreTest(unittest.TestCase):
 
     def test_public_api_surface_is_a_known_set(self) -> None:
         expected = {
+            "CHECKPOINT_SCHEMA",
+            "CheckpointStore",
+            "FileCheckpointStore",
+            "FileOperationLedger",
+            "FileRunStore",
             "AbortFlag",
             "Agent",
             "AgentEndEvent",
@@ -460,9 +571,16 @@ class CoreTest(unittest.TestCase):
             "ModelRequestEvent",
             "ModelResponseEvent",
             "ModelTurn",
+            "LeaseConflict",
+            "OperationConflict",
+            "OperationLedger",
+            "OperationRecord",
             "PriceBook",
             "Role",
             "RunCost",
+            "RunControlError",
+            "RunRecord",
+            "RunStore",
             "RunTrace",
             "SkillMetadata",
             "SkillRoot",
@@ -514,6 +632,8 @@ class CoreTest(unittest.TestCase):
             "run_trace_from_state",
             "run_with_skills",
             "spans_from_events",
+            "state_from_checkpoint",
+            "state_to_checkpoint",
             "runtime_message",
             "task_tool",
             "text_of",
@@ -524,6 +644,8 @@ class CoreTest(unittest.TestCase):
             "tool_results_of",
             "usage_cost",
             "user_message",
+            "VersionConflict",
+            "operation_args_digest",
         }
         self.assertEqual(set(simple_long_horizon_agent.__all__), expected)
         self.assertEqual(len(simple_long_horizon_agent.__all__), len(expected))

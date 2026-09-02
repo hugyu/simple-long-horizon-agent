@@ -60,6 +60,8 @@ MODULE_ZONES = {
     "context_view": CORE,
     "compression": CORE,
     "state": CORE,
+    "checkpoint": CORE,
+    "run_control": CORE,
     "core": CORE,
     "hooks": CORE,
     "llm_agent": CORE,

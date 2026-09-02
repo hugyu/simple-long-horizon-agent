@@ -10,6 +10,26 @@ surface. Import them explicitly, e.g.::
 
 from .core import Agent, run
 from .state import State
+from .checkpoint import (
+    CHECKPOINT_SCHEMA,
+    CheckpointStore,
+    FileCheckpointStore,
+    state_from_checkpoint,
+    state_to_checkpoint,
+)
+from .run_control import (
+    FileOperationLedger,
+    FileRunStore,
+    LeaseConflict,
+    OperationConflict,
+    OperationLedger,
+    OperationRecord,
+    RunControlError,
+    RunRecord,
+    RunStore,
+    VersionConflict,
+    operation_args_digest,
+)
 from .llm_agent import make_llm_agent
 from .messages import make_message
 from .protocols import (
@@ -162,6 +182,22 @@ __all__ = [
     "text_of",
     "tool_results_of",
     "State",
+    "CHECKPOINT_SCHEMA",
+    "CheckpointStore",
+    "FileCheckpointStore",
+    "state_from_checkpoint",
+    "state_to_checkpoint",
+    "FileOperationLedger",
+    "FileRunStore",
+    "LeaseConflict",
+    "OperationConflict",
+    "OperationLedger",
+    "OperationRecord",
+    "RunControlError",
+    "RunRecord",
+    "RunStore",
+    "VersionConflict",
+    "operation_args_digest",
     "CompactControl",
     "CompressionDecision",
     "CompressionStrategy",

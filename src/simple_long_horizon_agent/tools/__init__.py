@@ -61,6 +61,7 @@ class ToolResult:
 
 
 ToolUpdateFn = Callable[[ToolResult], None]
+SideEffectDetector = Callable[[dict[str, Any]], bool]
 # The canonical tool-execute signature called by `core.dispatch_tool_calls`:
 #   (call_id, args, abort, on_update) -> ToolResult
 # Tools that don't stream intermediate updates can ignore `on_update`;
@@ -98,6 +99,8 @@ class AgentTool(Tool):
     execute: ToolExecuteFn
     execution_mode: ToolExecutionMode = "parallel"
     timeout_seconds: float | None = None
+    side_effecting: bool = False
+    side_effect_detector: SideEffectDetector | None = None
 
 
 def text_result(

@@ -33,6 +33,24 @@ from . import (
 
 BASH_TOOL_NAME = "bash"
 
+
+def bash_command_may_modify(args: dict[str, Any]) -> bool:
+    """Return whether a command may change the workspace or its metadata."""
+
+    command = str(args.get("command", ""))
+    lowered = command.casefold()
+    if any(operator in command for operator in (">", "<")):
+        return True
+    return bool(
+        re.search(
+            r"\b(?:rm|mv|cp|mkdir|rmdir|touch|chmod|chown|ln|tee|"
+            r"git\s+(?:apply|checkout|reset|clean|commit|merge|rebase)|"
+            r"sed\s+-i|perl\s+-i)\b",
+            lowered,
+        )
+    )
+
+
 DEFAULT_BASH_TIMEOUT_SECONDS = 30.0
 DEFAULT_BASH_MAX_OUTPUT_CHARS = 4000
 MAX_BASH_TIMEOUT_SECONDS = 300.0
@@ -241,6 +259,7 @@ def make_bash_tool(
         execute=execute,
         execution_mode=execution_mode,
         timeout_seconds=max_timeout_seconds + 1,
+        side_effect_detector=bash_command_may_modify,
     )
 
 

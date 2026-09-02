@@ -24,7 +24,7 @@ the tool result.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, Iterator
+from typing import TYPE_CHECKING, Callable, Iterator, cast
 
 from .compression import maybe_compress_context
 from .context_view import (
@@ -54,6 +54,12 @@ from .protocols import (
     ToolExecutionUpdateEvent,
     TurnEndEvent,
     TurnStartEvent,
+)
+from .run_control import (
+    OperationLedger,
+    OperationRecord,
+    RunControlError,
+    operation_args_digest,
 )
 from .state import State
 from .tools import AbortFlag, AgentTool, ToolResult, ToolUpdateFn, text_result
@@ -356,6 +362,9 @@ def dispatch_tool_calls(
     # (the model self-corrects next turn); the rest go to `effective`.
     effective: list[ToolCallBlock] = []
     results: dict[str, ToolResult] = {}
+    operation_ledger = _operation_ledger(state)
+    operation_records: dict[str, OperationRecord] = {}
+    run_id = str(state.data.get("run_id") or "")
     for tool_call in tool_calls:
         decision, hook_events = fire_hooks(
             hooks,
@@ -379,6 +388,50 @@ def dispatch_tool_calls(
                 )
             )
             continue
+        tool = tools.get(tool_call.name)
+        if (
+            tool is not None
+            and operation_ledger is not None
+            and run_id
+            and _tool_has_side_effects(tool, dict(tool_call.arguments))
+        ):
+            try:
+                operation = _prepare_operation(
+                    operation_ledger,
+                    run_id=run_id,
+                    tool_call=tool_call,
+                    tool=tool,
+                )
+            except RunControlError as exc:
+                results[tool_call.id] = text_result(
+                    f"Tool operation was rejected by the operation ledger: {exc}",
+                    is_error=True,
+                )
+                yield state.record_event(
+                    ToolExecutionEndEvent(
+                        tool_call_id=tool_call.id,
+                        tool_name=tool_call.name,
+                        is_error=True,
+                        terminate=False,
+                    )
+                )
+                continue
+            if operation is None:
+                results[tool_call.id] = text_result(
+                    f"Tool operation {run_id}:{tool_call.id} already exists and "
+                    "needs reconciliation before it can be retried.",
+                    is_error=True,
+                )
+                yield state.record_event(
+                    ToolExecutionEndEvent(
+                        tool_call_id=tool_call.id,
+                        tool_name=tool_call.name,
+                        is_error=True,
+                        terminate=False,
+                    )
+                )
+                continue
+            operation_records[tool_call.id] = operation
         effective.append(tool_call)
 
     sequential = any(
@@ -418,6 +471,16 @@ def dispatch_tool_calls(
                 except Exception as exc:
                     result = text_result(f"{type(exc).__name__}: {exc}", is_error=True)
                 results[call.id] = result
+                operation = operation_records.get(call.id)
+                if operation is not None and operation_ledger is not None:
+                    operation_ledger.transition(
+                        operation,
+                        "confirmed" if not result.is_error else "unknown",
+                        result={
+                            "is_error": result.is_error,
+                            "terminate": result.terminate,
+                        },
+                    )
 
                 for partial in update_buffers[call.id]:
                     yield state.record_event(
@@ -512,3 +575,57 @@ def _execute_one(
             )
     finally:
         pool.shutdown(wait=False)
+
+
+def _operation_ledger(state: State) -> OperationLedger | None:
+    """Read an optional operation ledger from runtime-owned state data."""
+
+    value = state.data.get("operation_ledger")
+    if value is None:
+        return None
+    # Keep the protocol static-only: the runtime accepts any object exposing
+    # the three ledger methods, which also makes small test doubles convenient.
+    if not all(
+        callable(getattr(value, name, None))
+        for name in ("create_intent", "get", "transition")
+    ):
+        raise TypeError("state.data['operation_ledger'] must implement OperationLedger")
+    return cast(OperationLedger, value)
+
+
+def _tool_has_side_effects(tool: AgentTool, arguments: dict[str, object]) -> bool:
+    if tool.side_effect_detector is not None:
+        return tool.side_effect_detector(arguments)
+    return tool.side_effecting
+
+
+def _prepare_operation(
+    ledger: OperationLedger,
+    *,
+    run_id: str,
+    tool_call: ToolCallBlock,
+    tool: AgentTool,
+) -> OperationRecord | None:
+    """Record a side-effecting call and return it only when execution is safe."""
+
+    arguments = dict(tool_call.arguments)
+    idempotency_key = f"{run_id}:{tool_call.id}"
+    operation_id = (
+        "op-" + operation_args_digest({"idempotency_key": idempotency_key})[:32]
+    )
+    record = ledger.create_intent(
+        OperationRecord(
+            operation_id=operation_id,
+            run_id=run_id,
+            tool_call_id=tool_call.id,
+            tool_name=tool.name,
+            idempotency_key=idempotency_key,
+            args_digest=operation_args_digest(arguments),
+        )
+    )
+    if record.status == "created":
+        record = ledger.transition(record, "intent_recorded")
+    if record.status == "intent_recorded":
+        record = ledger.transition(record, "started")
+        return record
+    return None

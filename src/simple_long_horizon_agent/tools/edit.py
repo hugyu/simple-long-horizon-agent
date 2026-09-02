@@ -141,6 +141,7 @@ def make_edit_tool(
         },
         execute=execute,
         execution_mode=execution_mode,
+        side_effecting=True,
     )
 
 

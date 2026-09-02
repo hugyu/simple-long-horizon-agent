@@ -119,7 +119,8 @@ docs/design/
 ├── 10-evaluation-and-operations.md         # 已完成
 ├── 11-configuration-and-extension.md       # 已完成
 ├── 12-system-scenarios-and-completeness.md # 已完成
-└── 15-resume-project-description.md         # 已完成
+├── 15-resume-project-description.md         # 已完成
+└── 16-recoverable-code-task-runtime.md     # 开发设计
 ```
 
 每篇文档都可以独立阅读；首次了解项目建议仍按编号顺序阅读。第 12 篇用于从完整场景反查前面各专题是否闭环。
@@ -258,6 +259,15 @@ docs/design/
 - 单任务、批量、提交后协调和链式运行；
 - Oracle、环境内评分和官方评测器；
 - Runs、Profiles 和可复现实验入口。
+
+### 16. [`16-recoverable-code-task-runtime.md`](16-recoverable-code-task-runtime.md)——可恢复的软件工程长任务 Runtime
+
+这是面向后续开发的场景化设计，依托 Agent 在隔离代码工作区中修复 Bug、运行测试并生成补丁的任务，定义：
+
+- Run、Event Journal、Checkpoint 和 Operation Ledger 的职责边界；
+- 页面关闭、服务器重启和优雅停机时的行为；
+- 租约、fencing token 和工具副作用核对语义；
+- 分阶段实施方案、验收标准和故障注入测试。
 
 ### 11. [`11-configuration-and-extension.md`](11-configuration-and-extension.md)——配置与扩展原则
 
