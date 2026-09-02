@@ -10,12 +10,82 @@ from simple_long_horizon_agent import (
     FileRunStore,
     RecoverableRun,
     RecoverableRunExecutor,
+    RecoveryScanner,
     State,
     assistant_message,
+    FileEventJournal,
 )
+from simple_long_horizon_agent.protocols import TurnStartEvent
+from simple_long_horizon_agent.run_control import RunRecord
 
 
 class RecoverableRuntimeTest(unittest.TestCase):
+    def test_event_journal_is_append_only_and_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            journal = FileEventJournal(Path(raw_root))
+            event = TurnStartEvent(agent="writer", index=0, uuid="event-1")
+            journal.append("run-1", event)
+            journal.append("run-1", event)
+            self.assertEqual(journal.read("run-1"), [event])
+            with self.assertRaises(ValueError):
+                journal.append("run-1", TurnStartEvent(agent="writer", index=2))
+
+    def test_scanner_finds_runnable_and_expired_runs(self) -> None:
+        now = [100.0]
+        with tempfile.TemporaryDirectory() as raw_root:
+            store = FileRunStore(Path(raw_root), clock=lambda: now[0])
+            store.create(RunRecord("runnable", status="runnable"))
+            store.create(
+                RunRecord(
+                    "expired",
+                    status="running",
+                    lease_owner="old",
+                    lease_expires_at=99.0,
+                    fencing_token=1,
+                )
+            )
+            store.create(
+                RunRecord(
+                    "active",
+                    status="running",
+                    lease_owner="old",
+                    lease_expires_at=101.0,
+                    fencing_token=1,
+                )
+            )
+            found = {
+                record.run_id
+                for record in RecoveryScanner(store, clock=lambda: now[0]).runnable()
+            }
+            self.assertEqual(found, {"runnable", "expired"})
+
+    def test_executor_writes_independent_event_journal(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            executor = RecoverableRunExecutor(
+                run_store=FileRunStore(root / "runs"),
+                checkpoint_store=FileCheckpointStore(root / "checkpoints"),
+                event_journal=FileEventJournal(root / "events"),
+                checkpoint_every_events=2,
+            )
+            executor.create("run-journal", State("finish"), worker_id="worker")
+            agent = Agent(
+                "writer",
+                lambda visible: assistant_message(
+                    "done", sender="writer", target="user", kind="final"
+                ),
+            )
+            _, events = executor.execute(
+                RecoverableRun("run-journal", "run-journal", "worker"), agent
+            )
+            list(events)
+            journal_events = FileEventJournal(root / "events").read("run-journal")
+            self.assertTrue(journal_events)
+            self.assertEqual(
+                [event.index for event in journal_events],
+                list(range(len(journal_events))),
+            )
+
     def test_run_is_checkpointed_and_completed(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)

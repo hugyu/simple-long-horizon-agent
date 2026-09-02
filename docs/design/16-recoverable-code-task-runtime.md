@@ -46,8 +46,9 @@ token、Operation Ledger，以及 `RecoverableRunExecutor` 的基本接管流程
 剩余缺口主要是生产化边界：
 
 - 没有后台恢复扫描器和持久化队列，Worker 需要由调用方显式触发接管；
-- Event Journal 仍由 `State.events` 承载，尚未拆成独立的跨进程追加日志；
+- 已增加 `FileEventJournal`，按 Run 追加 JSONL 事件并校验 index 连续性；生产环境仍需共享存储和事务边界；
 - 工作区生命周期、快照和垃圾回收还没有纳入 Run 控制面；
+- `RecoveryScanner` 已能发现 runnable、reconciling 和过期租约 Run，但尚未形成常驻后台调度循环；
 - 文件系统存储还没有替换为带条件更新和事务边界的共享数据库；
 - 优雅停机已覆盖单个执行器的释放语义，但尚未形成多 Worker 的服务级停机编排。
 
@@ -271,6 +272,16 @@ created -> intent_recorded -> started -> confirmed
 - Worker 异常退出时先保存当前状态、释放租约，使新 Worker 能从 Checkpoint 接管。
 
 这仍是单进程文件系统协调器，不包含后台扫描器、数据库事务或通用工作区恢复。
+
+### Phase 2.6：Event Journal 与恢复扫描
+
+状态：已完成最小文件系统实现。
+
+- `FileEventJournal` 为每个 Run 保存独立 JSONL 事件流，追加时校验事件序号连续，重复写入同一事件可安全去重；
+- `RecoveryScanner` 扫描 `RunStore.list()`，返回 runnable、等待核对以及租约已过期的 Run；
+- 扫描与抢租约分离，实际接管仍由 `RecoverableRunExecutor.execute()` 通过条件租约完成。
+
+当前还没有常驻调度线程、跨机器通知或数据库级 Journal。服务器重启后的最小流程是：新 Worker 扫描候选 Run，再使用自己的 Worker ID 调用执行器竞争租约。
 
 ### Phase 3：长任务证据与 Skill 观测
 

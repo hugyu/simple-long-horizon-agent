@@ -9,10 +9,12 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
+import time
 from typing import Callable, cast
 
 from .checkpoint import CheckpointStore
 from .core import Agent, run
+from .event_journal import EventJournal
 from .protocols import AgentEndEvent, Event
 from .run_control import OperationLedger, RunRecord, RunStatus, RunStore
 from .state import State
@@ -40,6 +42,7 @@ class RecoverableRunExecutor:
         run_store: RunStore,
         checkpoint_store: CheckpointStore,
         operation_ledger: OperationLedger | None = None,
+        event_journal: EventJournal | None = None,
         lease_seconds: float = 30.0,
         checkpoint_every_events: int = 10,
     ) -> None:
@@ -50,6 +53,7 @@ class RecoverableRunExecutor:
         self.run_store = run_store
         self.checkpoint_store = checkpoint_store
         self.operation_ledger = operation_ledger
+        self.event_journal = event_journal
         self.lease_seconds = lease_seconds
         self.checkpoint_every_events = checkpoint_every_events
 
@@ -86,7 +90,7 @@ class RecoverableRunExecutor:
             state = agent._default_init_state(task)
         state.data["run_id"] = handle.run_id
         state.data["fencing_token"] = lease.fencing_token
-        self.run_store.transition(lease, "running")
+        lease = self.run_store.transition(lease, "running")
         return state, self._events(
             handle, agent, state, max_turns=max_turns, abort=abort
         )
@@ -104,6 +108,8 @@ class RecoverableRunExecutor:
         last_checkpoint = len(state.events)
         try:
             for event in run(agent, state, max_turns=max_turns, abort=abort):
+                if self.event_journal is not None:
+                    self.event_journal.append(handle.run_id, event)
                 yield event
                 if len(
                     state.events
@@ -141,4 +147,27 @@ class RecoverableRunExecutor:
             raise
 
 
-__all__ = ["RecoverableRun", "RecoverableRunExecutor"]
+class RecoveryScanner:
+    """Find Runs that a new worker may attempt to claim after restart."""
+
+    def __init__(
+        self, run_store: RunStore, *, clock: Callable[[], float] = time.time
+    ) -> None:
+        self.run_store = run_store
+        self._clock = clock
+
+    def runnable(self) -> list[RunRecord]:
+        return [record for record in self.run_store.list() if self._is_runnable(record)]
+
+    def _is_runnable(self, record: RunRecord) -> bool:
+        if record.status in {"runnable", "reconciling", "waiting_external"}:
+            return True
+        if record.status in {"leased", "running"}:
+            return (
+                record.lease_expires_at is not None
+                and record.lease_expires_at <= self._clock()
+            )
+        return False
+
+
+__all__ = ["RecoverableRun", "RecoverableRunExecutor", "RecoveryScanner"]

@@ -9,6 +9,7 @@ fencing, and idempotent tool operation identities.
 from __future__ import annotations
 
 import hashlib
+import builtins
 import json
 import os
 import tempfile
@@ -80,6 +81,8 @@ class RunStore(Protocol):
 
     def get(self, run_id: str) -> RunRecord: ...
 
+    def list(self) -> builtins.list[RunRecord]: ...
+
     def acquire_lease(
         self, run_id: str, worker_id: str, *, lease_seconds: float
     ) -> RunRecord: ...
@@ -134,6 +137,14 @@ class FileRunStore:
         except FileNotFoundError:
             raise FileNotFoundError(f"Run not found: {run_id}") from None
         return _run_from_payload(payload)
+
+    def list(self) -> builtins.list[RunRecord]:
+        self.root.mkdir(parents=True, exist_ok=True)
+        return [
+            self.get(path.stem)
+            for path in sorted(self.root.glob("*.json"))
+            if not path.name.startswith(".") and path.name != "idempotency.json"
+        ]
 
     def acquire_lease(
         self, run_id: str, worker_id: str, *, lease_seconds: float

@@ -63,6 +63,7 @@ MODULE_ZONES = {
     "checkpoint": CORE,
     "run_control": CORE,
     "recoverable_runtime": CORE,
+    "event_journal": CORE,
     "core": CORE,
     "hooks": CORE,
     "llm_agent": CORE,
