@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from simple_long_horizon_agent import (
@@ -18,10 +19,12 @@ from simple_long_horizon_agent import (
     FileEvidenceStore,
     LeaseLostError,
     State,
+    ToolCallBlock,
     assistant_message,
     FileEventJournal,
     merge_checkpoint_with_journal,
 )
+from simple_long_horizon_agent.tools.edit import make_edit_tool
 from simple_long_horizon_agent.reconciliation import EditOperationReconciler
 from simple_long_horizon_agent.run_control import (
     FileOperationLedger,
@@ -362,6 +365,165 @@ class RecoverableRuntimeTest(unittest.TestCase):
             pack = evidence_store.load("evidence-run")
             self.assertEqual(pack.run_id, "evidence-run")
             self.assertEqual(pack.stop_reason, "done")
+
+    def test_fault_injection_recovers_after_edit_before_confirmation(self) -> None:
+        """A crash after the file write must reconcile before the next model turn."""
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            run_store = FileRunStore(root / "runs")
+            ledger = FileOperationLedger(root / "ledger")
+            journal = FileEventJournal(root / "events")
+            checkpoints = FileCheckpointStore(root / "checkpoints")
+            evidence = FileEvidenceStore(root / "evidence")
+            target = root / "note.txt"
+            target.write_text("before", encoding="utf-8")
+
+            edit = make_edit_tool(cwd=root)
+            calls = 0
+
+            def crash_after_write(
+                call_id: str, args: dict[str, object], abort, on_update
+            ):
+                nonlocal calls
+                calls += 1
+                edit.execute(call_id, args, abort, on_update)
+                raise KeyboardInterrupt("simulated worker exit")
+
+            crashing_edit = replace(edit, execute=crash_after_write)
+            first = RecoverableRunExecutor(
+                run_store=run_store,
+                checkpoint_store=checkpoints,
+                operation_ledger=ledger,
+                event_journal=journal,
+                evidence_store=evidence,
+                checkpoint_every_events=1,
+            )
+            first.create("fault-recover", State("edit note"), worker_id="worker-a")
+
+            def issue_edit(visible):
+                del visible
+                return assistant_message(
+                    [
+                        ToolCallBlock(
+                            "edit-1",
+                            "edit",
+                            {
+                                "path": "note.txt",
+                                "old_string": "before",
+                                "new_string": "after",
+                            },
+                        )
+                    ],
+                    sender="writer",
+                    target="user",
+                    kind="step",
+                )
+
+            with self.assertRaises(KeyboardInterrupt):
+                _, events = first.execute(
+                    RecoverableRun("fault-recover", "fault-recover", "worker-a"),
+                    Agent("writer", issue_edit, tools=(crashing_edit,)),
+                )
+                list(events)
+
+            self.assertEqual(calls, 1)
+            self.assertEqual(target.read_text(encoding="utf-8"), "after")
+            self.assertEqual(ledger.list_pending("fault-recover")[0].status, "started")
+            self.assertEqual(run_store.get("fault-recover").status, "runnable")
+
+            second = RecoverableRunExecutor(
+                run_store=run_store,
+                checkpoint_store=checkpoints,
+                operation_ledger=ledger,
+                event_journal=journal,
+                evidence_store=evidence,
+                reconciler_for=lambda operation: EditOperationReconciler(
+                    workspace=root
+                ),
+            )
+            _, resumed = second.execute(
+                RecoverableRun("fault-recover", "fault-recover", "worker-b"),
+                Agent(
+                    "writer",
+                    lambda visible: assistant_message(
+                        "continued", sender="writer", target="user", kind="final"
+                    ),
+                ),
+            )
+            list(resumed)
+
+            self.assertEqual(calls, 1, "recovery must not repeat the edit")
+            self.assertEqual(ledger.list_pending("fault-recover"), [])
+            self.assertEqual(run_store.get("fault-recover").status, "complete")
+            self.assertEqual(evidence.load("fault-recover").stop_reason, "done")
+
+    def test_fault_injection_blocks_when_post_image_cannot_be_confirmed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            run_store = FileRunStore(root / "runs")
+            ledger = FileOperationLedger(root / "ledger")
+            edit = make_edit_tool(cwd=root)
+            target = root / "note.txt"
+            target.write_text("before", encoding="utf-8")
+
+            def crash_after_write(call_id, args, abort, on_update):
+                edit.execute(call_id, args, abort, on_update)
+                raise KeyboardInterrupt("simulated worker exit")
+
+            crashing_edit = replace(edit, execute=crash_after_write)
+            executor = RecoverableRunExecutor(
+                run_store=run_store,
+                checkpoint_store=FileCheckpointStore(root / "checkpoints"),
+                operation_ledger=ledger,
+                event_journal=FileEventJournal(root / "events"),
+            )
+            executor.create("fault-blocked", State("edit note"), worker_id="worker-a")
+
+            def issue_edit(visible):
+                del visible
+                return assistant_message(
+                    [
+                        ToolCallBlock(
+                            "edit-1",
+                            "edit",
+                            {
+                                "path": "note.txt",
+                                "old_string": "before",
+                                "new_string": "after",
+                            },
+                        )
+                    ],
+                    sender="writer",
+                    target="user",
+                    kind="step",
+                )
+
+            with self.assertRaises(KeyboardInterrupt):
+                _, events = executor.execute(
+                    RecoverableRun("fault-blocked", "fault-blocked", "worker-a"),
+                    Agent("writer", issue_edit, tools=(crashing_edit,)),
+                )
+                list(events)
+            target.write_text("tampered", encoding="utf-8")
+
+            recovering = RecoverableRunExecutor(
+                run_store=run_store,
+                checkpoint_store=FileCheckpointStore(root / "checkpoints"),
+                operation_ledger=ledger,
+                reconciler_for=lambda operation: EditOperationReconciler(
+                    workspace=root
+                ),
+            )
+            with self.assertRaisesRegex(Exception, "could not be reconciled"):
+                recovering.execute(
+                    RecoverableRun("fault-blocked", "fault-blocked", "worker-b"),
+                    Agent(
+                        "writer",
+                        lambda visible: (_ for _ in ()).throw(AssertionError()),
+                    ),
+                )
+            self.assertEqual(run_store.get("fault-blocked").status, "blocked")
 
     def test_run_is_checkpointed_and_completed(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:

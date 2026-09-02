@@ -315,12 +315,16 @@ fencing 语义完成、释放或等待接管。
 
 - 已增加 `SkillInvokedEvent`，记录 Skill 内容版本、任务输入摘要、来源和触发方式；
 - 已增加 `EvidencePack` 派生函数，汇总 Skill、工具错误、工作区引用、验证元数据和停止原因；
-- 在 SWE-bench 或 Terminal-Bench 风格任务上加入故障注入运行。
+- 已加入文件系统版故障注入验收：模拟写工具完成文件写入后、Ledger 确认前
+  Worker 退出，再由新 Worker 从 Checkpoint + Journal 接管；
+- 当编辑结果的 post-image 哈希匹配时，恢复会先完成 reconciliation，再继续模型执行，
+  不会重复写入；哈希不匹配或缺少核对器时，Run 会进入 `blocked`，不会盲目重试。
 
 证据包从 `State.events` 和 `State.data` 派生，不参与恢复决策，也不把原始任务或
 Skill 正文重复写入观测数据。`FileEvidenceStore` 已提供原子 JSON 持久化；执行器在
 完成、阻断和异常释放边界写入最新摘要，服务器重启后可直接读取。后续再补充验证
-命令、补丁摘要和人工核对结果等更细粒度字段。
+命令、补丁摘要和人工核对结果等更细粒度字段。对应验收测试位于
+`tests/unit/test_recoverable_runtime.py` 的 `test_fault_injection_*` 用例。
 
 本阶段不要求引入数据库。文件系统实现先验证协议和恢复语义，跨进程部署时再替换为具备条件更新能力的存储后端。
 
