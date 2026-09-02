@@ -582,6 +582,8 @@ class CoreTest(unittest.TestCase):
             "RunRecord",
             "RunStore",
             "RunTrace",
+            "RecoverableRun",
+            "RecoverableRunExecutor",
             "SkillMetadata",
             "SkillRoot",
             "Span",

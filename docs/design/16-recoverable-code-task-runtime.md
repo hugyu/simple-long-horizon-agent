@@ -41,13 +41,15 @@
 | 观测与审计 | JSONL Trace | 增量写入并支持中断后的前缀读取 |
 | 评测环境 | Local/Docker/Remote Backend | 为每个评测 Run 提供独立工作目录或容器工作区 |
 
-主要缺口是：
+当前已经补齐了单机文件系统原型：State Checkpoint、Run 租约与 fencing
+token、Operation Ledger，以及 `RecoverableRunExecutor` 的基本接管流程。
+剩余缺口主要是生产化边界：
 
-- `State` 仍是进程内 Python 对象，没有通用的版本化加载和保存协议；
-- Trace 可以回放和审计，但不能直接作为可继续执行的 Runtime 状态；
-- 工具事件没有持久化操作意图、幂等键和“结果未知”状态；
-- 没有 Run 租约和 fencing token，无法安全地防止两个 Worker 同时推进同一任务；
-- 优雅停机、服务器重启后的接管和恢复尚未形成可测试的状态机。
+- 没有后台恢复扫描器和持久化队列，Worker 需要由调用方显式触发接管；
+- Event Journal 仍由 `State.events` 承载，尚未拆成独立的跨进程追加日志；
+- 工作区生命周期、快照和垃圾回收还没有纳入 Run 控制面；
+- 文件系统存储还没有替换为带条件更新和事务边界的共享数据库；
+- 优雅停机已覆盖单个执行器的释放语义，但尚未形成多 Worker 的服务级停机编排。
 
 因此，本开发项只补齐“单个长任务可恢复执行”所需的最小边界，不引入通用多租户调度系统。
 
@@ -254,6 +256,21 @@ created -> intent_recorded -> started -> confirmed
 - 增加旧 Worker 迟到提交和重复恢复测试。
 
 这里的 `confirmed` 表示工具进程返回了成功结果，`unknown` 表示工具报错或超时、但外部副作用是否已经发生仍不确定。当前实现不宣称跨进程 exactly-once；`reconciled` 仍需要上层根据工作区状态或外部系统查询后显式推进。
+
+### Phase 2.5：可恢复 Run 执行入口
+
+状态：已完成最小文件系统协调器。
+
+`RecoverableRunExecutor` 位于 `recoverable_runtime.py`，负责把现有
+`RunStore`、`CheckpointStore`、`OperationLedger` 和 `core.run()` 串起来：
+
+- 创建 Run 时保存初始 Checkpoint，并写入 `run_id`；
+- 执行前领取租约、写入 `fencing_token`，再进入 `running`；
+- 每 N 个 Event 或 Agent 结束时自动保存 Checkpoint 和进度；
+- Agent 正常结束时将 Run 标记为 `complete`、`aborted` 或可继续的 `runnable`；
+- Worker 异常退出时先保存当前状态、释放租约，使新 Worker 能从 Checkpoint 接管。
+
+这仍是单进程文件系统协调器，不包含后台扫描器、数据库事务或通用工作区恢复。
 
 ### Phase 3：长任务证据与 Skill 观测
 

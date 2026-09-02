@@ -30,6 +30,7 @@ from .run_control import (
     VersionConflict,
     operation_args_digest,
 )
+from .recoverable_runtime import RecoverableRun, RecoverableRunExecutor
 from .llm_agent import make_llm_agent
 from .messages import make_message
 from .protocols import (
@@ -198,6 +199,8 @@ __all__ = [
     "RunStore",
     "VersionConflict",
     "operation_args_digest",
+    "RecoverableRun",
+    "RecoverableRunExecutor",
     "CompactControl",
     "CompressionDecision",
     "CompressionStrategy",

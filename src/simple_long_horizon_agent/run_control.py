@@ -88,7 +88,17 @@ class RunStore(Protocol):
 
     def transition(self, record: RunRecord, status: RunStatus) -> RunRecord: ...
 
-    def release_lease(self, record: RunRecord) -> RunRecord: ...
+    def update_progress(
+        self,
+        record: RunRecord,
+        *,
+        latest_event_index: int | None = None,
+        checkpoint_event_index: int | None = None,
+    ) -> RunRecord: ...
+
+    def release_lease(
+        self, record: RunRecord, *, status: RunStatus = "runnable"
+    ) -> RunRecord: ...
 
 
 class FileRunStore:
@@ -189,14 +199,48 @@ class FileRunStore:
             _atomic_write(path, updated)
             return updated
 
-    def release_lease(self, record: RunRecord) -> RunRecord:
+    def update_progress(
+        self,
+        record: RunRecord,
+        *,
+        latest_event_index: int | None = None,
+        checkpoint_event_index: int | None = None,
+    ) -> RunRecord:
         path = self._path(record.run_id)
         with self._lock(record.run_id):
             current = self.get(record.run_id)
             self._assert_lease(current, record)
             updated = replace(
                 current,
-                status="runnable",
+                version=current.version + 1,
+                latest_event_index=(
+                    current.latest_event_index
+                    if latest_event_index is None
+                    else latest_event_index
+                ),
+                checkpoint_event_index=(
+                    current.checkpoint_event_index
+                    if checkpoint_event_index is None
+                    else checkpoint_event_index
+                ),
+            )
+            _atomic_write(path, updated)
+            return updated
+
+    def release_lease(
+        self, record: RunRecord, *, status: RunStatus = "runnable"
+    ) -> RunRecord:
+        if status not in {"runnable", "complete", "blocked", "aborted", "failed"}:
+            raise ValueError(
+                f"release status must be terminal or runnable, got {status!r}"
+            )
+        path = self._path(record.run_id)
+        with self._lock(record.run_id):
+            current = self.get(record.run_id)
+            self._assert_lease(current, record)
+            updated = replace(
+                current,
+                status=status,
                 version=current.version + 1,
                 lease_owner=None,
                 lease_expires_at=None,
