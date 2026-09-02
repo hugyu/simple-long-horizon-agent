@@ -14,12 +14,29 @@ from simple_long_horizon_agent import (
     State,
     assistant_message,
     FileEventJournal,
+    merge_checkpoint_with_journal,
 )
 from simple_long_horizon_agent.protocols import TurnStartEvent
 from simple_long_horizon_agent.run_control import RunRecord
 
 
 class RecoverableRuntimeTest(unittest.TestCase):
+    def test_checkpoint_journal_merge_replays_only_tail(self) -> None:
+        checkpoint = State("task")
+        checkpoint.send("task", "user", "writer", "task")
+        prefix = list(checkpoint.events)
+        tail = checkpoint.record_event(TurnStartEvent(agent="writer"))
+        merged = merge_checkpoint_with_journal(checkpoint, [*prefix, tail])
+        self.assertEqual(merged.events, [*prefix, tail])
+        self.assertEqual(merged.messages, checkpoint.messages)
+
+    def test_checkpoint_journal_merge_rejects_prefix_conflict(self) -> None:
+        checkpoint = State("task")
+        checkpoint.send("task", "user", "writer", "task")
+        conflicting = TurnStartEvent(agent="other", index=0, uuid="different")
+        with self.assertRaisesRegex(ValueError, "conflicts"):
+            merge_checkpoint_with_journal(checkpoint, [conflicting])
+
     def test_event_journal_is_append_only_and_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             journal = FileEventJournal(Path(raw_root))

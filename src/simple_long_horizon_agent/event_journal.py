@@ -9,12 +9,37 @@ from typing import Any, Protocol
 
 from .checkpoint import _event_from_record, _event_to_record
 from .protocols import Event
+from .state import State
 
 
 class EventJournal(Protocol):
     def append(self, run_id: str, event: Event) -> None: ...
 
     def read(self, run_id: str) -> list[Event]: ...
+
+
+def merge_checkpoint_with_journal(
+    checkpoint: State, journal_events: list[Event]
+) -> State:
+    """Validate a checkpoint prefix and rebuild State with any journal tail."""
+
+    checkpoint_events = checkpoint.events
+    if checkpoint_events and not journal_events:
+        raise ValueError("Event journal is missing the checkpoint event prefix")
+    if len(journal_events) < len(checkpoint_events):
+        raise ValueError("Event journal is shorter than the checkpoint event prefix")
+    for index, expected in enumerate(checkpoint_events):
+        actual = journal_events[index]
+        if actual != expected:
+            raise ValueError(
+                f"Event journal conflicts with checkpoint at event index {index}"
+            )
+    if len(journal_events) == len(checkpoint_events):
+        return checkpoint
+
+    merged = State(task=checkpoint.task, events=list(journal_events))
+    merged.data.update(checkpoint.data)
+    return merged
 
 
 class FileEventJournal:
@@ -79,4 +104,4 @@ class FileEventJournal:
         return events
 
 
-__all__ = ["EventJournal", "FileEventJournal"]
+__all__ = ["EventJournal", "FileEventJournal", "merge_checkpoint_with_journal"]

@@ -14,7 +14,7 @@ from typing import Callable, cast
 
 from .checkpoint import CheckpointStore
 from .core import Agent, run
-from .event_journal import EventJournal
+from .event_journal import EventJournal, merge_checkpoint_with_journal
 from .protocols import AgentEndEvent, Event
 from .run_control import OperationLedger, RunRecord, RunStatus, RunStore
 from .state import State
@@ -66,6 +66,9 @@ class RecoverableRunExecutor:
                 getattr(self.operation_ledger, "root", "")
             )
         self.checkpoint_store.save(run_id, state)
+        if self.event_journal is not None:
+            for event in state.events:
+                self.event_journal.append(run_id, event)
         self.run_store.create(RunRecord(run_id=run_id, status="runnable"))
         return RecoverableRun(run_id=run_id, checkpoint_id=run_id, worker_id=worker_id)
 
@@ -84,6 +87,10 @@ class RecoverableRunExecutor:
             handle.run_id, handle.worker_id, lease_seconds=self.lease_seconds
         )
         state = self.checkpoint_store.load(handle.checkpoint_id)
+        if self.event_journal is not None:
+            state = merge_checkpoint_with_journal(
+                state, self.event_journal.read(handle.run_id)
+            )
         if self.operation_ledger is not None:
             state.data["operation_ledger"] = self.operation_ledger
         if task is not None and not state.messages:

@@ -280,6 +280,7 @@ created -> intent_recorded -> started -> confirmed
 - `FileEventJournal` 为每个 Run 保存独立 JSONL 事件流，追加时校验事件序号连续，重复写入同一事件可安全去重；
 - `RecoveryScanner` 扫描 `RunStore.list()`，返回 runnable、等待核对以及租约已过期的 Run；
 - 扫描与抢租约分离，实际接管仍由 `RecoverableRunExecutor.execute()` 通过条件租约完成。
+- 恢复执行时先加载 Checkpoint，再读取 Journal；Checkpoint 覆盖的事件必须逐条相等，Journal 超出的尾部事件会合并回新的 `State`，前缀冲突或 Journal 缺失则拒绝继续。
 
 当前还没有常驻调度线程、跨机器通知或数据库级 Journal。服务器重启后的最小流程是：新 Worker 扫描候选 Run，再使用自己的 Worker ID 调用执行器竞争租约。
 

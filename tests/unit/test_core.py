@@ -587,6 +587,7 @@ class CoreTest(unittest.TestCase):
             "RecoveryScanner",
             "EventJournal",
             "FileEventJournal",
+            "merge_checkpoint_with_journal",
             "SkillMetadata",
             "SkillRoot",
             "Span",

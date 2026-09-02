@@ -35,7 +35,11 @@ from .recoverable_runtime import (
     RecoverableRunExecutor,
     RecoveryScanner,
 )
-from .event_journal import EventJournal, FileEventJournal
+from .event_journal import (
+    EventJournal,
+    FileEventJournal,
+    merge_checkpoint_with_journal,
+)
 from .llm_agent import make_llm_agent
 from .messages import make_message
 from .protocols import (
@@ -208,6 +212,7 @@ __all__ = [
     "RecoverableRunExecutor",
     "EventJournal",
     "FileEventJournal",
+    "merge_checkpoint_with_journal",
     "RecoveryScanner",
     "CompactControl",
     "CompressionDecision",
