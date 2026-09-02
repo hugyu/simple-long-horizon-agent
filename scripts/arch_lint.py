@@ -65,6 +65,7 @@ MODULE_ZONES = {
     "recoverable_runtime": CORE,
     "event_journal": CORE,
     "reconciliation": CORE,
+    "workspace": CORE,
     "core": CORE,
     "hooks": CORE,
     "llm_agent": CORE,

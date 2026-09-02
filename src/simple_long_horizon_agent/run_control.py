@@ -75,6 +75,7 @@ class RunRecord:
     lease_owner: str | None = None
     lease_expires_at: float | None = None
     fencing_token: int = 0
+    workspace_ref: str | None = None
 
 
 class RunStore(Protocol):
@@ -454,6 +455,9 @@ def _run_from_payload(payload: object) -> RunRecord:
         if values.get("lease_expires_at") is not None
         else None,
         fencing_token=int(values.get("fencing_token", 0)),
+        workspace_ref=str(values["workspace_ref"])
+        if values.get("workspace_ref") is not None
+        else None,
     )
 
 

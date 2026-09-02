@@ -11,6 +11,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 import time
 import threading
+from pathlib import Path
 from typing import Callable, cast
 
 from .checkpoint import CheckpointStore
@@ -28,6 +29,7 @@ from .run_control import (
 )
 from .state import State
 from .tools import AbortFlag
+from .workspace import WorkspaceManager, WorkspaceRef
 
 
 StateFactory = Callable[[], State]
@@ -128,6 +130,7 @@ class RecoverableRunExecutor:
         checkpoint_store: CheckpointStore,
         operation_ledger: OperationLedger | None = None,
         event_journal: EventJournal | None = None,
+        workspace_manager: WorkspaceManager | None = None,
         reconciler_for: Callable[[OperationRecord], OperationReconciler | None]
         | None = None,
         lease_seconds: float = 30.0,
@@ -142,6 +145,7 @@ class RecoverableRunExecutor:
         self.checkpoint_store = checkpoint_store
         self.operation_ledger = operation_ledger
         self.event_journal = event_journal
+        self.workspace_manager = workspace_manager
         self.reconciler_for = reconciler_for
         self.lease_seconds = lease_seconds
         self.lease_renew_interval_seconds = (
@@ -153,10 +157,27 @@ class RecoverableRunExecutor:
             raise ValueError("lease_renew_interval_seconds must be greater than zero")
         self.checkpoint_every_events = checkpoint_every_events
 
-    def create(self, run_id: str, state: State, *, worker_id: str) -> RecoverableRun:
+    def create(
+        self,
+        run_id: str,
+        state: State,
+        *,
+        worker_id: str,
+        workspace_source: str | Path | None = None,
+    ) -> RecoverableRun:
         """Persist the initial state and make a Run available to workers."""
 
         state.data["run_id"] = run_id
+        workspace_ref = state.data.get("workspace_ref")
+        if isinstance(workspace_ref, WorkspaceRef):
+            workspace_ref = workspace_ref.workspace_id
+        if workspace_ref is not None and not isinstance(workspace_ref, str):
+            raise ValueError("state.data['workspace_ref'] must be a string")
+        if self.workspace_manager is not None and workspace_ref is None:
+            workspace_ref = self.workspace_manager.create(
+                run_id, source=workspace_source
+            ).workspace_id
+            state.data["workspace_ref"] = workspace_ref
         if self.operation_ledger is not None:
             state.data["operation_ledger_root"] = str(
                 getattr(self.operation_ledger, "root", "")
@@ -165,7 +186,9 @@ class RecoverableRunExecutor:
         if self.event_journal is not None:
             for event in state.events:
                 self.event_journal.append(run_id, event)
-        self.run_store.create(RunRecord(run_id=run_id, status="runnable"))
+        self.run_store.create(
+            RunRecord(run_id=run_id, status="runnable", workspace_ref=workspace_ref)
+        )
         return RecoverableRun(run_id=run_id, checkpoint_id=run_id, worker_id=worker_id)
 
     def execute(
@@ -183,6 +206,18 @@ class RecoverableRunExecutor:
             handle.run_id, handle.worker_id, lease_seconds=self.lease_seconds
         )
         state = self.checkpoint_store.load(handle.checkpoint_id)
+        if self.workspace_manager is not None and lease.workspace_ref is not None:
+            try:
+                state.data["workspace_ref"] = lease.workspace_ref
+                state.data["workspace_path"] = str(
+                    self.workspace_manager.resolve(lease.workspace_ref)
+                )
+            except (FileNotFoundError, ValueError) as exc:
+                lease = self.run_store.transition(lease, "blocked")
+                self.run_store.release_lease(lease, status="blocked")
+                raise RunControlError(
+                    f"Run {handle.run_id!r} workspace cannot be recovered: {exc}"
+                ) from exc
         if self.event_journal is not None:
             state = merge_checkpoint_with_journal(
                 state, self.event_journal.read(handle.run_id)

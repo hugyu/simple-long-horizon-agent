@@ -48,6 +48,7 @@ from .reconciliation import (
     ReconcileResult,
     reconcile_pending,
 )
+from .workspace import FileWorkspaceManager, WorkspaceManager, WorkspaceRef
 from .llm_agent import make_llm_agent
 from .messages import make_message
 from .protocols import (
@@ -226,6 +227,9 @@ __all__ = [
     "OperationReconciler",
     "ReconcileResult",
     "reconcile_pending",
+    "FileWorkspaceManager",
+    "WorkspaceManager",
+    "WorkspaceRef",
     "RecoveryScanner",
     "RecoveryScheduler",
     "CompactControl",

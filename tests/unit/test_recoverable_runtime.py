@@ -14,6 +14,7 @@ from simple_long_horizon_agent import (
     RecoverableRunExecutor,
     RecoveryScanner,
     RecoveryScheduler,
+    FileWorkspaceManager,
     LeaseLostError,
     State,
     assistant_message,
@@ -336,6 +337,59 @@ class RecoverableRuntimeTest(unittest.TestCase):
             self.assertEqual(
                 executor.checkpoint_store.load("run-1").events, resumed.events
             )
+
+    def test_executor_persists_and_resolves_workspace_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            manager = FileWorkspaceManager(root / "workspaces")
+            executor = RecoverableRunExecutor(
+                run_store=FileRunStore(root / "runs"),
+                checkpoint_store=FileCheckpointStore(root / "checkpoints"),
+                workspace_manager=manager,
+            )
+            state = State("finish")
+            executor.create("workspace-run", state, worker_id="worker")
+            self.assertEqual(
+                executor.run_store.get("workspace-run").workspace_ref,
+                "workspace-run",
+            )
+            resumed, events = executor.execute(
+                RecoverableRun("workspace-run", "workspace-run", "worker"),
+                Agent(
+                    "writer",
+                    lambda visible: assistant_message(
+                        "done", sender="writer", target="user", kind="final"
+                    ),
+                ),
+            )
+            list(events)
+            self.assertEqual(
+                resumed.data["workspace_path"],
+                str(manager.resolve("workspace-run")),
+            )
+
+    def test_missing_workspace_blocks_run_before_model_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            manager = FileWorkspaceManager(root / "workspaces")
+            executor = RecoverableRunExecutor(
+                run_store=FileRunStore(root / "runs"),
+                checkpoint_store=FileCheckpointStore(root / "checkpoints"),
+                workspace_manager=manager,
+            )
+            executor.create("missing-workspace", State("finish"), worker_id="worker")
+            manager.release("missing-workspace", remove=True)
+            with self.assertRaisesRegex(Exception, "workspace cannot be recovered"):
+                executor.execute(
+                    RecoverableRun("missing-workspace", "missing-workspace", "worker"),
+                    Agent(
+                        "writer",
+                        lambda visible: (_ for _ in ()).throw(AssertionError()),
+                    ),
+                )
+            record = executor.run_store.get("missing-workspace")
+            self.assertEqual(record.status, "blocked")
+            self.assertIsNone(record.lease_owner)
 
     def test_exception_checkpoints_and_releases_for_takeover(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
