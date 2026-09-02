@@ -585,6 +585,7 @@ class CoreTest(unittest.TestCase):
             "RecoverableRun",
             "RecoverableRunExecutor",
             "RecoveryScanner",
+            "LeaseLostError",
             "EventJournal",
             "FileEventJournal",
             "merge_checkpoint_with_journal",

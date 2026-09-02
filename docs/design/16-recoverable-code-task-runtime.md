@@ -270,8 +270,9 @@ created -> intent_recorded -> started -> confirmed
 - 每 N 个 Event 或 Agent 结束时自动保存 Checkpoint 和进度；
 - Agent 正常结束时将 Run 标记为 `complete`、`aborted` 或可继续的 `runnable`；
 - Worker 异常退出时先保存当前状态、释放租约，使新 Worker 能从 Checkpoint 接管。
+- 执行期间由心跳线程按租约的约三分之一间隔调用 `renew_lease()`；续租失败或 fencing token 变化时，旧 Worker 停止提交进度并以 `LeaseLostError` 结束。
 
-这仍是单进程文件系统协调器，不包含后台扫描器、数据库事务或通用工作区恢复。
+这仍是单进程文件系统协调器，不包含后台扫描器、数据库事务或通用工作区恢复。心跳只保护 Runtime 的控制面；已经交给外部进程的命令仍需工具自身支持取消或后续核对。
 
 ### Phase 2.6：Event Journal 与恢复扫描
 

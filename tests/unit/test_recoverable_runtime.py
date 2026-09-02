@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -11,6 +13,7 @@ from simple_long_horizon_agent import (
     RecoverableRun,
     RecoverableRunExecutor,
     RecoveryScanner,
+    LeaseLostError,
     State,
     assistant_message,
     FileEventJournal,
@@ -21,6 +24,80 @@ from simple_long_horizon_agent.run_control import RunRecord
 
 
 class RecoverableRuntimeTest(unittest.TestCase):
+    def test_long_run_renews_lease_before_it_expires(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            run_store = FileRunStore(root / "runs")
+            executor = RecoverableRunExecutor(
+                run_store=run_store,
+                checkpoint_store=FileCheckpointStore(root / "checkpoints"),
+                lease_seconds=0.15,
+                lease_renew_interval_seconds=0.03,
+            )
+            executor.create("heartbeat", State("wait"), worker_id="worker-a")
+            ready = threading.Event()
+
+            def generate(visible):
+                ready.set()
+                time.sleep(0.25)
+                return assistant_message(
+                    "done", sender="writer", target="user", kind="final"
+                )
+
+            _, events = executor.execute(
+                RecoverableRun("heartbeat", "heartbeat", "worker-a"),
+                Agent("writer", generate),
+            )
+            list(events)
+            self.assertTrue(ready.is_set())
+            self.assertEqual(run_store.get("heartbeat").status, "complete")
+
+    def test_lost_lease_stops_old_worker_without_releasing_new_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            now = [100.0]
+            run_store = FileRunStore(root / "runs", clock=lambda: now[0])
+            executor = RecoverableRunExecutor(
+                run_store=run_store,
+                checkpoint_store=FileCheckpointStore(root / "checkpoints"),
+                lease_seconds=10,
+                lease_renew_interval_seconds=0.02,
+            )
+            executor.create("fenced", State("task"), worker_id="worker-a")
+            entered = threading.Event()
+            release = threading.Event()
+
+            def generate(visible):
+                entered.set()
+                release.wait(1)
+                return assistant_message(
+                    "done", sender="writer", target="user", kind="final"
+                )
+
+            _, events = executor.execute(
+                RecoverableRun("fenced", "fenced", "worker-a"),
+                Agent("writer", generate),
+            )
+            worker_error: list[BaseException] = []
+
+            def consume() -> None:
+                try:
+                    list(events)
+                except BaseException as exc:
+                    worker_error.append(exc)
+
+            thread = threading.Thread(target=consume)
+            thread.start()
+            self.assertTrue(entered.wait(1))
+            now[0] = 111.0
+            new_lease = run_store.acquire_lease("fenced", "worker-b", lease_seconds=10)
+            self.assertEqual(new_lease.lease_owner, "worker-b")
+            release.set()
+            thread.join(2)
+            self.assertTrue(worker_error)
+            self.assertIsInstance(worker_error[0], LeaseLostError)
+            self.assertEqual(run_store.get("fenced").lease_owner, "worker-b")
+
     def test_checkpoint_journal_merge_replays_only_tail(self) -> None:
         checkpoint = State("task")
         checkpoint.send("task", "user", "writer", "task")

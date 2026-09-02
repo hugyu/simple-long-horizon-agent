@@ -31,6 +31,7 @@ from .run_control import (
     operation_args_digest,
 )
 from .recoverable_runtime import (
+    LeaseLostError,
     RecoverableRun,
     RecoverableRunExecutor,
     RecoveryScanner,
@@ -210,6 +211,7 @@ __all__ = [
     "operation_args_digest",
     "RecoverableRun",
     "RecoverableRunExecutor",
+    "LeaseLostError",
     "EventJournal",
     "FileEventJournal",
     "merge_checkpoint_with_journal",
