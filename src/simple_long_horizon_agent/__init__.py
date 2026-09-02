@@ -55,6 +55,7 @@ from .evidence import (
     FileEvidenceStore,
     evidence_pack_from_state,
 )
+from .service import AgentFactory, RecoverableRuntimeService
 from .llm_agent import make_llm_agent
 from .messages import make_message
 from .protocols import (
@@ -172,6 +173,7 @@ from .skills import (
 __all__ = [
     "Agent",
     "AgentEndEvent",
+    "AgentFactory",
     "AgentStartEvent",
     "ContextCompressionEvent",
     "Event",
@@ -241,6 +243,7 @@ __all__ = [
     "EvidencePack",
     "EvidenceStore",
     "FileEvidenceStore",
+    "RecoverableRuntimeService",
     "evidence_pack_from_state",
     "RecoveryScanner",
     "RecoveryScheduler",

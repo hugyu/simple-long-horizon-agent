@@ -318,6 +318,20 @@ fencing 语义完成、释放或等待接管。
 `tests/unit/test_recoverable_runtime.py` 的 `test_scheduler_recovers_*`、
 `test_two_service_schedulers_*` 和 `test_service_shutdown_*` 用例。
 
+### Phase 2.8：服务入口集成
+
+`RecoverableRuntimeService` 是面向 Web、CLI 或进程管理器的最小服务外观：
+
+- `submit()` 只创建持久化 `runnable` Run，不把任务状态留在页面或服务内存中；
+- `start()` / `stop()` 统一管理常驻恢复扫描和优雅停机；
+- `recover_once()` 适合由外部服务循环或测试显式触发恢复；
+- `agent_for(record)` 在执行器取得租约后重建 Agent，因此 Agent 工厂本身不拥有
+  Run 的推进权。
+
+该模块不绑定 HTTP 框架、模型提供商或队列实现，服务层只负责生命周期和依赖组装，
+租约、Checkpoints、Journal、工具核对和 fencing 仍由现有 Runtime 组件负责。跨进程
+部署时可将同一组接口挂到 HTTP handler 或任务进程入口，并替换底层存储实现。
+
 ### Phase 3：长任务证据与 Skill 观测
 
 - 已增加 `SkillInvokedEvent`，记录 Skill 内容版本、任务输入摘要、来源和触发方式；

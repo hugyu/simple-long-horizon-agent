@@ -13,6 +13,7 @@ from simple_long_horizon_agent import (
     FileRunStore,
     RecoverableRun,
     RecoverableRunExecutor,
+    RecoverableRuntimeService,
     RecoveryScanner,
     RecoveryScheduler,
     FileWorkspaceManager,
@@ -36,6 +37,62 @@ from simple_long_horizon_agent.run_control import RunRecord
 
 
 class RecoverableRuntimeTest(unittest.TestCase):
+    def test_service_submit_and_recover_once_rebuilds_agent_from_record(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            run_store = FileRunStore(root / "runs")
+            executor = RecoverableRunExecutor(
+                run_store=run_store,
+                checkpoint_store=FileCheckpointStore(root / "checkpoints"),
+            )
+            factory_calls: list[str] = []
+
+            def agent_for(record: RunRecord) -> Agent:
+                factory_calls.append(record.run_id)
+                return Agent(
+                    "writer",
+                    lambda visible: assistant_message(
+                        "service complete",
+                        sender="writer",
+                        target="user",
+                        kind="final",
+                    ),
+                )
+
+            service = RecoverableRuntimeService(
+                executor,
+                worker_id="service-a",
+                agent_for=agent_for,
+            )
+            handle = service.submit("service-run", "finish this")
+            self.assertEqual(handle.worker_id, "service-a")
+            self.assertEqual(run_store.get("service-run").status, "runnable")
+            self.assertEqual(service.recover_once(), ["service-run"])
+            self.assertEqual(factory_calls, ["service-run"])
+            self.assertEqual(run_store.get("service-run").status, "complete")
+
+    def test_service_context_manager_stops_background_scheduler(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            executor = RecoverableRunExecutor(
+                run_store=FileRunStore(root / "runs"),
+                checkpoint_store=FileCheckpointStore(root / "checkpoints"),
+            )
+            service = RecoverableRuntimeService(
+                executor,
+                worker_id="service-a",
+                agent_for=lambda record: Agent(
+                    "writer",
+                    lambda visible: assistant_message(
+                        "done", sender="writer", target="user", kind="final"
+                    ),
+                ),
+                poll_interval_seconds=0.01,
+            )
+            with service as running:
+                self.assertTrue(running.running)
+            self.assertFalse(service.running)
+
     def test_edit_reconciler_confirms_existing_post_image(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)

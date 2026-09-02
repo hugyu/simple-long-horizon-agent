@@ -593,6 +593,8 @@ class CoreTest(unittest.TestCase):
             "EvidencePack",
             "EvidenceStore",
             "FileEvidenceStore",
+            "AgentFactory",
+            "RecoverableRuntimeService",
             "evidence_pack_from_state",
             "LeaseLostError",
             "EventJournal",
