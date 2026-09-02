@@ -15,6 +15,7 @@ from simple_long_horizon_agent import (
     RecoveryScanner,
     RecoveryScheduler,
     FileWorkspaceManager,
+    FileEvidenceStore,
     LeaseLostError,
     State,
     assistant_message,
@@ -337,6 +338,30 @@ class RecoverableRuntimeTest(unittest.TestCase):
                 [event.index for event in journal_events],
                 list(range(len(journal_events))),
             )
+
+    def test_executor_persists_evidence_on_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            evidence_store = FileEvidenceStore(root / "evidence")
+            executor = RecoverableRunExecutor(
+                run_store=FileRunStore(root / "runs"),
+                checkpoint_store=FileCheckpointStore(root / "checkpoints"),
+                evidence_store=evidence_store,
+            )
+            executor.create("evidence-run", State("finish"), worker_id="worker")
+            _, events = executor.execute(
+                RecoverableRun("evidence-run", "evidence-run", "worker"),
+                Agent(
+                    "writer",
+                    lambda visible: assistant_message(
+                        "done", sender="writer", target="user", kind="final"
+                    ),
+                ),
+            )
+            list(events)
+            pack = evidence_store.load("evidence-run")
+            self.assertEqual(pack.run_id, "evidence-run")
+            self.assertEqual(pack.stop_reason, "done")
 
     def test_run_is_checkpointed_and_completed(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:

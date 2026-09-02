@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
 
 from simple_long_horizon_agent import (
     AgentEndEvent,
     EvidencePack,
+    FileEvidenceStore,
     SkillInvokedEvent,
     State,
     ToolExecutionEndEvent,
@@ -69,6 +71,17 @@ class EvidencePackTest(unittest.TestCase):
         )
         restored = state_from_checkpoint(state_to_checkpoint(state))
         self.assertEqual(restored.events, state.events)
+
+    def test_file_store_round_trips_and_replaces_atomically(self) -> None:
+        state = State("task")
+        state.data.update({"run_id": "run-1", "workspace_ref": "workspace-1"})
+        pack = evidence_pack_from_state(state)
+        with tempfile.TemporaryDirectory() as raw_root:
+            store = FileEvidenceStore(raw_root)
+            path = store.save("run-1", pack)
+            self.assertTrue(path.is_file())
+            self.assertEqual(store.load("run-1"), pack)
+            self.assertFalse(list(path.parent.glob("*.part")))
 
 
 if __name__ == "__main__":

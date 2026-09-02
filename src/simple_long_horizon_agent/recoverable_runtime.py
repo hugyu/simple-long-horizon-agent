@@ -17,6 +17,7 @@ from typing import Callable, cast
 from .checkpoint import CheckpointStore
 from .core import Agent, run
 from .event_journal import EventJournal, merge_checkpoint_with_journal
+from .evidence import EvidenceStore, evidence_pack_from_state
 from .reconciliation import OperationReconciler, reconcile_pending
 from .protocols import AgentEndEvent, Event
 from .run_control import (
@@ -130,6 +131,7 @@ class RecoverableRunExecutor:
         checkpoint_store: CheckpointStore,
         operation_ledger: OperationLedger | None = None,
         event_journal: EventJournal | None = None,
+        evidence_store: EvidenceStore | None = None,
         workspace_manager: WorkspaceManager | None = None,
         reconciler_for: Callable[[OperationRecord], OperationReconciler | None]
         | None = None,
@@ -145,6 +147,7 @@ class RecoverableRunExecutor:
         self.checkpoint_store = checkpoint_store
         self.operation_ledger = operation_ledger
         self.event_journal = event_journal
+        self.evidence_store = evidence_store
         self.workspace_manager = workspace_manager
         self.reconciler_for = reconciler_for
         self.lease_seconds = lease_seconds
@@ -215,6 +218,7 @@ class RecoverableRunExecutor:
             except (FileNotFoundError, ValueError) as exc:
                 lease = self.run_store.transition(lease, "blocked")
                 self.run_store.release_lease(lease, status="blocked")
+                self._save_evidence(state)
                 raise RunControlError(
                     f"Run {handle.run_id!r} workspace cannot be recovered: {exc}"
                 ) from exc
@@ -240,6 +244,7 @@ class RecoverableRunExecutor:
             if any(outcome.status != "confirmed" for _, outcome in outcomes):
                 lease = self.run_store.transition(lease, "blocked")
                 self.run_store.release_lease(lease, status="blocked")
+                self._save_evidence(state)
                 raise RunControlError(
                     f"Run {handle.run_id!r} has an operation that could not be reconciled"
                 )
@@ -247,6 +252,12 @@ class RecoverableRunExecutor:
         return state, self._events(
             handle, agent, state, max_turns=max_turns, abort=abort
         )
+
+    def _save_evidence(self, state: State) -> None:
+        if self.evidence_store is not None:
+            self.evidence_store.save(
+                str(state.data.get("run_id") or ""), evidence_pack_from_state(state)
+            )
 
     def _events(
         self,
@@ -301,6 +312,7 @@ class RecoverableRunExecutor:
                     )
                     lease = heartbeat.transition(status)
                     heartbeat.release(status=status)
+                    self._save_evidence(state)
                     return
         except LeaseLostError:
             raise
@@ -318,6 +330,7 @@ class RecoverableRunExecutor:
                     else -1,
                 )
                 heartbeat.release(status="runnable")
+                self._save_evidence(state)
             except RunControlError as exc:
                 raise LeaseLostError(
                     "Run lease was lost while handling a worker failure"

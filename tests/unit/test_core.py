@@ -591,6 +591,8 @@ class CoreTest(unittest.TestCase):
             "WorkspaceManager",
             "WorkspaceRef",
             "EvidencePack",
+            "EvidenceStore",
+            "FileEvidenceStore",
             "evidence_pack_from_state",
             "LeaseLostError",
             "EventJournal",
