@@ -18,6 +18,8 @@ Both reduce to the same move and record the same event.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING, Iterator
 
 from ..context_view import (
@@ -28,6 +30,7 @@ from ..context_view import (
 from ..messages import (
     AssistantMessage,
     Message,
+    TextBlock,
     message_tool_calls,
     tool_results_of,
 )
@@ -36,6 +39,23 @@ from ..protocols import ContextCompressionEvent, Event, MessageEvent
 if TYPE_CHECKING:
     from ..core import Agent
     from ..state import State
+
+
+def format_index_ranges(indices: Sequence[int]) -> str:
+    """Render indices as compact sorted ranges: (2, 3, 4, 7) -> '2-4, 7'."""
+    ordered = sorted(set(indices))
+    if not ordered:
+        return ""
+    ranges: list[str] = []
+    start = prev = ordered[0]
+    for index in ordered[1:]:
+        if index == prev + 1:
+            prev = index
+            continue
+        ranges.append(f"{start}-{prev}" if start != prev else f"{start}")
+        start = prev = index
+    ranges.append(f"{start}-{prev}" if start != prev else f"{start}")
+    return ", ".join(ranges)
 
 
 def _active_context_tokens(active: list[tuple[int, Message]]) -> int:
@@ -144,6 +164,16 @@ def _apply_decision(
     compress_set, replacement = _resolve_targets(active, decision)
     if not compress_set:
         return
+
+    if not decision.rewrite:
+        # Cite the final aligned set, not the strategy's proposed indices.
+        citation = (
+            f"[Compressed from transcript messages {format_index_ranges(sorted(compress_set))}; "
+            "use recall with these 0-based indices to read originals.]\n"
+        )
+        replacement = replace(
+            replacement, content=(TextBlock(citation), *replacement.content)
+        )
 
     for event in decision.trace_events:
         yield state.record_event_at(
@@ -319,3 +349,125 @@ def _tool_partners(index: int, by_index: dict[int, Message]) -> list[int]:
             and any(tool_call.id in wanted for tool_call in other_message.tool_calls)
         )
     return partners
+
+
+def enforce_input_budget(
+    agent: "Agent", state: "State", policy: ContextPolicy, *, force: bool = False
+) -> list[Event]:
+    """Bound estimated wire input, including system and tool schemas, before dispatch.
+
+    A conservative UTF-8 byte estimate avoids assuming English token density.
+    Originals remain in the transcript and can be paged with recall.
+    """
+    import json
+    from dataclasses import asdict
+    from ..llm.bridge import messages_to_llm_messages
+    from ..messages import make_message
+    from ..state import StateResourceLimitError
+
+    limit = (
+        policy.max_input_bytes
+        if policy.max_input_bytes is not None
+        else policy.max_input_tokens
+    )
+    if limit is None:
+        return []
+
+    def size() -> int:
+        messages = [m for _, m in state.active_context_items() if policy.is_visible(m)]
+        payload = [
+            asdict(m) for m in messages_to_llm_messages(messages, with_header=False)
+        ]
+        tools = [
+            {"name": t.name, "description": t.description, "parameters": t.parameters}
+            for t in agent.tools
+        ]
+        return len(
+            json.dumps(
+                [agent.system_prompt, tools, payload], ensure_ascii=False, default=str
+            ).encode("utf-8")
+        )
+
+    if size() <= limit and not force:
+        return []
+    events = []
+    # Shrink the largest message first, preserving its role and tool linkage.
+    # Keep both ends: failures and conclusions commonly occur at the end.
+    from ..messages import text_of, ToolResultBlock, TextBlock
+
+    while size() > limit or force:
+        active = [
+            item for item in state.active_context_items() if policy.is_visible(item[1])
+        ]
+        candidates = [
+            (i, m)
+            for i, m in active
+            if m.kind not in {"task", "system", "context"}
+            and not (m.sidecar or {}).get("budget_externalized")
+        ]
+        if not candidates:
+            break
+        index, message = max(candidates, key=lambda item: len(str(item[1].content)))
+
+        def excerpt(text: str) -> str:
+            return text if len(text) <= 512 else text[:256] + "\n…\n" + text[-256:]
+
+        marker = f"[Full original: recall indices=[{index}], offset=0; follow next_offset.]\n"
+        content = []
+        for block in message.content:
+            if isinstance(block, TextBlock):
+                content.append(TextBlock(marker + excerpt(block.text)))
+            elif isinstance(block, ToolResultBlock):
+                content.append(
+                    replace(
+                        block,
+                        content=(TextBlock(marker + excerpt(text_of(block.content))),),
+                    )
+                )
+            else:
+                content.append(block)
+        replacement = replace(
+            message,
+            content=tuple(content),
+            sidecar={**(message.sidecar or {}), "budget_externalized": True},
+        )
+        decision = CompressionDecision(
+            (index,), replacement, rewrite=True, label="input-budget"
+        )
+        events.extend(_apply_decision(agent, state, active, decision))
+        force = False
+    # If many small messages exceed the allowance, fold only the older half.
+    # Keep the latest exchanges and the caller-owned task progress available.
+    while size() > limit:
+        active = [
+            item for item in state.active_context_items() if policy.is_visible(item[1])
+        ]
+        candidates = [
+            (i, m) for i, m in active if m.kind not in {"task", "system", "context"}
+        ]
+        if len(candidates) <= 4:
+            break
+        indices = tuple(i for i, _ in candidates[: max(1, len(candidates) // 2)])
+        progress = json.dumps(state.data.get("task_progress", {}), ensure_ascii=False)
+        decision = CompressionDecision(
+            indices,
+            make_message(
+                "user",
+                "Older history externalized. Saved progress: "
+                + progress
+                + "\nUse paged recall for evidence.",
+                kind="summary",
+                sender="runtime",
+                target=agent.name,
+            ),
+            label="input-budget",
+        )
+        before = size()
+        events.extend(_apply_decision(agent, state, active, decision))
+        if size() >= before:
+            break
+    if size() > limit:
+        raise StateResourceLimitError(
+            "Pinned instructions, tool schemas or recall citations exceed the input byte allowance; reduce fixed input or increase the configured budget"
+        )
+    return events

@@ -37,6 +37,233 @@ from simple_long_horizon_agent.run_control import RunRecord
 
 
 class RecoverableRuntimeTest(unittest.TestCase):
+    def test_rejected_tool_identity_does_not_lose_valid_run_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "note").write_text("before")
+            executor = RecoverableRunExecutor(
+                run_store=FileRunStore(root / "runs"),
+                checkpoint_store=FileCheckpointStore(root / "checkpoints"),
+                operation_ledger=FileOperationLedger(root / "operations"),
+            )
+            calls = 0
+
+            def generate(visible):
+                nonlocal calls
+                calls += 1
+                if calls == 3:
+                    return assistant_message("done", sender="worker", kind="final")
+                return assistant_message(
+                    [
+                        ToolCallBlock(
+                            "same-id",
+                            "edit",
+                            {
+                                "path": "note",
+                                "old_string": "before" if calls == 1 else "after",
+                                "new_string": "after" if calls == 1 else "wrong",
+                            },
+                        )
+                    ],
+                    sender="worker",
+                    kind="step",
+                )
+
+            handle = executor.create("identity", State("edit"), worker_id="worker")
+            _, events = executor.execute(
+                handle, Agent("worker", generate, tools=(make_edit_tool(cwd=root),))
+            )
+            list(events)
+            self.assertEqual(calls, 3)
+            self.assertEqual((root / "note").read_text(), "after")
+            self.assertEqual(executor.run_store.get("identity").status, "finished")
+
+    def test_recovery_after_agent_end_repeats_only_verifier(self) -> None:
+        from simple_long_horizon_agent.completion import CompletionResult
+        from simple_long_horizon_agent.protocols import AgentEndEvent
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executor = RecoverableRunExecutor(
+                run_store=FileRunStore(root / "runs"),
+                checkpoint_store=FileCheckpointStore(root / "checkpoints"),
+                event_journal=FileEventJournal(root / "journal"),
+                completion_check=lambda state: CompletionResult(True, reason="passed"),
+            )
+            calls = []
+
+            def generate(visible):
+                calls.append(visible)
+                return assistant_message("done", sender="worker", kind="final")
+
+            handle = executor.create("ended", State("task"), worker_id="first")
+            agent = Agent("worker", generate)
+            _, events = executor.execute(handle, agent)
+            for event in events:
+                if isinstance(event, AgentEndEvent):
+                    break
+            events.close()
+            _, resumed = executor.execute(handle, agent)
+            list(resumed)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(executor.run_store.get("ended").status, "complete")
+
+    def test_delayed_old_iterator_cannot_borrow_new_worker_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            now = [0.0]
+            store = FileRunStore(root / "runs", clock=lambda: now[0])
+            executor = RecoverableRunExecutor(
+                run_store=store,
+                checkpoint_store=FileCheckpointStore(root / "checkpoints"),
+            )
+            agent = Agent(
+                "worker",
+                lambda visible: assistant_message(
+                    "done", sender="worker", kind="final"
+                ),
+            )
+            handle = executor.create("delayed", State("task"), worker_id="old")
+            _, old_events = executor.execute(handle, agent)
+            now[0] = 100.0
+            _, new_events = executor.execute(replace(handle, worker_id="new"), agent)
+            with self.assertRaises(LeaseLostError):
+                list(old_events)
+            self.assertEqual(store.get("delayed").lease_owner, "new")
+            list(new_events)
+            self.assertEqual(store.get("delayed").status, "finished")
+
+    def test_unverified_turn_limit_continues_instead_of_replaying_old_end(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executor = RecoverableRunExecutor(
+                run_store=FileRunStore(root / "runs"),
+                checkpoint_store=FileCheckpointStore(root / "checkpoints"),
+            )
+            handle = executor.create("limited", State("task"), worker_id="worker")
+            calls = []
+
+            def generate(visible):
+                calls.append(visible)
+                return assistant_message("step", sender="worker", kind="step")
+
+            agent = Agent("worker", generate)
+            for _ in range(3):
+                _, events = executor.execute(handle, agent, max_turns=1)
+                list(events)
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(
+                executor.run_store.get("limited").status, "budget_exhausted"
+            )
+
+    def test_missing_verifier_blocks_before_calling_model(self) -> None:
+        from simple_long_horizon_agent.completion import CompletionResult
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = FileRunStore(root / "runs")
+            checkpoints = FileCheckpointStore(root / "checkpoints")
+            first = RecoverableRunExecutor(
+                run_store=store,
+                checkpoint_store=checkpoints,
+                completion_check=lambda state: CompletionResult(True),
+            )
+            handle = first.create("required", State("task"), worker_id="first")
+            second = RecoverableRunExecutor(
+                run_store=store, checkpoint_store=checkpoints
+            )
+
+            def generate(visible):
+                self.fail("model must not run when the required verifier is missing")
+
+            _, events = second.execute(handle, Agent("worker", generate))
+            list(events)
+            self.assertEqual(store.get("required").status, "blocked")
+
+    def test_failed_verification_survives_service_restart_and_then_passes(self) -> None:
+        from simple_long_horizon_agent.completion import CompletionResult
+        from simple_long_horizon_agent.messages import text_of
+        from simple_long_horizon_agent.protocols import GoalStatusEvent
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repaired = root / "repaired"
+            store = FileRunStore(root / "runs")
+            checkpoints = FileCheckpointStore(root / "checkpoints")
+            journal = FileEventJournal(root / "journal")
+            seen = []
+
+            def generate(visible):
+                text = "\n".join(text_of(message.content) for message in visible)
+                seen.append(text)
+                if "missing repair" in text:
+                    repaired.touch()
+                return assistant_message("done", sender="worker", kind="final")
+
+            def service(worker):
+                return RecoverableRuntimeService(
+                    RecoverableRunExecutor(
+                        run_store=store,
+                        checkpoint_store=checkpoints,
+                        event_journal=journal,
+                        completion_check=lambda state: CompletionResult(
+                            done=repaired.exists(), reason="missing repair"
+                        ),
+                        max_attempts=2,
+                    ),
+                    worker_id=worker,
+                    agent_for=lambda record: Agent("worker", generate),
+                )
+
+            first = service("first")
+            first.submit("verified", "Repair TASK-31415")
+            first.recover_once()
+            self.assertEqual(first.scheduler.last_errors, [])
+            self.assertEqual(store.get("verified").status, "runnable")
+            second = service("second")
+            second.recover_once()
+            self.assertEqual(second.scheduler.last_errors, [])
+            self.assertEqual(store.get("verified").status, "complete")
+            self.assertIn("TASK-31415", seen[0])
+            self.assertIn("missing repair", seen[1])
+            goals = [
+                e for e in journal.read("verified") if isinstance(e, GoalStatusEvent)
+            ]
+            self.assertEqual([e.status for e in goals], ["active", "complete"])
+            self.assertTrue(all(e.objective == "Repair TASK-31415" for e in goals))
+            self.assertEqual([e.turns_used for e in goals], [1, 2])
+
+    def test_verification_budget_survives_restart(self) -> None:
+        from simple_long_horizon_agent.completion import CompletionResult
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = FileRunStore(root / "runs")
+            for attempt in range(2):
+                service = RecoverableRuntimeService(
+                    RecoverableRunExecutor(
+                        run_store=store,
+                        checkpoint_store=FileCheckpointStore(root / "checkpoints"),
+                        completion_check=lambda state: CompletionResult(
+                            False, reason="tests fail"
+                        ),
+                        max_attempts=2 if attempt == 0 else 100,
+                    ),
+                    worker_id=str(attempt),
+                    agent_for=lambda record: Agent(
+                        "worker",
+                        lambda visible: assistant_message(
+                            "done", sender="worker", kind="final"
+                        ),
+                    ),
+                )
+                if attempt == 0:
+                    service.submit("budget", "repair")
+                service.recover_once()
+                self.assertEqual(service.scheduler.last_errors, [])
+            self.assertEqual(store.get("budget").status, "budget_exhausted")
+            self.assertEqual(RecoveryScanner(store).runnable(), [])
+
     def test_service_submit_and_recover_once_rebuilds_agent_from_record(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
@@ -46,18 +273,21 @@ class RecoverableRuntimeTest(unittest.TestCase):
                 checkpoint_store=FileCheckpointStore(root / "checkpoints"),
             )
             factory_calls: list[str] = []
+            observed_tasks: list[str] = []
 
             def agent_for(record: RunRecord) -> Agent:
                 factory_calls.append(record.run_id)
-                return Agent(
-                    "writer",
-                    lambda visible: assistant_message(
+
+                def generate(visible):
+                    observed_tasks.extend(str(message.content) for message in visible)
+                    return assistant_message(
                         "service complete",
                         sender="writer",
                         target="user",
                         kind="final",
-                    ),
-                )
+                    )
+
+                return Agent("writer", generate)
 
             service = RecoverableRuntimeService(
                 executor,
@@ -69,7 +299,8 @@ class RecoverableRuntimeTest(unittest.TestCase):
             self.assertEqual(run_store.get("service-run").status, "runnable")
             self.assertEqual(service.recover_once(), ["service-run"])
             self.assertEqual(factory_calls, ["service-run"])
-            self.assertEqual(run_store.get("service-run").status, "complete")
+            self.assertTrue(any("finish this" in text for text in observed_tasks))
+            self.assertEqual(run_store.get("service-run").status, "finished")
 
     def test_service_context_manager_stops_background_scheduler(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
@@ -164,7 +395,7 @@ class RecoverableRuntimeTest(unittest.TestCase):
             )
             list(events)
             self.assertEqual(ledger.get("op-edit").status, "confirmed")
-            self.assertEqual(run_store.get("recover").status, "complete")
+            self.assertEqual(run_store.get("recover").status, "finished")
 
     def test_long_run_renews_lease_before_it_expires(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
@@ -192,7 +423,7 @@ class RecoverableRuntimeTest(unittest.TestCase):
             )
             list(events)
             self.assertTrue(ready.is_set())
-            self.assertEqual(run_store.get("heartbeat").status, "complete")
+            self.assertEqual(run_store.get("heartbeat").status, "finished")
 
     def test_lost_lease_stops_old_worker_without_releasing_new_lease(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
@@ -415,7 +646,7 @@ class RecoverableRuntimeTest(unittest.TestCase):
             )
             self.assertEqual(set(resumed), {"restart-a", "restart-b", "restart-c"})
             self.assertTrue(
-                all(run_store.get(run_id).status == "complete" for run_id in resumed)
+                all(run_store.get(run_id).status == "finished" for run_id in resumed)
             )
 
     def test_two_service_schedulers_race_but_only_one_worker_advances_each_run(
@@ -488,7 +719,7 @@ class RecoverableRuntimeTest(unittest.TestCase):
             self.assertTrue(all(not thread.is_alive() for thread in threads))
             self.assertEqual(generated, {"race-a": 1, "race-b": 1})
             self.assertTrue(
-                all(run_store.get(run_id).status == "complete" for run_id in generated)
+                all(run_store.get(run_id).status == "finished" for run_id in generated)
             )
             self.assertTrue(
                 errors, "the losing scheduler should report lease conflicts"
@@ -536,7 +767,7 @@ class RecoverableRuntimeTest(unittest.TestCase):
             self.assertFalse(scheduler.stop(join_timeout=0.01))
             release.set()
             self.assertTrue(scheduler.stop(join_timeout=1))
-            self.assertEqual(run_store.get("drain-a").status, "complete")
+            self.assertEqual(run_store.get("drain-a").status, "finished")
             self.assertEqual(run_store.get("drain-b").status, "runnable")
 
             restarted = RecoveryScheduler(
@@ -555,7 +786,7 @@ class RecoverableRuntimeTest(unittest.TestCase):
                 ),
             )
             self.assertEqual(restarted.run_once(), ["drain-b"])
-            self.assertEqual(run_store.get("drain-b").status, "complete")
+            self.assertEqual(run_store.get("drain-b").status, "finished")
 
     def test_executor_writes_independent_event_journal(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
@@ -697,7 +928,7 @@ class RecoverableRuntimeTest(unittest.TestCase):
 
             self.assertEqual(calls, 1, "recovery must not repeat the edit")
             self.assertEqual(ledger.list_pending("fault-recover"), [])
-            self.assertEqual(run_store.get("fault-recover").status, "complete")
+            self.assertEqual(run_store.get("fault-recover").status, "finished")
             self.assertEqual(evidence.load("fault-recover").stop_reason, "done")
 
     def test_fault_injection_blocks_when_post_image_cannot_be_confirmed(self) -> None:
@@ -789,7 +1020,7 @@ class RecoverableRuntimeTest(unittest.TestCase):
             list(events)
 
             self.assertTrue(resumed.events)
-            self.assertEqual(executor.run_store.get("run-1").status, "complete")
+            self.assertEqual(executor.run_store.get("run-1").status, "finished")
             self.assertEqual(
                 executor.checkpoint_store.load("run-1").events, resumed.events
             )
@@ -877,7 +1108,7 @@ class RecoverableRuntimeTest(unittest.TestCase):
             )
             _, resumed_events = executor.execute(takeover, safe_agent)
             list(resumed_events)
-            self.assertEqual(run_store.get("run-2").status, "complete")
+            self.assertEqual(run_store.get("run-2").status, "finished")
 
 
 if __name__ == "__main__":

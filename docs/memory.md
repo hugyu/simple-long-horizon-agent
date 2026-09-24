@@ -111,3 +111,65 @@ directory and sets them. Memory itself never imports Docker or evals — assembl
 code passes it a local path. A suite's optional `memory_artifacts(...)` hook
 supplies that run's durable products, captured inside `memory.finish` at
 `SESSION_END` while the workspace is still intact.
+
+## Updating and retiring advice
+
+New or changed lessons should be top-level Markdown bullets with indented
+`Scope`, `Source`, `Verified`, `Status` (`active` or `needs-verification`), and
+`Recheck` fields. The distiller is instructed to replace advice contradicted by
+explicit user corrections or current workspace evidence, and to leave unexplained
+failures uncertain. Age and commit changes trigger rechecking, not automatic expiry.
+This semantic policy is model-driven, not a proof of correctness.
+
+After an accepted rewrite, `MEMORY.provenance.json` records each bullet's namespace,
+source run and observed revision. Pass a known revision in
+`MemoryContext(data={"memory_revision": "abc123"}, ...)`; unknown stays unknown.
+Unchanged bullets retain their provenance; preexisting untracked bullets are marked
+`legacy:unknown`. These are provenance records, not verified truth. The stored
+handbook hash permits detecting manual changes; runtime does not automatically
+revalidate them. Missing/pruned evidence and scope mismatches require fresh checks.
+
+Explicit host maintenance uses the same root lock as distillation:
+
+```python
+from simple_long_horizon_agent.memory import FilesystemMemory
+
+memory = FilesystemMemory(root="/path/to/memory")
+memory.invalidate(
+    "project",
+    lesson="- Old advice.\n  Scope: project",  # exact bullet, including metadata
+    reason="Current project evidence contradicts this advice",
+)
+memory.reset("project", reason="Project migrated; relearn from current evidence")
+```
+
+`invalidate` removes one exact top-level bullet and its indented metadata; a missing
+entry raises `ValueError`. `reset` explicitly clears the handbook, bypassing only
+the automatic rewrite's erasure guard. Neither operation deletes run evidence.
+Both replace the navigation summary, keep one `MEMORY.previous.md` backup, and
+record reasons/retired bullets in `MEMORY.control.json`. Readers must consult that
+control file first; it overrides old advice in handbooks, backups and run summaries.
+The distiller also receives it and must not revive retired advice from historical
+runs. A new namespace is appropriate for an unrelated environment.
+
+The control record is written first so interrupted maintenance still leaves an
+invalidation barrier. Writes are atomic per file, not a transaction across files;
+retry maintenance after an I/O failure. Existing agents may already hold old
+context, so start a fresh session after maintenance. No automatic TTL or semantic
+conflict classifier is implemented. The host rejects rewrites containing a retired
+bullet's original first-line advice, even if its metadata changed; paraphrases
+still rely on the model policy and workspace revalidation. Retirements are not
+silently pruned; their record is capped at 100,000 characters and a full record
+requires a new namespace. Run evidence remains subject to normal retention limits.
+
+Regression coverage: `tests/unit/test_memory_maintenance.py` exercises corrections,
+provenance retention, invalidation, reset, resurrection rejection and interrupted
+maintenance. `tests/unit/test_memory.py` covers root-lock serialization and the
+existing bounded storage and rewrite guards.
+
+
+Recall can page through a compressed message with a character `offset`; follow
+its `next_offset` marker to retrieve details beyond the first page. The long-task
+entry also enforces a pre-dispatch input allowance after ordinary compression.
+See [runtime recovery](runtime-recovery.md#long-task-context-and-command-recovery)
+for fixed-input limits and configuration.

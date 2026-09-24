@@ -10,7 +10,12 @@ from pathlib import Path
 from typing import Protocol
 from typing import Any
 
-from .protocols import AgentEndEvent, SkillInvokedEvent, ToolExecutionEndEvent
+from .protocols import (
+    AgentEndEvent,
+    GoalStatusEvent,
+    SkillInvokedEvent,
+    ToolExecutionEndEvent,
+)
 
 
 @dataclass(frozen=True)
@@ -134,6 +139,15 @@ def evidence_pack_from_state(state: Any) -> EvidencePack:
         event for event in state.events if isinstance(event, ToolExecutionEndEvent)
     ]
     end_events = [event for event in state.events if isinstance(event, AgentEndEvent)]
+    goals = [event for event in state.events if isinstance(event, GoalStatusEvent)]
+    verification = state.data.get("verification")
+    if goals:
+        verification = {
+            "status": goals[-1].status,
+            "reason": goals[-1].reason,
+            "attempts": goals[-1].turns_used,
+            "details": verification,
+        }
     return EvidencePack(
         run_id=str(state.data.get("run_id") or ""),
         workspace_ref=(
@@ -144,7 +158,7 @@ def evidence_pack_from_state(state: Any) -> EvidencePack:
         skills=skills,
         tool_calls=len(tool_end_events),
         tool_errors=sum(1 for event in tool_end_events if event.is_error),
-        verification=state.data.get("verification"),
+        verification=verification,
         stop_reason=end_events[-1].reason if end_events else None,
     )
 

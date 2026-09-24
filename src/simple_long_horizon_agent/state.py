@@ -5,8 +5,10 @@ from __future__ import annotations
 import dataclasses
 import time
 import uuid as _uuid
+from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
-from typing import Any, TypeVar
+from typing import Any, Protocol, TypeVar, cast
 
 from .messages import (
     AgentName,
@@ -32,11 +34,30 @@ def _new_uuid() -> str:
     return str(_uuid.uuid4())
 
 
+class StateHistory(Protocol):
+    """Optional durable history; append commits the event and projection together."""
+
+    @property
+    def events(self) -> Sequence[Event]: ...
+
+    @property
+    def messages(self) -> Sequence[Message]: ...
+
+    @property
+    def active_context_indices(self) -> list[int]: ...
+
+    def append(self, event: Event) -> None: ...
+
+
+class StateResourceLimitError(RuntimeError):
+    """A state budget was reached; the rejected event was not committed."""
+
+
 @dataclass
 class StateSnapshot:
     """Derived cache for fast access to the current event projection."""
 
-    messages: list[Message] = field(default_factory=list)
+    messages: Sequence[Message] = field(default_factory=list)
     # The active context: indices into `messages` that survive compression
     # and feed the next model step. `None` means no compression has run yet,
     # so all messages are active. (A later visibility filter in
@@ -57,7 +78,9 @@ class StateSnapshot:
     def apply(self, event: Event) -> None:
         if isinstance(event, MessageEvent):
             message_index = len(self.messages)
-            self.messages.append(event.message)
+            if not isinstance(self.messages, list):
+                raise TypeError("Durable snapshots are updated by their history store")
+            cast(list[Message], self.messages).append(event.message)
             if self.active_context_indices is not None:
                 self.active_context_indices.append(message_index)
             return
@@ -88,7 +111,7 @@ class StateSnapshot:
 class State:
     # `str` or a sequence of content blocks (multimodal task: text + images).
     task: ContentInput
-    events: list[Event] = field(default_factory=list)
+    events: Sequence[Event] = field(default_factory=list)
     snapshot: StateSnapshot = field(default_factory=StateSnapshot)
     # Open scratchpad for harnesses/experiments to hang run-level metadata
     # on a State (e.g. the SWE-bench runner stashes `model_patch`,
@@ -98,8 +121,17 @@ class State:
     data: dict[str, Any] = field(default_factory=dict)
     _monotonic_origin: float = field(default_factory=time.monotonic, repr=False)
 
+    history: StateHistory | None = field(default=None, repr=False)
+    write_guard: Callable[[], AbstractContextManager[None]] = field(
+        default=nullcontext, repr=False
+    )
+
     def __post_init__(self) -> None:
-        if self.events and not self.snapshot.messages:
+        if self.history is not None:
+            if self.events or self.snapshot.messages:
+                raise ValueError("Pass history or in-memory events, not both")
+            self.rebuild_snapshot()
+        elif self.events and not self.snapshot.messages:
             self.rebuild_snapshot()
 
     def _elapsed(self) -> float:
@@ -111,12 +143,17 @@ class State:
         return self._elapsed()
 
     @property
-    def messages(self) -> list[Message]:
+    def messages(self) -> Sequence[Message]:
         # A fresh list each call, so a concurrent reader — e.g. the `recall`
         # tool running in the parallel tool pool — gets a length-stable
         # snapshot to index into. A shallow copy suffices: `Message`s are
         # frozen and never mutated after recording, and `list()` is atomic.
-        return list(self.snapshot.messages)
+        messages = self.snapshot.messages
+        return (
+            list(cast(list[Message], messages))
+            if isinstance(messages, list)
+            else messages
+        )
 
     def active_context_items(self) -> list[tuple[int, Message]]:
         return self.snapshot.active_context_items()
@@ -136,8 +173,7 @@ class State:
         stamped = dataclasses.replace(
             event, index=len(self.events), elapsed=self._elapsed(), uuid=_new_uuid()
         )
-        self.events.append(stamped)
-        self.snapshot.apply(stamped)
+        self._append(stamped)
         return stamped
 
     def record_event_at(self, event: EventT, *, elapsed: float) -> EventT:
@@ -151,15 +187,32 @@ class State:
         stamped = dataclasses.replace(
             event, index=len(self.events), elapsed=max(0.0, elapsed), uuid=_new_uuid()
         )
-        self.events.append(stamped)
-        self.snapshot.apply(stamped)
+        self._append(stamped)
         return stamped
 
     def record(self, message: Message) -> MessageEvent:
         """Convenience for the common `MessageEvent` path."""
         return self.record_event(MessageEvent(message=message))
 
+    def _append(self, event: Event) -> None:
+        with self.write_guard():
+            if self.history is not None:
+                self.history.append(event)
+                self.rebuild_snapshot()
+            else:
+                if not isinstance(self.events, list):
+                    raise TypeError("In-memory State requires a mutable event list")
+                cast(list[Event], self.events).append(event)
+                self.snapshot.apply(event)
+
     def rebuild_snapshot(self) -> StateSnapshot:
+        if self.history is not None:
+            self.events = self.history.events
+            self.snapshot = StateSnapshot(
+                messages=self.history.messages,
+                active_context_indices=self.history.active_context_indices,
+            )
+            return self.snapshot
         snapshot = StateSnapshot()
         for event in self.events:
             snapshot.apply(event)

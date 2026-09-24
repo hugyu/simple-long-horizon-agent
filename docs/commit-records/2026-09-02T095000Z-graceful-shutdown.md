@@ -17,7 +17,8 @@ drained within the caller's timeout.
   iteration and boolean drain result from `RecoveryScheduler.stop()`.
 - `tests/unit/test_recoverable_runtime.py`: cover stopping while a callback is
   active and verify that later candidates are not started.
-- `docs/design/16-recoverable-code-task-runtime.md`: document service shutdown
+- Runtime design notes (subsequently removed during documentation cleanup):
+  document service shutdown
   behavior and timeout semantics.
 
 ## Verification

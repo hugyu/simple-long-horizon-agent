@@ -21,7 +21,8 @@ uses the merge path before continuing an acquired Run.
   the merge helper and update the public API contract.
 - `tests/unit/test_recoverable_runtime.py`: cover tail replay and prefix
   conflict rejection.
-- `docs/design/16-recoverable-code-task-runtime.md`: document the recovery
+- Runtime design notes (subsequently removed during documentation cleanup):
+  document the recovery
   merge order and consistency rule.
 
 ## Verification

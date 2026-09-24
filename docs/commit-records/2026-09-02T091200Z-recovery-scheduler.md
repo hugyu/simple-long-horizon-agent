@@ -19,7 +19,8 @@ the existing lease-fenced executor.
 - `tests/unit/test_recoverable_runtime.py`: cover candidate processing,
   per-Run error isolation, and background shutdown.
 - `tests/unit/test_core.py`: update the public API contract.
-- `docs/design/16-recoverable-code-task-runtime.md`: document the scheduler
+- Runtime design notes (subsequently removed during documentation cleanup):
+  document the scheduler
   boundary, restart behavior, and service shutdown limitations.
 
 ## Verification

@@ -536,6 +536,9 @@ class CoreTest(unittest.TestCase):
             "CHECKPOINT_SCHEMA",
             "CheckpointStore",
             "FileCheckpointStore",
+            "SqliteCheckpointStore",
+            "StateLimits",
+            "StateResourceLimitError",
             "FileOperationLedger",
             "FileRunStore",
             "AbortFlag",
@@ -764,7 +767,8 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(len(summaries), 1)
         self.assertEqual(summaries[0].role, "user")
         summary_text = simple_long_horizon_agent.text_of(summaries[0].content)
-        self.assertTrue(summary_text.startswith("[This session continues"))
+        self.assertTrue(summary_text.startswith("[Compressed from transcript messages"))
+        self.assertIn("[This session continues", summary_text)
         self.assertIn("compressed old context", summary_text)
         self.assertEqual(
             summaries[0].sidecar["compression"]["model"],
@@ -816,7 +820,9 @@ class CoreTest(unittest.TestCase):
         writer_texts = captured["writer_visible_texts"]
         self.assertEqual(len(writer_texts), 3)
         self.assertEqual(writer_texts[0], "compress context")
-        self.assertTrue(writer_texts[1].startswith("[This session continues"))
+        self.assertTrue(
+            writer_texts[1].startswith("[Compressed from transcript messages 1;")
+        )
         self.assertEqual(writer_texts[2], "recent note")
         next_view = build_context_view("writer", state.active_context_messages())
         self.assertNotIn(
@@ -947,7 +953,7 @@ class CoreTest(unittest.TestCase):
         replacement = state.messages[compression.summary_message_index]
         self.assertEqual(replacement.kind, "summary")
         self.assertEqual(replacement.role, "user")
-        replacement_text = message_text(replacement)
+        replacement_text = simple_long_horizon_agent.text_of(replacement.content)
         self.assertIn("Compacted 2 older tool exchange(s)", replacement_text)
         self.assertIn("alpha result", replacement_text)
         self.assertIn("beta result", replacement_text)

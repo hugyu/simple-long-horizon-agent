@@ -9,7 +9,8 @@ surface. Import them explicitly, e.g.::
 """
 
 from .core import Agent, run
-from .state import State
+from .state import State, StateResourceLimitError
+from .sqlite_state import SqliteCheckpointStore, StateLimits
 from .checkpoint import (
     CHECKPOINT_SCHEMA,
     CheckpointStore,
@@ -214,6 +215,9 @@ __all__ = [
     "CHECKPOINT_SCHEMA",
     "CheckpointStore",
     "FileCheckpointStore",
+    "SqliteCheckpointStore",
+    "StateLimits",
+    "StateResourceLimitError",
     "state_from_checkpoint",
     "state_to_checkpoint",
     "FileOperationLedger",

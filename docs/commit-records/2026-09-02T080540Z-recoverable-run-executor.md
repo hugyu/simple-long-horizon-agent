@@ -22,7 +22,8 @@ resumable Run on failure, and let another worker continue from the checkpoint.
 - `tests/unit/test_recoverable_runtime.py`: cover completion, checkpointing,
   failure release, and worker takeover.
 - `tests/unit/test_core.py`: update the public API contract.
-- `docs/design/16-recoverable-code-task-runtime.md`: document the implemented
+- Runtime design notes (subsequently removed during documentation cleanup):
+  document the implemented
   coordinator and remaining production gaps.
 
 ## Verification

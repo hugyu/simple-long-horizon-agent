@@ -41,6 +41,8 @@ if TYPE_CHECKING:
 DEFAULT_FILESYSTEM_MEMORY_ROOT = "~/.simple/memory"
 MEMORY_SUMMARY_FILENAME = "memory_summary.md"
 MEMORY_HANDBOOK_FILENAME = "MEMORY.md"
+MEMORY_CONTROL_FILENAME = "MEMORY.control.json"
+MEMORY_PROVENANCE_FILENAME = "MEMORY.provenance.json"
 MEMORY_LOCK_FILENAME = ".memory-lock/memory.lock"
 
 # Default character cap on transcript text passed to the distiller (the full
@@ -118,6 +120,7 @@ class FilesystemMemoryPayload:
     available_memories: tuple[str, ...]
     context: MemoryContext
     memory_summary: str = ""
+    maintenance: str = ""
 
 
 @dataclass(frozen=True)
@@ -211,6 +214,93 @@ class FilesystemMemory(Memory):
             self._finish(ctx)
         except Exception as exc:
             self._record_finish_error(exc)
+
+    def invalidate(self, memory_name: str, *, lesson: str, reason: str) -> None:
+        """Retire one exact top-level Markdown bullet, including its continuation."""
+        self._maintain(memory_name, lesson=lesson, reason=reason)
+
+    def reset(self, memory_name: str, *, reason: str) -> None:
+        """Explicitly clear the handbook; retain historical run evidence."""
+        self._maintain(memory_name, lesson=None, reason=reason)
+
+    def _maintain(self, memory_name: str, *, lesson: str | None, reason: str) -> None:
+        if not memory_name.strip() or not reason.strip() or len(reason) > 2000:
+            raise ValueError(
+                "memory_name and reason must be nonempty; reason must be <= 2000 chars"
+            )
+        if lesson is not None and not lesson.strip():
+            raise ValueError("lesson must be a nonempty exact Markdown bullet")
+        with _memory_lock(self.root):
+            memory_dir = self.root / safe_memory_name(memory_name)
+            path = memory_dir / MEMORY_HANDBOOK_FILENAME
+            if not path.is_file():
+                raise ValueError(f"Unknown memory namespace: {memory_name!r}")
+            existing = path.read_text(encoding="utf-8")
+            entries = _lesson_blocks(existing)
+            if lesson is not None and lesson.strip() not in entries:
+                raise ValueError(
+                    f"Lesson not found as an exact top-level bullet: {lesson!r}"
+                )
+            removed = entries if lesson is None else [lesson.strip()]
+            control = _read_memory_control(memory_dir)
+            retired = dict(control.get("invalidated", {}))
+            for entry in removed:
+                retired[entry] = reason.strip()
+            control.update(invalidated=retired, reason=reason.strip())
+            if lesson is None:
+                control["reset"] = True
+            control_text = json.dumps(control, ensure_ascii=False, indent=2) + "\n"
+            if len(control_text) > 100_000:
+                raise ValueError(
+                    "Memory retirement record exceeds 100000 chars; use a new namespace"
+                )
+            updated = (
+                _handbook_skeleton()
+                if lesson is None
+                else re.sub(
+                    r"(?m)^" + re.escape(lesson.strip()) + r"(?=\n|$)",
+                    "",
+                    existing,
+                    count=1,
+                )
+            )
+            # Publish the invalidation barrier first: an interrupted multi-file
+            # update must still tell readers that the old advice is retired.
+            _write_text_atomic(memory_dir / MEMORY_CONTROL_FILENAME, control_text)
+            _write_text_atomic(memory_dir / "MEMORY.previous.md", existing)
+            _write_text_atomic(path, updated.rstrip() + "\n")
+            _write_text_atomic(
+                memory_dir / MEMORY_SUMMARY_FILENAME,
+                _memory_summary_skeleton(memory_dir.name),
+            )
+            provenance_path = memory_dir / MEMORY_PROVENANCE_FILENAME
+            prior = (
+                json.loads(provenance_path.read_text(encoding="utf-8"))
+                if provenance_path.exists()
+                else {}
+            )
+            _write_text_atomic(
+                provenance_path,
+                json.dumps(
+                    {
+                        "operation": "reset" if lesson is None else "invalidate",
+                        "scope": memory_dir.name,
+                        "reason": reason.strip(),
+                        "handbook_sha256": hashlib.sha256(
+                            path.read_bytes()
+                        ).hexdigest(),
+                        "verification": "requires_revalidation",
+                        "lessons": [
+                            entry
+                            for entry in prior.get("lessons", [])
+                            if entry["text"] in _lesson_blocks(updated)
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+            )
 
     def memory_dir(self, ctx: MemoryContext) -> Path:
         return self.root / safe_memory_name(ctx.memory_name or "default")
@@ -335,6 +425,7 @@ class FilesystemMemory(Memory):
                     ),
                     artifacts=artifacts,
                     memory_summary=memory_summary,
+                    maintenance=self._maintenance_context(ctx),
                     index=index,
                     notes=handbook,
                     run_path=run_path,
@@ -386,15 +477,18 @@ class FilesystemMemory(Memory):
             row=row,
             summary_path=f"{run_path}/summary.md",
         )
-        _apply_handbook_rewrite(
+        previous_handbook = (memory_dir / MEMORY_HANDBOOK_FILENAME).read_text(
+            encoding="utf-8"
+        )
+        accepted = _apply_handbook_rewrite(
             memory_dir / MEMORY_HANDBOOK_FILENAME,
             distillation.memory_md,
             run_dir=run_dir,
         )
-        update_memory_summary(
-            memory_dir,
-            distillation.memory_summary_md,
-        )
+        if accepted:
+            _write_handbook_provenance(memory_dir, previous_handbook, ctx, run_path)
+        if accepted is not False:
+            update_memory_summary(memory_dir, distillation.memory_summary_md)
         _write_text_atomic(run_dir / ".complete", "ok\n")
         prune_memory_runs(
             memory_dir,
@@ -421,6 +515,17 @@ class FilesystemMemory(Memory):
         ):
             name = "default"
         return self.root / name
+
+    def _maintenance_context(self, ctx: MemoryContext) -> str:
+        names = (
+            (safe_memory_name(ctx.memory_name),)
+            if ctx.memory_name
+            else self.available_memories()[: self.limits.max_namespaces_in_context]
+        )
+        return "\n".join(
+            f"{name}: {json.dumps(_read_memory_control(self.root / name), ensure_ascii=False)}"
+            for name in names
+        )
 
     def _distillation_context_files(
         self,
@@ -577,6 +682,13 @@ def filesystem_distillation_prompt(payload: FilesystemMemoryPayload) -> str:
             "- summary_md is the concise per-run evidence summary. Use sections: Task, Key Signals, Useful Context, Actions And Artifacts, Failed Or Risky Attempts, Reusable Lessons.",
             "- memory_summary_md is the compact top-level navigation summary for this memory namespace. Start it with exactly `v1`; keep it under about 1200 words; leave it empty if the deterministic updater is enough.",
             "- memory_md is the COMPLETE updated durable handbook: the entire new MEMORY.md, not a per-run delta. Start from the current <MEMORY.md> below and return the whole file with this run's durable lessons merged in.",
+            "- For each new or changed lesson, use a top-level Markdown bullet with indented Scope, Source, Verified, Status, and Recheck fields. Scope names the project/environment; Source points to evidence; Verified names an actually observed revision or unknown; Status is active or needs-verification; Recheck states what changes require checking again.",
+            "- Preserve old source references for unchanged lessons. Legacy lessons without metadata are unverified; do not invent verification dates or revisions.",
+            "- Explicit user corrections and current code/tool evidence override conflicting older advice. Replace the old advice rather than keeping both as active. A single unexplained failure is uncertainty: mark needs-verification, not disproven. Age or a different commit alone does not prove invalidity.",
+            "- In summary_md explain which lessons were confirmed, replaced/retired, or left uncertain, and cite supporting evidence. Speculation is not a durable fact.",
+            "- The maintenance record is authoritative: never revive invalidated advice, including paraphrases. After reset, historical runs are evidence only; relearn from new task evidence. Automatic empty rewrites still mean no change; only the explicit host reset API clears the whole handbook.",
+            f"<maintenance>{payload.maintenance}</maintenance>",
+            f"<observed_revision>{payload.context.data.get('memory_revision', 'unknown')}</observed_revision>",
             "- Every reusable lesson must cite evidence from this run path, transcript.md, artifacts, or summary.md.",
             "- Cite evidence as greppable anchors a future agent can find directly: a transcript section heading written as `transcript.md ## <n>` (headings are `## <n>. <role> (<kind>, <sender> -> <target>)`, locatable with `grep -n '^## <n>\\.' transcript.md`), a file path, a symbol, a command, or an error string. Never cite raw line numbers or `lines X-Y` — those numbers are message section ids, not file lines, and shift between runs.",
             "- index_row must contain summary, scope, signals, keywords, and artifacts.",
@@ -878,7 +990,72 @@ def upsert_index_row(
     _write_text_atomic(index_path, "\n".join(lines).rstrip() + "\n")
 
 
-def _apply_handbook_rewrite(path: Path, proposed: str, *, run_dir: Path) -> None:
+def _lesson_blocks(text: str) -> list[str]:
+    """Top-level bullets with indented metadata; headings are not lessons."""
+    return [
+        match.group(0).strip()
+        for match in re.finditer(
+            r"(?m)^[-*] [^\n]*(?:\n(?:[ \t]+[^\n]*|[ \t]*))*", text
+        )
+    ]
+
+
+def _write_handbook_provenance(
+    memory_dir: Path, previous: str, ctx: MemoryContext, run_path: str
+) -> None:
+    path = memory_dir / MEMORY_PROVENANCE_FILENAME
+    prior = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    known = {entry["text"]: entry for entry in prior.get("lessons", [])}
+    old_lessons = set(_lesson_blocks(previous))
+    handbook = (memory_dir / MEMORY_HANDBOOK_FILENAME).read_text(encoding="utf-8")
+    entries = []
+    for lesson in _lesson_blocks(handbook):
+        if lesson in old_lessons and lesson in known:
+            entries.append(known[lesson])
+            continue
+        entries.append(
+            {
+                "text": lesson,
+                "scope": memory_dir.name,
+                "source": "legacy:unknown"
+                if lesson in old_lessons
+                else f"{run_path}/transcript.md",
+                "observed_revision": "unknown"
+                if lesson in old_lessons
+                else str(ctx.data.get("memory_revision", "unknown")),
+                "verification": "requires_revalidation",
+            }
+        )
+    _write_text_atomic(
+        path,
+        json.dumps(
+            {
+                "operation": "distill",
+                "scope": memory_dir.name,
+                "source": f"{run_path}/transcript.md",
+                "handbook_sha256": hashlib.sha256(handbook.encode("utf-8")).hexdigest(),
+                "lessons": entries,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+    )
+
+
+def _read_memory_control(memory_dir: Path) -> dict[str, Any]:
+    path = memory_dir / MEMORY_CONTROL_FILENAME
+    if not path.exists():
+        return {}
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or not isinstance(
+        value.get("invalidated", {}), dict
+    ):
+        raise ValueError(f"Invalid memory control record: {path}")
+    return value
+
+
+def _apply_handbook_rewrite(path: Path, proposed: str, *, run_dir: Path) -> bool | None:
     """Persist a model-owned full rewrite of MEMORY.md, guarded against loss.
 
     The distiller returns the entire updated handbook (it owns merging, rewriting,
@@ -896,13 +1073,18 @@ def _apply_handbook_rewrite(path: Path, proposed: str, *, run_dir: Path) -> None
         path.read_text(encoding="utf-8") if path.exists() else _handbook_skeleton()
     )
     reason = _handbook_rewrite_rejection(proposed, existing)
+    for retired in _read_memory_control(path.parent).get("invalidated", {}):
+        if retired.splitlines()[0].lstrip("-* ") in proposed:
+            reason = "rewrite restores an explicitly invalidated lesson"
+            break
     if reason:
         _write_text_atomic(
             run_dir / "memory_error.md",
             handbook_rejection_text(reason),
         )
-        return
+        return False
     _write_text_atomic(path, proposed.rstrip() + "\n")
+    return True
 
 
 def _handbook_rewrite_rejection(proposed: str, existing: str) -> str:
@@ -1233,6 +1415,9 @@ def _policy_block(memory_dir: Path, memory_summary: str) -> str:
             "Locate transcript.md evidence by searching for the cited anchor (a `## <n>.` section heading, file path, symbol, command, or error string), not raw line numbers — citation numbers are message section ids, not file lines.",
             "Keep recall lightweight: avoid broad scans unless the summary and index are insufficient.",
             "Treat memory as dated context, not current truth.",
+            f"Read {MEMORY_CONTROL_FILENAME} first when present; it overrides the handbook and historical run summaries. Invalidated lessons must not be followed or revived. After reset, old runs are evidence only, not active advice.",
+            f"{MEMORY_PROVENANCE_FILENAME} records the last handbook update source/scope/revision, not proof that every lesson was verified. Legacy entries and missing/pruned evidence require revalidation.",
+            "Use only lessons whose Scope matches; recheck commands/paths against the current workspace. A changed revision or old age is a recheck trigger, not proof of invalidity.",
             "If a memory fact names a file, command, test, or current repo state and verification is cheap, verify it against the current workspace before relying on it.",
             "Current user instructions, code, tests, and tool observations outrank memory.",
             "Do not modify memory files during the task unless explicitly instructed.",
@@ -1265,6 +1450,7 @@ def _root_policy_block(root: Path, overview: tuple[str, ...]) -> str:
             f"Start with {MEMORY_SUMMARY_FILENAME}; then use {MEMORY_HANDBOOK_FILENAME}, INDEX.md, and targeted run summaries.",
             "Locate transcript.md evidence by searching for a cited anchor (a `## <n>.` section heading, file path, symbol, or command), not raw line numbers; avoid broad scans unless needed.",
             "Treat memory as dated context, not current truth, and verify cheap drift-prone facts.",
+            f"Read each namespace's {MEMORY_CONTROL_FILENAME} first when present: invalidations/reset override all historical advice. Missing provenance or pruned source evidence requires revalidation.",
             "Current user instructions, code, tests, and tool observations outrank memory.",
             "Do not modify memory files during the task unless explicitly instructed.",
             "</filesystem_memory>",

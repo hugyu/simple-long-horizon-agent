@@ -19,7 +19,8 @@ that may already belong to a replacement Worker.
 - `tests/unit/test_recoverable_runtime.py`: cover long-run renewal and takeover
   fencing under a lease race.
 - `tests/unit/test_core.py`: update the public API contract.
-- `docs/design/16-recoverable-code-task-runtime.md`: document heartbeat timing,
+- Runtime design notes (subsequently removed during documentation cleanup):
+  document heartbeat timing,
   fail-closed behavior, and external-process cancellation limits.
 
 ## Verification

@@ -27,7 +27,8 @@ exactly-once execution.
 - `tests/unit/test_checkpoint.py`, `tests/unit/test_run_control.py`,
   `tests/unit/test_core.py`, `tests/unit/test_bash_agent.py`: cover durability,
   fencing, lifecycle, replay blocking, and command classification.
-- `docs/design/16-recoverable-code-task-runtime.md`: document the implemented
+- Runtime design notes (subsequently removed during documentation cleanup):
+  document the implemented
   Phase 2 boundary and its reconciliation limitations.
 
 ## Verification

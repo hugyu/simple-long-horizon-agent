@@ -18,6 +18,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Protocol, cast
 
+from .llm.types import llm_message
 from .messages import (
     AssistantMessage,
     ContentBlock,
@@ -118,6 +119,8 @@ class FileCheckpointStore:
 def state_to_checkpoint(state: State) -> dict[str, Any]:
     """Encode a State with a schema marker and content hash."""
 
+    if state.history is not None:
+        raise ValueError("Use the owning durable store to checkpoint disk-backed State")
     body = {
         "task": _content_input_to_record(state.task),
         "data": _json_safe(state.data),
@@ -201,7 +204,16 @@ def _event_from_record(record: Any) -> Event:
             tools=list(record.get("tools", []))
             if isinstance(record.get("tools"), list)
             else [],
-            llm_payload=list(record.get("llm_payload", []))
+            llm_payload=[
+                llm_message(
+                    item["role"],
+                    _content_input_from_record(item.get("content", "")),
+                    extra=item["extra"],
+                )
+                if isinstance(item, Mapping) and "role" in item and "extra" in item
+                else item
+                for item in record.get("llm_payload", [])
+            ]
             if isinstance(record.get("llm_payload"), list)
             else [],
             system_prompt=str(record.get("system_prompt") or ""),
@@ -384,6 +396,9 @@ def _tool_result_from_record(record: Any) -> ToolResult:
         details=record.get("details"),
         is_error=bool(record.get("is_error", False)),
         terminate=bool(record.get("terminate", False)),
+        execution_complete=record.get("execution_complete")
+        if isinstance(record.get("execution_complete"), bool)
+        else None,
     )
 
 

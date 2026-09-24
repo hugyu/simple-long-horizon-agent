@@ -73,11 +73,17 @@ def make_edit_tool(
     ) -> ToolResult:
         del call_id, on_update
         if abort():
-            return text_result("Edit aborted before start.", is_error=True)
+            return text_result(
+                "Edit aborted before start.", is_error=True, execution_complete=True
+            )
 
         raw_path = str(args.get("path", "")).strip()
         if not raw_path:
-            return text_result("Missing required edit argument: path.", is_error=True)
+            return text_result(
+                "Missing required edit argument: path.",
+                is_error=True,
+                execution_complete=True,
+            )
 
         old_string = args.get("old_string")
         new_string = args.get("new_string")
@@ -182,6 +188,10 @@ def _edit_operation_metadata(
     return {
         "path": str(path),
         "mode": mode,
+        "old_sha256": hashlib.sha256(path.read_bytes()).hexdigest()
+        if path.exists()
+        else None,
+        "arguments": dict(args),
         "new_sha256": hashlib.sha256(expected.encode("utf-8")).hexdigest(),
     }
 
@@ -206,6 +216,7 @@ def edit_file(
         return text_result(
             "No changes to make: old_string and new_string are identical.",
             is_error=True,
+            execution_complete=True,
         )
 
     base = Path(root or ".").resolve()
@@ -215,7 +226,11 @@ def edit_file(
     try:
         path = candidate.resolve()
     except OSError as exc:
-        return text_result(f"Could not resolve path {raw_path!r}: {exc}", is_error=True)
+        return text_result(
+            f"Could not resolve path {raw_path!r}: {exc}",
+            is_error=True,
+            execution_complete=True,
+        )
 
     if path.is_dir():
         return text_result(
@@ -229,29 +244,36 @@ def edit_file(
                 f"File does not exist: {raw_path}. Use an empty old_string to "
                 "create a new file.",
                 is_error=True,
+                execution_complete=True,
             )
         return _write_new_file(path, raw_path, new_string)
 
     try:
         size = path.stat().st_size
     except OSError as exc:
-        return text_result(f"Failed to stat {raw_path}: {exc}", is_error=True)
+        return text_result(
+            f"Failed to stat {raw_path}: {exc}", is_error=True, execution_complete=True
+        )
     if size > max_bytes:
         return text_result(
             f"File is too large to edit ({size} bytes, limit {max_bytes}).",
             is_error=True,
+            execution_complete=True,
         )
 
     try:
         content = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
-        return text_result(f"Failed to read {raw_path}: {exc}", is_error=True)
+        return text_result(
+            f"Failed to read {raw_path}: {exc}", is_error=True, execution_complete=True
+        )
 
     if old_string == "":
         if content != "":
             return text_result(
                 f"Cannot create new file - file already exists: {raw_path}.",
                 is_error=True,
+                execution_complete=True,
             )
         return _write_new_file(path, raw_path, new_string)
 
@@ -260,6 +282,7 @@ def edit_file(
         return text_result(
             f"String to replace not found in file.\nString: {old_string}",
             is_error=True,
+            execution_complete=True,
         )
     if matches > 1 and not replace_all:
         return text_result(
@@ -268,6 +291,7 @@ def edit_file(
             "or set replace_all to true to change every occurrence.\n"
             f"String: {old_string}",
             is_error=True,
+            execution_complete=True,
         )
 
     if replace_all:
@@ -280,7 +304,11 @@ def edit_file(
     try:
         path.write_text(updated, encoding="utf-8")
     except OSError as exc:
-        return text_result(f"Failed to write {raw_path}: {exc}", is_error=True)
+        return text_result(
+            f"Failed to write {raw_path}: {exc}",
+            is_error=True,
+            execution_complete=False,
+        )
 
     result = EditResult(
         path=str(path),
@@ -305,7 +333,11 @@ def _write_new_file(path: Path, raw_path: str, new_string: str) -> ToolResult:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(new_string, encoding="utf-8")
     except OSError as exc:
-        return text_result(f"Failed to create {raw_path}: {exc}", is_error=True)
+        return text_result(
+            f"Failed to create {raw_path}: {exc}",
+            is_error=True,
+            execution_complete=False,
+        )
 
     result = EditResult(
         path=str(path),

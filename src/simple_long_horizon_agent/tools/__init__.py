@@ -52,12 +52,15 @@ class ToolResult:
     never crosses the model boundary. `is_error=True` means the error text
     should go back to the model so it can self-correct. `terminate=True`
     asks the owning runtime to stop after recording the result.
+    `execution_complete` distinguishes an observed exit (including nonzero)
+    from interrupted/unknown effects; None retains conservative legacy behavior.
     """
 
     content: ToolResultContent = ()
     details: Any = None
     is_error: bool = False
     terminate: bool = False
+    execution_complete: bool | None = None
 
 
 ToolUpdateFn = Callable[[ToolResult], None]
@@ -94,7 +97,9 @@ class AgentTool(Tool):
     `execute` uses the canonical `ToolExecuteFn` signature (above).
     `execution_mode="sequential"` runs a batch's calls one at a time;
     `"parallel"` lets the runtime dispatch them concurrently.
-    `timeout_seconds` (when set) bounds a single call.
+    `timeout_seconds` signals cooperative cancellation. The runtime joins the
+    tool before returning; uncooperative Python tools can exceed this deadline.
+    Use process-backed tools when hard cancellation is required.
     """
 
     execute: ToolExecuteFn
@@ -111,6 +116,7 @@ def text_result(
     details: Any = None,
     is_error: bool = False,
     terminate: bool = False,
+    execution_complete: bool | None = None,
 ) -> ToolResult:
     """Build a text-only `ToolResult`."""
 
@@ -120,6 +126,7 @@ def text_result(
         details=details,
         is_error=is_error,
         terminate=terminate,
+        execution_complete=execution_complete,
     )
 
 

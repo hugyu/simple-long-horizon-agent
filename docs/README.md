@@ -6,15 +6,8 @@ behavior.
 
 ## Guides
 
-### Architecture and learning path
-
-- [`design/README.md`](design/README.md) — architecture-first index for the
-  design notes.
-- [`design/00-running-example.md`](design/00-running-example.md) — a concrete,
-  deterministic task traced from input through model, tool, state, events, and
-  final output. Start here when learning how the system actually runs.
-- [`interview/answer-guidelines.md`](interview/answer-guidelines.md) — rules for
-  code-grounded Agent interview answers.
+- [`runtime-recovery.md`](runtime-recovery.md) — verified completion, lease ownership,
+  interrupted tool operations, and process-level recovery acceptance.
 
 - [`development.md`](development.md) — the quality gate, and the `ty` false
   positives worth recognizing.

@@ -70,9 +70,15 @@ def _fake_bash_trace(label: str) -> RunTrace:
 class BashToolTest(unittest.TestCase):
     def test_bash_side_effect_detector_is_conservative_for_writes(self) -> None:
         cases = {
-            "printf 'hello'": False,
-            "rg TODO src": False,
-            "uv run python -m unittest": False,
+            "printf 'hello'": True,
+            "rg TODO src": True,
+            "uv run python -m unittest": True,
+            "python -c \"open('x', 'w').write('changed')\"": True,
+            "node script.js": True,
+            "custom-build": True,
+            "printf '%s' $(touch x)": True,
+            "rg --pre custom-filter needle": True,
+            "find . -exec rm {} +": True,
             "echo hi > output.txt": True,
             "rm output.txt": True,
             "git reset --hard HEAD": True,

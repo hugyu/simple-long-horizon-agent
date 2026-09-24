@@ -145,6 +145,14 @@ class ContextPolicy:
 
     model_invisible_kinds: tuple[MessageKind, ...] = ()
     strategy: CompressionStrategy | None = None
+    max_input_tokens: int | None = None  # Legacy conservative byte allowance.
+    max_input_bytes: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.max_input_bytes is not None and self.max_input_bytes < 1:
+            raise ValueError("max_input_bytes must be positive")
+        if self.max_input_tokens is not None and self.max_input_tokens < 1:
+            raise ValueError("max_input_tokens must be positive")
 
     def is_visible(self, message: Message) -> bool:
         """Whether this message survives the agent's visibility filter."""

@@ -16,7 +16,8 @@ case verifies that a tampered post-image fails closed and blocks the Run.
 
 - `tests/unit/test_recoverable_runtime.py`: add recoverable edit interruption
   and failed-reconciliation tests.
-- `docs/design/16-recoverable-code-task-runtime.md`: mark Phase 3 fault
+- Runtime design notes (subsequently removed during documentation cleanup):
+  mark Phase 3 fault
   injection acceptance as complete and document the continue/block outcomes.
 
 ## Verification

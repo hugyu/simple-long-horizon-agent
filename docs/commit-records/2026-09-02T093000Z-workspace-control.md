@@ -25,7 +25,8 @@ workspace has disappeared.
 - `tests/unit/test_workspace.py`, `tests/unit/test_recoverable_runtime.py`,
   `tests/unit/test_core.py`: cover workspace lifecycle, recovery, missing
   workspace blocking, and public API compatibility.
-- `docs/design/16-recoverable-code-task-runtime.md`: sync workspace lifecycle
+- Runtime design notes (subsequently removed during documentation cleanup):
+  sync workspace lifecycle
   and recovery guarantees.
 
 ## Verification

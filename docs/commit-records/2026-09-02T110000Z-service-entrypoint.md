@@ -21,7 +21,8 @@ callers provide an Agent factory for rebuilding execution inputs after restart.
 - `scripts/arch_lint.py`: classify the new service module in the core zone.
 - `tests/unit/test_recoverable_runtime.py`: cover durable submission, Agent
   rebuilding, and service context-manager shutdown.
-- `docs/design/16-recoverable-code-task-runtime.md`: document the service entry
+- Runtime design notes (subsequently removed during documentation cleanup):
+  document the service entry
   contract and its framework-neutral boundary.
 
 ## Verification

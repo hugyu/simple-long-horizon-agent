@@ -16,7 +16,8 @@ for the next service instance.
 
 - `tests/unit/test_recoverable_runtime.py`: add restart takeover, concurrent
   scheduler fencing, and shutdown-drain coverage.
-- `docs/design/16-recoverable-code-task-runtime.md`: document the validated
+- Runtime design notes (subsequently removed during documentation cleanup):
+  document the validated
   service lifecycle contract and test locations.
 
 ## Verification

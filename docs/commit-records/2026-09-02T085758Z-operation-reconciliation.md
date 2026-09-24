@@ -23,7 +23,8 @@ observable outcomes, and blocks the Run when the outcome cannot be determined.
 - `src/simple_long_horizon_agent/tools/edit.py`: record expected post-edit hash.
 - `tests/unit/test_recoverable_runtime.py`, `tests/unit/test_core.py`: cover
   successful edit recovery and fail-closed behavior.
-- `docs/design/16-recoverable-code-task-runtime.md`: document the recovery
+- Runtime design notes (subsequently removed during documentation cleanup):
+  document the recovery
   contract and adapter limitation.
 
 ## Verification

@@ -11,6 +11,7 @@ Two halves of one loop:
 
 from __future__ import annotations
 
+import re
 import unittest
 
 from simple_long_horizon_agent import (
@@ -27,9 +28,13 @@ from simple_long_horizon_agent import (
     text_of,
 )
 from simple_long_horizon_agent.compression import (
+    ToolCompactStrategy,
+    maybe_compress_context,
     continuation_preamble,
     format_index_ranges,
 )
+from simple_long_horizon_agent.context_view import CompressionDecision
+from simple_long_horizon_agent.llm.bridge import messages_to_llm_messages
 from simple_long_horizon_agent.messages import (
     ToolResultBlock,
     make_message,
@@ -83,6 +88,109 @@ class IndexCitationTest(unittest.TestCase):
         preamble = continuation_preamble()
         self.assertIn("continues a previous", preamble)
         self.assertIn("working memory", preamble)
+
+
+class SummaryRecallIntegrationTest(unittest.TestCase):
+    def test_tool_summary_exposes_indices_that_recall_original_results(self) -> None:
+        state = State("task")
+        state.send("task", "user", "worker", "find the access code")
+        state.record(
+            assistant_message(
+                [ToolCallBlock("read1", "read", {"path": "report"})],
+                sender="worker",
+                kind="step",
+            )
+        )
+        state.record(
+            tool_results_message(
+                [
+                    ToolResultBlock(
+                        tool_call_id="read1",
+                        tool_name="read",
+                        content=(TextBlock("padding " * 100 + "ACCESS-CODE-9931"),),
+                    )
+                ],
+                target="worker",
+            )
+        )
+        policy = ContextPolicy(
+            strategy=ToolCompactStrategy(
+                threshold_tokens=1,
+                keep_recent_exchanges=0,
+                preview_chars=10,
+            )
+        )
+        agent = Agent("worker", lambda visible: assistant_message("done"))
+        events = maybe_compress_context(agent, state, policy)
+        # Read only model-facing content: no event metadata or known indices.
+        wire = messages_to_llm_messages(state.active_context_messages())
+        visible = "\n".join(text_of(message.content) for message in wire)
+        self.assertNotIn("ACCESS-CODE-9931", visible)
+        match = re.search(r"Compressed from transcript messages (.*?);", visible)
+        self.assertIsNotNone(match)
+        assert match is not None
+        indices = []
+        for span in match.group(1).split(", "):
+            bounds = [int(value) for value in span.split("-")]
+            indices.extend(range(bounds[0], bounds[-1] + 1))
+        fold = next(e for e in events if isinstance(e, ContextCompressionEvent))
+        self.assertEqual(indices, fold.compressed_message_indices)
+        result = make_recall_tool(state).execute(
+            "recall1",
+            {"indices": indices},
+            _no_abort,
+            None,
+        )
+        self.assertFalse(result.is_error)
+        self.assertIn("ACCESS-CODE-9931", tool_result_text(result))
+
+    def test_citation_uses_aligned_noncontiguous_indices_and_survives_refold(
+        self,
+    ) -> None:
+        state = State("task")
+        state.send("task", "user", "worker", "task")
+        state.send("message", "user", "worker", "first fact")  # 1
+        state.record(assistant_message([ToolCallBlock("c", "read", {})]))  # 2
+        state.record(
+            tool_results_message(
+                [
+                    ToolResultBlock(
+                        tool_call_id="c",
+                        tool_name="read",
+                        content=(TextBlock("kept"),),
+                    )
+                ],
+                target="worker",
+            )
+        )  # 3
+        state.send("message", "user", "worker", "second fact")  # 4
+        agent = Agent("worker", lambda visible: assistant_message("done"))
+
+        def fold(active, name):
+            return CompressionDecision(
+                compress_indices=(1, 2, 4),
+                replacement=make_message("user", "summary", kind="summary"),
+            )
+
+        maybe_compress_context(agent, state, ContextPolicy(strategy=fold))
+        summary = state.messages[5]
+        self.assertIn("messages 1, 4;", text_of(summary.content))
+
+        def refold(active, name):
+            return CompressionDecision(
+                compress_indices=(5,),
+                replacement=make_message("user", "new summary", kind="summary"),
+            )
+
+        maybe_compress_context(agent, state, ContextPolicy(strategy=refold))
+        self.assertIn("messages 5;", text_of(state.messages[6].content))
+        recalled = make_recall_tool(state).execute(
+            "r",
+            {"indices": [5]},
+            _no_abort,
+            None,
+        )
+        self.assertIn("messages 1, 4;", tool_result_text(recalled))
 
 
 class RecallToolTest(unittest.TestCase):
@@ -273,7 +381,10 @@ class CompactControlTest(unittest.TestCase):
         self.assertEqual(replacement.kind, "summary")
         replacement_text = text_of(replacement.content)
         # Framed as a continuation, then the agent's summary.
-        self.assertTrue(replacement_text.startswith("[This session continues"))
+        self.assertTrue(
+            replacement_text.startswith("[Compressed from transcript messages")
+        )
+        self.assertIn("[This session continues", replacement_text)
         self.assertIn("B is the answer", replacement_text)
         # The run still finishes normally after the fold.
         self.assertEqual(state.messages[-1].kind, "final")

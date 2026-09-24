@@ -13,6 +13,7 @@ import os
 import re
 import shlex
 import subprocess
+import signal
 import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -35,20 +36,14 @@ BASH_TOOL_NAME = "bash"
 
 
 def bash_command_may_modify(args: dict[str, Any]) -> bool:
-    """Return whether a command may change the workspace or its metadata."""
+    """Treat arbitrary shell execution as potentially side-effecting.
 
-    command = str(args.get("command", ""))
-    lowered = command.casefold()
-    if any(operator in command for operator in (">", "<")):
-        return True
-    return bool(
-        re.search(
-            r"\b(?:rm|mv|cp|mkdir|rmdir|touch|chmod|chown|ln|tee|"
-            r"git\s+(?:apply|checkout|reset|clean|commit|merge|rebase)|"
-            r"sed\s+-i|perl\s+-i)\b",
-            lowered,
-        )
-    )
+    Interpreters, build tools and even test runners can write files. Parsing
+    shell text cannot prove read-only behavior; use the dedicated read tool
+    when a recovery-safe read is needed. This is accounting, not a sandbox.
+    """
+    del args
+    return True
 
 
 DEFAULT_BASH_TIMEOUT_SECONDS = 30.0
@@ -108,6 +103,7 @@ class BashExecution:
 
 def make_bash_tool(
     *,
+    recoverable_commands: tuple[str, ...] = (),
     cwd: str | Path | None = None,
     default_timeout_seconds: float | None = None,
     max_timeout_seconds: float | None = None,
@@ -159,7 +155,11 @@ def make_bash_tool(
     ) -> ToolResult:
         del call_id, on_update
         if abort():
-            return text_result("Bash command aborted before start.", is_error=True)
+            return text_result(
+                "Bash command aborted before start.",
+                is_error=True,
+                execution_complete=True,
+            )
 
         command = str(args.get("command", "")).strip()
         if not command:
@@ -173,6 +173,7 @@ def make_bash_tool(
                 f"Blocked bash command: {blocked_sleep}. Use a shorter delay or a real readiness check.",
                 details={"command": command, "blocked_sleep": blocked_sleep},
                 is_error=True,
+                execution_complete=True,
             )
 
         try:
@@ -182,13 +183,16 @@ def make_bash_tool(
                 max_timeout_seconds,
             )
         except ValueError as exc:
-            return text_result(f"Invalid bash timeout: {exc}", is_error=True)
+            return text_result(
+                f"Invalid bash timeout: {exc}", is_error=True, execution_complete=True
+            )
         execution = run_bash(
             command,
             cwd=root,
             timeout_seconds=timeout_seconds,
             max_output_chars=max_output_chars,
             exec_prefix=exec_prefix,
+            abort=abort,
         )
         if abort():
             return text_result(
@@ -260,6 +264,11 @@ def make_bash_tool(
         execution_mode=execution_mode,
         timeout_seconds=max_timeout_seconds + 1,
         side_effect_detector=bash_command_may_modify,
+        side_effect_metadata=lambda args: (
+            {"retry_command": args["command"]}
+            if args.get("command") in recoverable_commands
+            else None
+        ),
     )
 
 
@@ -286,6 +295,7 @@ def run_bash(
     timeout_seconds: float = DEFAULT_BASH_TIMEOUT_SECONDS,
     max_output_chars: int = DEFAULT_BASH_MAX_OUTPUT_CHARS,
     exec_prefix: tuple[str, ...] = (),
+    abort: AbortFlag = lambda: False,
 ) -> BashExecution:
     """Execute `command` with `bash -lc` and return a structured result.
 
@@ -307,27 +317,42 @@ def run_bash(
     env = _bash_subprocess_env()
     start = time.monotonic()
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             [*exec_prefix, "bash", "-lc", command],
             cwd=root,
-            capture_output=True,
-            timeout=timeout_seconds,
-            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             env=env,
+            start_new_session=os.name == "posix",
         )
-        stdout = _coerce_process_text(completed.stdout)
-        stderr = _coerce_process_text(completed.stderr)
-        exit_code = completed.returncode
         timed_out = False
-    except subprocess.TimeoutExpired as exc:
-        stdout = _coerce_process_text(exc.stdout)
-        stderr = _coerce_process_text(exc.stderr)
-        if stderr:
-            stderr = f"{stderr}\nTimed out after {timeout_seconds:g}s"
-        else:
-            stderr = f"Timed out after {timeout_seconds:g}s"
-        exit_code = -1
-        timed_out = True
+        try:
+            while True:
+                if abort() or time.monotonic() - start >= timeout_seconds:
+                    timed_out = True
+                    if os.name == "posix":
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    else:
+                        process.kill()
+                    out, err = process.communicate()
+                    break
+                try:
+                    out, err = process.communicate(timeout=0.05)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+        stdout = _coerce_process_text(out)
+        stderr = _coerce_process_text(err)
+        exit_code = -1 if timed_out else process.returncode
+        if timed_out:
+            stderr += f"\nTimed out or cancelled after {time.monotonic() - start:g}s (limit {timeout_seconds:g}s)"
     except OSError as exc:
         stdout = ""
         stderr = f"{type(exc).__name__}: {exc}"
@@ -370,6 +395,7 @@ def bash_execution_to_tool_result(execution: BashExecution) -> ToolResult:
         format_bash_observation(execution),
         details=asdict(execution),
         is_error=execution.is_error,
+        execution_complete=not execution.timed_out and execution.exit_code >= 0,
     )
 
 

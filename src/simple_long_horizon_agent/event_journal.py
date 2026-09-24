@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+
+from filelock import FileLock
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -56,6 +58,10 @@ class FileEventJournal:
     def append(self, run_id: str, event: Event) -> None:
         path = self._path(run_id)
         path.parent.mkdir(parents=True, exist_ok=True)
+        with FileLock(str(path) + ".lock"):
+            self._append_locked(run_id, event, path)
+
+    def _append_locked(self, run_id: str, event: Event, path: Path) -> None:
         existing = self.read(run_id)
         expected = existing[-1].index + 1 if existing else 0
         if event.index < expected:
@@ -71,6 +77,13 @@ class FileEventJournal:
         encoded = json.dumps(
             _event_to_record(event), ensure_ascii=False, sort_keys=True
         )
+        # A newline commits a record. Discard only an unterminated suffix left
+        # by a killed writer; malformed committed records still fail closed.
+        if path.exists():
+            raw = path.read_bytes()
+            if raw and not raw.endswith(b"\n"):
+                with path.open("r+b") as handle:
+                    handle.truncate(raw.rfind(b"\n") + 1)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(encoded + "\n")
             handle.flush()
@@ -82,7 +95,9 @@ class FileEventJournal:
     def read(self, run_id: str) -> list[Event]:
         path = self._path(run_id)
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
+            raw = path.read_bytes()
+            committed = raw[: raw.rfind(b"\n") + 1]
+            lines = committed.decode("utf-8").splitlines()
         except FileNotFoundError:
             return []
         events: list[Event] = []

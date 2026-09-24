@@ -23,7 +23,8 @@ RecoverableRunExecutor now writes events to the journal before yielding them.
   `tests/unit/test_core.py`: expose and classify the new APIs.
 - `tests/unit/test_recoverable_runtime.py`: cover journal durability,
   contiguous append rules, scanner filtering, and executor journal output.
-- `docs/design/16-recoverable-code-task-runtime.md`: sync implemented recovery
+- Runtime design notes (subsequently removed during documentation cleanup):
+  sync implemented recovery
   behavior and remaining production gaps.
 
 ## Verification

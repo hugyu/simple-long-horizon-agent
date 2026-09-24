@@ -20,6 +20,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Literal
 
+from simple_long_horizon_agent.completion import (
+    CompletionCheck,
+    CompletionResult as CompletionResult,
+)
 from simple_long_horizon_agent.core import Agent
 from simple_long_horizon_agent.protocols import GoalLifecycleStatus, GoalStatusEvent
 from simple_long_horizon_agent.state import State
@@ -55,24 +59,6 @@ class GoalBudgets:
     max_turns: int | None = None
     token_budget: int | None = None  # cumulative output tokens
     wall_clock_seconds: float | None = None
-
-
-@dataclass(frozen=True)
-class CompletionResult:
-    """One verdict from a `CompletionCheck`.
-
-    `done=True` stops the loop with `complete`. `blocked=True` (with a stable
-    `reason`) feeds the >=3-consecutive-turn blocked-streak rule.
-    """
-
-    done: bool
-    blocked: bool = False
-    reason: str = ""
-
-
-# A completion check inspects the (finished-this-turn) State and reports a
-# verdict. It is INDEPENDENT of the agent's own claim of done-ness.
-CompletionCheck = Callable[[State], CompletionResult]
 
 
 @dataclass(frozen=True)

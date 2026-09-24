@@ -71,21 +71,26 @@ We focus on long-horizon evaluations across software engineering, terminal
 work, and autonomous model post-training. Reproducible results will be
 published here with the exact model, agent setup, and cost.
 
-| Benchmark | Model | **Score ↑** | Baseline | **Δ vs. Baseline ↑** | Cost / Task |
+| Benchmark | Model | **Score ↑** | Public reference | **Reported relative difference** | Cost / Task |
 | --- | --- | ---: | ---: | ---: | ---: |
 | [SWE-bench Pro](evals/swebench/README.md)[^swe-chain]<br>Resolved (%) | GPT-5.4 (xHigh) | **63.20%** | [59.10%](https://labs.scale.com/leaderboard/swe_bench_pro_public) | **+6.94%** | $7.7823 |
-| [Terminal-Bench](evals/harbor/README.md)<br>2.1 official score | GPT-5.3-Codex (xHigh) | **77.53%** | [64.70%](https://www.tbench.ai/leaderboard/terminal-bench/2.0) | **+19.83%** | $0.5667 |
+| [Terminal-Bench](evals/harbor/README.md)<br>2.1 official score | GPT-5.3-Codex (xHigh) | **77.53%** | [64.70%](https://www.tbench.ai/leaderboard/terminal-bench/2.0) | — | $0.5667 |
 | [PostTrainBench](https://posttrainbench.com/)[^posttrain]<br>Weighted average | GPT-5.5 (xHigh) | **45.88%** | [43.97%](https://posttrainbench.com/) | **+4.34%** | — |
 
 [^swe-chain]: We use a chained workflow similar to [ChainSWE](https://arxiv.org/abs/2607.02606v1), augmented with the `task` tool.
 
 [^posttrain]: We evaluate Qwen3-4B-Base on AIME 2025, BFCL, GSM8K, and HumanEval. Normalized rewards follow the [OpenAI PostTrainBench Lite method](https://deploymentsafety.openai.com/gpt-5-6-preview/performance-in-cases-flagged-by-users).
 
-**Δ vs. Baseline** is the score improvement over a baseline using the same
-model and task budget. It separates the value of the agent from the capability
-of the underlying model.
+These are previously reported scores. This checkout does not include their
+complete run manifests and original scorer outputs, so it cannot independently
+recompute them. The public references are not a controlled ablation: the
+Terminal-Bench reference links to version 2.0 while our reported run is 2.1,
+so no relative difference is reported for that row. Other differences are
+arithmetic comparisons, not evidence that a particular runtime component caused
+the gain. See [evaluation evidence requirements](evals/README.md#result-evidence)
+and the runnable paired context experiment there.
 
-An em dash means “not published yet,” not zero.
+An em dash means unavailable or not comparable, not zero.
 
 ## Quick Start
 
@@ -118,6 +123,8 @@ uv run python -m scripts.run_bash_agent_demo \
 
 See [.env.example](.env.example) for the supported provider settings.
 
+For sustained code tasks, use the [unified long-task entry](docs/runtime-recovery.md#unified-long-task-entry): it combines SQLite recovery, durable budgets, context compaction/Recall, and caller-owned verification, and exports the patch and run evidence.
+
 ## Use Cases
 
 - Learn how an agent behaves by running and modifying a complete example.
@@ -139,7 +146,6 @@ See [.env.example](.env.example) for the supported provider settings.
 - [Runnable demos and experiments](runs/README.md)
 - [Evaluation suites and benchmarks](evals/README.md)
 - [Project documentation](docs/README.md)
-- [Interview answer guidelines](docs/interview/answer-guidelines.md)
 - [Contributing guide](CONTRIBUTING.md)
 
 ## Project Status

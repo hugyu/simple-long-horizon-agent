@@ -8,19 +8,35 @@ through ``RunStore``, and releases a resumable run when a worker is interrupted.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 import time
+import math
 import threading
 from pathlib import Path
 from typing import Callable, cast
 
 from .checkpoint import CheckpointStore
+from .completion import CompletionCheck, CompletionResult
+from .messages import text_of
 from .core import Agent, run
 from .event_journal import EventJournal, merge_checkpoint_with_journal
 from .evidence import EvidenceStore, evidence_pack_from_state
-from .reconciliation import OperationReconciler, reconcile_pending
-from .protocols import AgentEndEvent, Event
+from .reconciliation import (
+    BashOperationReconciler,
+    OperationReconciler,
+    reconcile_pending,
+    restore_tool_results,
+)
+from .protocols import (
+    AgentEndEvent,
+    Event,
+    GoalStatusEvent,
+    ModelRequestEvent,
+    ModelResponseEvent,
+)
 from .run_control import (
+    GuardedOperationLedger,
     OperationLedger,
     OperationRecord,
     RunControlError,
@@ -28,7 +44,8 @@ from .run_control import (
     RunStatus,
     RunStore,
 )
-from .state import State
+from .state import State, StateResourceLimitError
+from .sqlite_state import SqliteCheckpointStore
 from .tools import AbortFlag
 from .workspace import WorkspaceManager, WorkspaceRef
 
@@ -49,11 +66,13 @@ class _LeaseHeartbeat:
         lease: RunRecord,
         *,
         interval_seconds: float,
+        lease_seconds: float,
     ) -> None:
+        self._lease_seconds = lease_seconds
         self._run_store = run_store
         self._lease = lease
         self._interval_seconds = interval_seconds
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._stop = threading.Event()
         self._lost = threading.Event()
         self._thread: threading.Thread | None = None
@@ -76,6 +95,20 @@ class _LeaseHeartbeat:
     def lease(self) -> RunRecord:
         with self._lock:
             return self._lease
+
+    @contextmanager
+    def guard(self) -> Iterator[None]:
+        with self._lock:
+            self._assert_active()
+            with ExitStack() as stack:
+                try:
+                    stack.enter_context(self._run_store.guard(self._lease))
+                except RunControlError as exc:
+                    self._lost.set()
+                    raise LeaseLostError("Run lease no longer permits writes") from exc
+                # A tool's ledger conflict is not evidence that the Run lease
+                # was lost; only failure to acquire the guard fences this worker.
+                yield
 
     def update_progress(self, **kwargs: int | None) -> RunRecord:
         with self._lock:
@@ -105,7 +138,7 @@ class _LeaseHeartbeat:
                 with self._lock:
                     self._assert_active()
                     self._lease = self._run_store.renew_lease(
-                        self._lease, lease_seconds=self._interval_seconds * 3
+                        self._lease, lease_seconds=self._lease_seconds
                     )
             except BaseException:
                 self._lost.set()
@@ -138,11 +171,50 @@ class RecoverableRunExecutor:
         lease_seconds: float = 30.0,
         lease_renew_interval_seconds: float | None = None,
         checkpoint_every_events: int = 10,
+        completion_check: CompletionCheck | None = None,
+        max_attempts: int = 3,
+        max_model_calls: int | None = None,
+        max_tokens: int | None = None,
+        wall_clock_seconds: float | None = None,
     ) -> None:
+        if (
+            isinstance(checkpoint_store, SqliteCheckpointStore)
+            and event_journal is not None
+        ):
+            raise ValueError(
+                "SQLite state already owns its event journal; omit event_journal"
+            )
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be greater than zero")
         if checkpoint_every_events <= 0:
             raise ValueError("checkpoint_every_events must be greater than zero")
+        if (
+            isinstance(max_attempts, bool)
+            or not isinstance(max_attempts, int)
+            or max_attempts < 1
+        ):
+            raise ValueError(
+                f"max_attempts must be a positive integer, got {max_attempts!r}"
+            )
+        for name, value in (
+            ("max_model_calls", max_model_calls),
+            ("max_tokens", max_tokens),
+        ):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 1
+            ):
+                raise ValueError(f"{name} must be a positive integer, got {value!r}")
+        if wall_clock_seconds is not None and (
+            not math.isfinite(wall_clock_seconds) or wall_clock_seconds <= 0
+        ):
+            raise ValueError(
+                f"wall_clock_seconds must be positive and finite, got {wall_clock_seconds!r}"
+            )
+        self.max_model_calls = max_model_calls
+        self.max_tokens = max_tokens
+        self.wall_clock_seconds = wall_clock_seconds
+        self.completion_check = completion_check
+        self.max_attempts = max_attempts
         self.run_store = run_store
         self.checkpoint_store = checkpoint_store
         self.operation_ledger = operation_ledger
@@ -171,6 +243,16 @@ class RecoverableRunExecutor:
         """Persist the initial state and make a Run available to workers."""
 
         state.data["run_id"] = run_id
+        state.data["completion_required"] = self.completion_check is not None
+        state.data["max_attempts"] = self.max_attempts
+        state.data["attempts_started"] = 0
+        state.data["run_budget"] = {
+            "max_model_calls": self.max_model_calls,
+            "max_tokens": self.max_tokens,
+            "deadline": time.time() + self.wall_clock_seconds
+            if self.wall_clock_seconds is not None
+            else None,
+        }
         workspace_ref = state.data.get("workspace_ref")
         if isinstance(workspace_ref, WorkspaceRef):
             workspace_ref = workspace_ref.workspace_id
@@ -200,6 +282,7 @@ class RecoverableRunExecutor:
         agent: Agent,
         *,
         task: str | None = None,
+        agent_for_state: Callable[[State], Agent] | None = None,
         max_turns: int = 10,
         abort: AbortFlag = lambda: False,
     ) -> tuple[State, Iterator[Event]]:
@@ -208,7 +291,49 @@ class RecoverableRunExecutor:
         lease = self.run_store.acquire_lease(
             handle.run_id, handle.worker_id, lease_seconds=self.lease_seconds
         )
+        heartbeat = _LeaseHeartbeat(
+            self.run_store,
+            lease,
+            interval_seconds=self.lease_renew_interval_seconds,
+            lease_seconds=self.lease_seconds,
+        )
+        heartbeat.start()
+        try:
+            if self.operation_ledger is not None and self.operation_ledger.list_pending(
+                handle.run_id
+            ):
+                heartbeat.transition("reconciling")
+            state = self._restore(
+                handle, agent, heartbeat.lease(), task, heartbeat=heartbeat
+            )
+            heartbeat.transition("running")
+        except StateResourceLimitError:
+            heartbeat.release(status="budget_exhausted")
+            raise
+        finally:
+            heartbeat.stop()
+        lease = heartbeat.lease()
+        return state, self._events(
+            handle,
+            agent,
+            state,
+            lease=lease,
+            max_turns=max_turns,
+            abort=abort,
+            agent_for_state=agent_for_state,
+        )
+
+    def _restore(
+        self,
+        handle: RecoverableRun,
+        agent: Agent,
+        lease: RunRecord,
+        task: str | None,
+        *,
+        heartbeat: _LeaseHeartbeat,
+    ) -> State:
         state = self.checkpoint_store.load(handle.checkpoint_id)
+        state.write_guard = heartbeat.guard
         if self.workspace_manager is not None and lease.workspace_ref is not None:
             try:
                 state.data["workspace_ref"] = lease.workspace_ref
@@ -216,42 +341,55 @@ class RecoverableRunExecutor:
                     self.workspace_manager.resolve(lease.workspace_ref)
                 )
             except (FileNotFoundError, ValueError) as exc:
-                lease = self.run_store.transition(lease, "blocked")
-                self.run_store.release_lease(lease, status="blocked")
                 self._save_evidence(state)
+                heartbeat.release(status="blocked")
                 raise RunControlError(
-                    f"Run {handle.run_id!r} workspace cannot be recovered: {exc}"
+                    f"Run workspace cannot be recovered: {exc}"
                 ) from exc
         if self.event_journal is not None:
             state = merge_checkpoint_with_journal(
                 state, self.event_journal.read(handle.run_id)
             )
-        if self.operation_ledger is not None:
-            state.data["operation_ledger"] = self.operation_ledger
-        if task is not None and not state.messages:
-            state = agent._default_init_state(task)
         state.data["run_id"] = handle.run_id
         state.data["fencing_token"] = lease.fencing_token
-        if self.operation_ledger is not None and self.operation_ledger.list_pending(
-            handle.run_id
-        ):
-            lease = self.run_store.transition(lease, "reconciling")
+        if self.operation_ledger is not None:
+            deadline = state.data.get("run_budget", {}).get("deadline")
+
+            def recovery_adapter(operation):
+                if deadline is not None and time.time() >= deadline:
+                    raise StateResourceLimitError("deadline reached during recovery")
+                with heartbeat.guard():
+                    adapter = (
+                        self.reconciler_for(operation) if self.reconciler_for else None
+                    )
+                if isinstance(adapter, BashOperationReconciler):
+                    if deadline is not None:
+                        adapter.timeout_seconds = min(
+                            adapter.timeout_seconds, max(0.01, deadline - time.time())
+                        )
+                return adapter
+
             outcomes = reconcile_pending(
-                self.operation_ledger,
+                GuardedOperationLedger(self.operation_ledger, heartbeat.guard),
                 handle.run_id,
-                self.reconciler_for or (lambda operation: None),
+                recovery_adapter,
             )
+            if deadline is not None and time.time() >= deadline:
+                raise StateResourceLimitError("deadline reached during recovery")
             if any(outcome.status != "confirmed" for _, outcome in outcomes):
-                lease = self.run_store.transition(lease, "blocked")
-                self.run_store.release_lease(lease, status="blocked")
                 self._save_evidence(state)
+                heartbeat.release(status="blocked")
                 raise RunControlError(
                     f"Run {handle.run_id!r} has an operation that could not be reconciled"
                 )
-        lease = self.run_store.transition(lease, "running")
-        return state, self._events(
-            handle, agent, state, max_turns=max_turns, abort=abort
+        restore_tool_results(
+            state, self.operation_ledger, str(state.data.get("agent_name", agent.name))
         )
+        if not state.messages:
+            if task is not None:
+                state.task = task
+            state.send("task", "user", agent.name, state.task)
+        return state
 
     def _save_evidence(self, state: State) -> None:
         if self.evidence_store is not None:
@@ -265,79 +403,295 @@ class RecoverableRunExecutor:
         agent: Agent,
         state: State,
         *,
+        lease: RunRecord,
+        agent_for_state: Callable[[State], Agent] | None,
         max_turns: int,
         abort: AbortFlag,
     ) -> Iterator[Event]:
-        lease = self.run_store.get(handle.run_id)
         heartbeat = _LeaseHeartbeat(
             self.run_store,
             lease,
             interval_seconds=self.lease_renew_interval_seconds,
+            lease_seconds=self.lease_seconds,
         )
-        heartbeat.start()
-        last_checkpoint = len(state.events)
-        try:
+        state.write_guard = heartbeat.guard
+        if self.operation_ledger is not None:
+            state.data["operation_ledger"] = GuardedOperationLedger(
+                self.operation_ledger, heartbeat.guard
+            )
+        persisted = (
+            len(self.event_journal.read(handle.run_id)) if self.event_journal else 0
+        )
+        last_checkpoint = 0
+        released = False
+        budget = state.data.get("run_budget", {})
+        accounted = 0
+        model_calls = 0
+        tokens = 0
 
-            def combined_abort() -> bool:
-                return abort() or heartbeat.lost
-
-            for event in run(agent, state, max_turns=max_turns, abort=combined_abort):
-                if heartbeat.lost:
-                    raise LeaseLostError(
-                        "Run lease was lost while the Agent was executing"
-                    )
-                if self.event_journal is not None:
-                    self.event_journal.append(handle.run_id, event)
-                yield event
-                if len(
-                    state.events
-                ) - last_checkpoint >= self.checkpoint_every_events or isinstance(
-                    event, AgentEndEvent
+        def budget_reason(*, before_request: bool = False) -> str:
+            nonlocal accounted, model_calls, tokens
+            for observed in state.events[accounted:]:
+                if isinstance(observed, ModelRequestEvent):
+                    model_calls += 1
+                elif (
+                    isinstance(observed, ModelResponseEvent)
+                    and observed.usage is not None
                 ):
+                    tokens += (
+                        observed.usage.input_tokens
+                        + observed.usage.output_tokens
+                        + observed.usage.cache_read_tokens
+                        + observed.usage.cache_write_tokens
+                    )
+            accounted = len(state.events)
+            if budget.get("deadline") is not None and time.time() >= budget["deadline"]:
+                return "durable wall-clock deadline reached"
+            if budget.get("max_tokens") is not None and tokens >= budget["max_tokens"]:
+                return "durable reported token budget reached"
+            # A request event reserves its slot before generate() is called.
+            if budget.get("max_model_calls") is not None and model_calls > budget[
+                "max_model_calls"
+            ] - (0 if before_request else 1):
+                return "durable model-call budget reached"
+            return ""
+
+        def exhaust(reason: str) -> None:
+            state.data["budget_reason"] = reason
+            finish("budget_exhausted")
+
+        def persist(*, checkpoint: bool = False) -> None:
+            nonlocal persisted, last_checkpoint
+            with heartbeat.guard():
+                if self.event_journal is not None:
+                    for event in state.events[persisted:]:
+                        self.event_journal.append(handle.run_id, event)
+                        persisted = event.index + 1
+                if checkpoint:
                     self.checkpoint_store.save(handle.checkpoint_id, state)
                     last_checkpoint = len(state.events)
-                    lease = heartbeat.update_progress(
-                        latest_event_index=event.index,
-                        checkpoint_event_index=event.index,
-                    )
-                if isinstance(event, AgentEndEvent):
-                    status = cast(
-                        RunStatus,
-                        {
-                            "done": "complete",
-                            "abort": "aborted",
-                            "max_turns": "runnable",
-                            "tool_terminate": "complete",
-                        }[event.reason],
-                    )
-                    lease = heartbeat.transition(status)
-                    heartbeat.release(status=status)
-                    self._save_evidence(state)
-                    return
-        except LeaseLostError:
-            raise
-        except BaseException:
-            if heartbeat.lost:
-                raise LeaseLostError(
-                    "Run lease was lost while handling a worker failure"
-                )
-            self.checkpoint_store.save(handle.checkpoint_id, state)
-            try:
                 heartbeat.update_progress(
                     latest_event_index=state.events[-1].index if state.events else -1,
-                    checkpoint_event_index=state.events[-1].index
-                    if state.events
-                    else -1,
+                    checkpoint_event_index=(
+                        state.events[-1].index if state.events else -1
+                    )
+                    if checkpoint
+                    else None,
                 )
-                heartbeat.release(status="runnable")
+
+        def finish(status: RunStatus) -> None:
+            nonlocal released
+            with heartbeat.guard():
+                persist(checkpoint=True)
                 self._save_evidence(state)
-            except RunControlError as exc:
-                raise LeaseLostError(
-                    "Run lease was lost while handling a worker failure"
-                ) from exc
+                heartbeat.release(status=status)
+                released = True
+
+        try:
+            heartbeat.start()
+            persist(checkpoint=True)
+            last = state.events[-1] if state.events else None
+            # A crash may happen after the verdict is durable but before release.
+            if isinstance(last, GoalStatusEvent):
+                if last.status != "active":
+                    finish(cast(RunStatus, last.status))
+                    return
+                state.send(
+                    "message",
+                    "user",
+                    agent.name,
+                    f"External verification failed. Continue the original task: {last.reason}",
+                )
+                persist(checkpoint=True)
+            if state.data.get("completion_required") and self.completion_check is None:
+                status = self._completion_status(
+                    state, agent, AgentEndEvent(reason="done")
+                )
+                finish(status)
+                return
+
+            reason = budget_reason(before_request=isinstance(last, AgentEndEvent))
+            if reason:
+                exhaust(reason)
+                return
+            if not isinstance(last, AgentEndEvent):
+                attempts = int(
+                    state.data.get(
+                        "attempts_started",
+                        sum(isinstance(event, AgentEndEvent) for event in state.events),
+                    )
+                )
+                if attempts >= int(state.data.get("max_attempts", self.max_attempts)):
+                    exhaust("durable attempt budget reached")
+                    return
+                state.data["attempts_started"] = attempts + 1
+                persist(checkpoint=True)
+                if agent_for_state is not None:
+                    prepared = agent_for_state(state)
+                    previous_name = state.data.get("agent_name")
+                    if previous_name is not None and prepared.name != previous_name:
+                        raise ValueError(
+                            "agent_for_state must preserve the persisted agent name"
+                        )
+                    agent = prepared
+                    state.data["agent_name"] = agent.name
+                    persist(checkpoint=True)
+
+            def combined_abort() -> bool:
+                # Call slots are checked at ModelRequestEvent, before dispatch.
+                deadline = budget.get("deadline")
+                return (
+                    abort()
+                    or heartbeat.lost
+                    or (deadline is not None and time.time() >= deadline)
+                )
+
+            # Re-run only the verifier if the previous worker durably ended a
+            # model attempt but died before verifying it. Verifiers must be safe to repeat.
+            events = (
+                iter([last])
+                if isinstance(last, AgentEndEvent)
+                else run(agent, state, max_turns=max_turns, abort=combined_abort)
+            )
+            for event in events:
+                persist(
+                    checkpoint=isinstance(
+                        event, (ModelRequestEvent, ModelResponseEvent)
+                    )
+                    or len(state.events) - last_checkpoint
+                    >= self.checkpoint_every_events
+                )
+                if isinstance(event, (ModelRequestEvent, ModelResponseEvent)):
+                    reason = budget_reason(before_request=True)
+                    if reason:
+                        exhaust(reason)
+                        return
+                yield event
+                if isinstance(event, AgentEndEvent):
+                    reason = budget_reason(before_request=True)
+                    if reason:
+                        exhaust(reason)
+                        return
+                    boundary = len(state.events)
+                    status = self._completion_status(state, agent, event)
+                    finish(status)
+                    yield from state.events[boundary:]
+                    return
+        except StateResourceLimitError:
+            # The rejected event is absent; preserve the last committed state
+            # and stop scheduling retries that would hit the same resource limit.
+            try:
+                finish("budget_exhausted")
+            except StateResourceLimitError:
+                # SQLite events are already durable even if metadata cannot fit.
+                heartbeat.release(status="budget_exhausted")
+                released = True
+            raise
+        except LeaseLostError:
+            raise
+        except BaseException as exc:
+            # Flush every recorded event before the snapshot so an exception
+            # cannot leave a checkpoint ahead of its event journal.
+            if not released:
+                state.data["last_error"] = f"{type(exc).__name__}: {exc}"[:2000]
+                exhausted = int(state.data.get("attempts_started", 0)) >= int(
+                    state.data.get("max_attempts", self.max_attempts)
+                )
+                reason = (
+                    "durable attempt budget reached" if exhausted else budget_reason()
+                )
+                if reason:
+                    state.data["budget_reason"] = reason
+                finish("budget_exhausted" if reason else "runnable")
             raise
         finally:
             heartbeat.stop()
+
+    def _completion_status(
+        self, state: State, agent: Agent, end: AgentEndEvent
+    ) -> RunStatus:
+        if end.reason == "abort":
+            return "aborted"
+        if self.completion_check is None:
+            if state.data.get("completion_required"):
+                state.record_event(
+                    GoalStatusEvent(
+                        objective=state.task
+                        if isinstance(state.task, str)
+                        else text_of(state.task),
+                        status="blocked",
+                        turns_used=0,
+                        reason="Required completion verifier is missing after recovery",
+                    )
+                )
+                return "blocked"
+            if end.reason != "max_turns":
+                return "finished"
+            attempts = int(
+                state.data.get(
+                    "attempts_started",
+                    sum(isinstance(event, AgentEndEvent) for event in state.events),
+                )
+            )
+            if attempts >= int(state.data.get("max_attempts", self.max_attempts)):
+                return "budget_exhausted"
+            state.send(
+                "message", "user", agent.name, "Continue working on the original task."
+            )
+            return "runnable"
+
+        attempts = int(
+            state.data.get(
+                "attempts_started",
+                sum(isinstance(event, AgentEndEvent) for event in state.events),
+            )
+        )
+        limit = int(state.data.get("max_attempts", self.max_attempts))
+        try:
+            verdict = self.completion_check(state)
+        except Exception as exc:
+            verdict = CompletionResult(
+                False,
+                blocked=True,
+                reason=f"Verifier failed: {type(exc).__name__}: {exc}",
+            )
+        deadline = state.data.get("run_budget", {}).get("deadline")
+        expired = deadline is not None and time.time() >= deadline
+        if expired:
+            state.data["budget_reason"] = (
+                "durable wall-clock deadline reached during verification"
+            )
+        status = (
+            "budget_exhausted"
+            if expired
+            else "complete"
+            if verdict.done
+            else "blocked"
+            if verdict.blocked
+            else "budget_exhausted"
+            if attempts >= limit
+            else "active"
+        )
+        state.record_event(
+            GoalStatusEvent(
+                objective=state.task
+                if isinstance(state.task, str)
+                else text_of(state.task),
+                status=status,
+                turns_used=attempts,
+                reason=verdict.reason,
+            )
+        )
+        if status == "active":
+            state.send(
+                "message",
+                "user",
+                agent.name,
+                "External verification has not passed. Continue working on the "
+                f"original task. Verification feedback: {verdict.reason}",
+            )
+            return "runnable"
+        return cast(RunStatus, status)
 
 
 class RecoveryScanner:

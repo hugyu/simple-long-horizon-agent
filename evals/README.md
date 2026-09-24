@@ -413,3 +413,42 @@ Evals should help answer:
 - Can we score model-call trajectories without scraping terminal output?
 - Are changes making the system easier or harder to understand?
 - Do reference architecture ideas improve the project in practice?
+
+## Result evidence
+
+A reported benchmark score needs a retrievable evidence pack before it can be
+presented as independently reproducible:
+
+- Code commit and source diff/hash, task IDs and dataset revision.
+- Exact model, reasoning settings, prompts, tools, budgets, retries and timeout policy.
+- Scorer version, expected denominator, every task outcome (including missing/failed runs),
+  raw scorer output, trajectories and generated patches.
+- Token accounting and the price source; unknown costs stay unknown.
+- For comparisons, matching dataset/scorer versions and controlled settings.
+
+The historical README scores currently lack that complete evidence pack in this
+checkout. New smoke tests do not validate those historical scores. In particular,
+the Terminal-Bench 2.1 score and linked 2.0 reference cannot establish a controlled gain.
+
+### Paired context experiment
+
+```bash
+uv run python -m evals.context_ablation --cases 12 --output evals/out/context-smoke
+uv run python -m evals.context_ablation --provider openai --cases 12 --output evals/out/context-live
+```
+
+The first command checks experiment wiring using a scripted model. The second
+uses standard provider variables (or `--dotenv PATH`) and calls the actual model.
+Each case has the same saved tool transcript, task, recall tool and turn/output
+budget in both arms. The only treatment is tool-exchange compression; arm order
+alternates. Exact-match scoring checks retrieval of a fixed code hidden inside
+an older report. This is a small synthetic retrieval experiment, not a SWE-bench
+result or proof of statistical significance.
+
+`manifest.json` records the configuration and source hash, `source.tar.gz`
+preserves the exact runnable source and dependency lock, `results.jsonl`
+retains every case including errors, per-case JSONL files preserve traces, and
+`summary.json` aggregates success and estimated context size. Provider usage
+and estimated cost are recorded separately from approximate context tokens;
+missing usage or price information does not become zero cost. Use a fresh output
+directory so unsuccessful experiments remain available for review.

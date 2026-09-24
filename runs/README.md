@@ -151,3 +151,16 @@ bash runs/swebench/eval_swebench.sh --pro --predictions evals/out/swebench_pro/s
 
 See `evals/swebench/README.md` for detailed Docker setup, macOS arm64
 workarounds, and troubleshooting.
+
+## Recoverable code-task acceptance
+
+```bash
+uv run python -m examples.recoverable_code_task.demo --hard-crash --output evals/out/recovery-demo
+```
+
+Use a fresh output directory. See [the recovery contract](../docs/runtime-recovery.md)
+for verified completion, artifacts and the real-model mode.
+
+The [unified long-task entry](../docs/runtime-recovery.md#unified-long-task-entry)
+combines durable budgets, SQLite, compaction/Recall and caller-owned verification.
+It accepts a real Git workspace and exports reproducible task artifacts.

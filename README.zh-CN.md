@@ -49,19 +49,19 @@ Simple Long Horizon Agent 足够小，可以被完整理解和自由修改；同
 
 我们聚焦三类长程任务评测：软件工程、终端操作和自主模型后训练。可复现结果将在这里发布，并完整注明模型、Agent 配置和成本。
 
-| Benchmark | 模型 | **分数 ↑** | 同模型基线 | **相对基线提升 ↑** | 单任务成本 |
+| Benchmark | 模型 | **分数 ↑** | 公开参考结果 | **报告分数相对差值** | 单任务成本 |
 | --- | --- | ---: | ---: | ---: | ---: |
 | [SWE-bench Pro](evals/swebench/README.md)[^swe-chain]<br>Resolved (%) | GPT-5.4 (xHigh) | **63.20%** | [59.10%](https://labs.scale.com/leaderboard/swe_bench_pro_public) | **+6.94%** | $7.7823 |
-| [Terminal-Bench](evals/harbor/README.md)<br>2.1 官方分数 | GPT-5.3-Codex (xHigh) | **77.53%** | [64.70%](https://www.tbench.ai/leaderboard/terminal-bench/2.0) | **+19.83%** | $0.5667 |
+| [Terminal-Bench](evals/harbor/README.md)<br>2.1 官方分数 | GPT-5.3-Codex (xHigh) | **77.53%** | [64.70%](https://www.tbench.ai/leaderboard/terminal-bench/2.0) | — | $0.5667 |
 | [PostTrainBench](https://posttrainbench.com/)[^posttrain]<br>加权平均分 | GPT-5.5 (xHigh) | **45.88%** | [43.97%](https://posttrainbench.com/) | **+4.34%** | — |
 
 [^swe-chain]: 我们采用与 [ChainSWE](https://arxiv.org/abs/2607.02606v1) 类似的链式运行方式，并加入 `task` 工具。
 
 [^posttrain]: 我们在 Qwen3-4B-Base 模型上评估 AIME 2025、BFCL、GSM8K 和 HumanEval 四项任务；归一化奖励采用 [OpenAI PostTrainBench Lite 方法](https://deploymentsafety.openai.com/gpt-5-6-preview/performance-in-cases-flagged-by-users)。
 
-**相对基线提升**表示：在使用相同模型和任务预算时，相比基础方案取得的分数增益。它用于区分 Agent 带来的价值与底层模型本身的能力。
+以上为此前报告的成绩。当前 checkout 未包含对应的完整运行配置和原始评分产物，无法独立复算。公开参考结果不等于受控消融：Terminal-Bench 参考链接为 2.0，而本项目报告的是 2.1，因此该行不计算相对差值。其他差值仅为算术比较，不能据此把收益归因于某个 Runtime 模块。参见[评测证据要求](evals/README.md#result-evidence)及其中的可运行上下文对照实验。
 
-破折号表示“尚未发布”，而不是零分。
+破折号表示数据尚缺或不适合比较，而不是零分。
 
 ## 快速开始
 
@@ -91,6 +91,8 @@ uv run python -m scripts.run_bash_agent_demo \
 ```
 
 更多模型配置请参考 [.env.example](.env.example)。
+
+真实的持续代码任务请使用[统一长程入口](docs/runtime-recovery.md#unified-long-task-entry)：默认组合 SQLite 恢复、持久化预算、上下文压缩/Recall 和调用方固定验收，并导出补丁与运行证据。
 
 ## 适用场景
 

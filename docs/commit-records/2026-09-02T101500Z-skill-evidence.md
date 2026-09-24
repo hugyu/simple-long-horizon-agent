@@ -28,7 +28,8 @@ with tool outcomes, verification metadata, workspace identity, and stop reason.
 - `tests/unit/test_skills.py`, `tests/unit/test_evidence.py`,
   `tests/unit/test_core.py`: cover Skill event recording, evidence summaries,
   public API, and Checkpoint round trips.
-- `docs/design/16-recoverable-code-task-runtime.md`: mark the Phase 3 boundary
+- Runtime design notes (subsequently removed during documentation cleanup):
+  mark the Phase 3 boundary
   and its non-invasive evidence semantics.
 
 ## Verification

@@ -14,7 +14,8 @@ import json
 import os
 import tempfile
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Iterator
+from contextlib import contextmanager, AbstractContextManager
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
 from typing import Any, cast, Literal, Protocol
@@ -30,6 +31,8 @@ RunStatus = Literal[
     "waiting_external",
     "reconciling",
     "complete",
+    "finished",
+    "budget_exhausted",
     "blocked",
     "aborted",
     "failed",
@@ -79,6 +82,10 @@ class RunRecord:
 
 
 class RunStore(Protocol):
+    def guard(self, record: RunRecord) -> AbstractContextManager[None]:
+        """Fence artifact writes under the same lock used to acquire a lease."""
+        ...
+
     def create(self, record: RunRecord) -> RunRecord: ...
 
     def get(self, run_id: str) -> RunRecord: ...
@@ -114,6 +121,7 @@ class FileRunStore:
     ) -> None:
         self.root = Path(root)
         self._clock = clock
+        self._locks: dict[str, FileLock] = {}
 
     def _path(self, run_id: str) -> Path:
         if not run_id or Path(run_id).name != run_id:
@@ -121,7 +129,16 @@ class FileRunStore:
         return self.root / f"{run_id}.json"
 
     def _lock(self, run_id: str) -> FileLock:
-        return FileLock(str(self.root / f".{run_id}.lock"))
+        self._path(run_id)
+        return self._locks.setdefault(
+            run_id, FileLock(str(self.root / f".{run_id}.lock"))
+        )
+
+    @contextmanager
+    def guard(self, record: RunRecord) -> Iterator[None]:
+        with self._lock(record.run_id):
+            self._assert_lease(self.get(record.run_id), record)
+            yield
 
     def create(self, record: RunRecord) -> RunRecord:
         path = self._path(record.run_id)
@@ -243,7 +260,15 @@ class FileRunStore:
     def release_lease(
         self, record: RunRecord, *, status: RunStatus = "runnable"
     ) -> RunRecord:
-        if status not in {"runnable", "complete", "blocked", "aborted", "failed"}:
+        if status not in {
+            "runnable",
+            "complete",
+            "finished",
+            "budget_exhausted",
+            "blocked",
+            "aborted",
+            "failed",
+        }:
             raise ValueError(
                 f"release status must be terminal or runnable, got {status!r}"
             )
@@ -306,6 +331,38 @@ class OperationLedger(Protocol):
     ) -> OperationRecord: ...
 
 
+class GuardedOperationLedger:
+    """Fence each ledger mutation with the executor's current Run lease."""
+
+    def __init__(
+        self,
+        ledger: OperationLedger,
+        guard: Callable[[], AbstractContextManager[None]],
+    ) -> None:
+        self.ledger = ledger
+        self.guard = guard
+
+    def create_intent(self, record: OperationRecord) -> OperationRecord:
+        with self.guard():
+            return self.ledger.create_intent(record)
+
+    def get(self, operation_id: str) -> OperationRecord:
+        return self.ledger.get(operation_id)
+
+    def list_pending(self, run_id: str) -> builtins.list[OperationRecord]:
+        return self.ledger.list_pending(run_id)
+
+    def transition(
+        self,
+        record: OperationRecord,
+        status: OperationStatus,
+        *,
+        result: Mapping[str, object] | None = None,
+    ) -> OperationRecord:
+        with self.guard():
+            return self.ledger.transition(record, status, result=result)
+
+
 class FileOperationLedger:
     """Filesystem operation ledger with idempotency-key deduplication."""
 
@@ -346,8 +403,6 @@ class FileOperationLedger:
                     f"Operation already exists: {record.operation_id}"
                 )
             _atomic_write(self._path(record.operation_id), record)
-            index[record.idempotency_key] = record.operation_id
-            _atomic_write(self._index_path(), index)
             return record
 
     def get(self, operation_id: str) -> OperationRecord:
@@ -364,7 +419,11 @@ class FileOperationLedger:
             if path.name == "idempotency.json":
                 continue
             record = self.get(path.stem)
-            if record.run_id == run_id and record.status in {"started", "unknown"}:
+            if record.run_id == run_id and record.status in {
+                "started",
+                "unknown",
+                "blocked",
+            }:
                 pending.append(record)
         return pending
 
@@ -397,13 +456,12 @@ class FileOperationLedger:
             return updated
 
     def _read_index(self) -> dict[str, str]:
-        try:
-            value = json.loads(self._index_path().read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return {}
-        if not isinstance(value, dict):
-            raise ValueError("Operation ledger idempotency index must be an object")
-        return {str(key): str(item) for key, item in value.items()}
+        return {
+            record.idempotency_key: record.operation_id
+            for path in self.root.glob("*.json")
+            if path.name != "idempotency.json"
+            for record in [self.get(path.stem)]
+        }
 
 
 _ALLOWED_OPERATION_TRANSITIONS: dict[OperationStatus, tuple[OperationStatus, ...]] = {
@@ -505,6 +563,8 @@ _RUN_STATUSES = {
     "waiting_external",
     "reconciling",
     "complete",
+    "finished",
+    "budget_exhausted",
     "blocked",
     "aborted",
     "failed",

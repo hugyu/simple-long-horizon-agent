@@ -16,6 +16,12 @@ concrete strategies and the runtime that applies them, depending on
 - `runtime` — the framework that turns a `CompressionDecision` into recorded
   events; strategy authors do not need to read it.
 
+Summary folds receive a runtime-generated source citation after tool-pair
+alignment. The citation is visible model content and names stable transcript
+indices for `recall`; original messages remain in State. A later fold can cite
+an earlier summary, allowing recall to follow the source chain. Structural
+1->1 rewrites do not receive summary citations.
+
 A policy holds a single `strategy` (the Strategy pattern); set
 `ContextPolicy.strategy` to the one you want and swap implementations to
 compare approaches.

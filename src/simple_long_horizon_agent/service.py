@@ -11,6 +11,7 @@ from collections.abc import Callable, Iterator
 from typing import TypeVar
 
 from .core import Agent
+from .messages import assistant_message
 from .protocols import Event
 from .recoverable_runtime import (
     RecoverableRun,
@@ -94,8 +95,10 @@ class RecoverableRuntimeService:
 
     def _recover(self, record: RunRecord) -> None:
         handle = RecoverableRun(record.run_id, record.run_id, self.worker_id)
-        agent = self.agent_for(record)
-        _, events = self.executor.execute(handle, agent)
+        agent = Agent("worker", lambda visible: assistant_message("unbound worker"))
+        _, events = self.executor.execute(
+            handle, agent, agent_for_state=lambda state: self.agent_for(record)
+        )
         self._drain(events)
 
     @staticmethod

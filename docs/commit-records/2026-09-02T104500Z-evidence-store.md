@@ -23,7 +23,8 @@ latest summary without reconstructing the entire in-memory execution.
   the evidence-store API and update the public surface contract.
 - `tests/unit/test_evidence.py`, `tests/unit/test_recoverable_runtime.py`:
   cover durable storage and executor completion output.
-- `docs/design/16-recoverable-code-task-runtime.md`: document durable evidence
+- Runtime design notes (subsequently removed during documentation cleanup):
+  document durable evidence
   behavior and its remaining limitations.
 
 ## Verification

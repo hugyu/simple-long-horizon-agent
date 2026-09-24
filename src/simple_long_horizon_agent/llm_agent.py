@@ -29,6 +29,7 @@ from .llm.bridge import (
 from .llm.provider import Provider as LLMProvider
 from .llm.provider import ReasoningEffort
 from .llm.retry import complete_with_tool_call_retry
+from .llm.stream import complete
 from .llm.types import LLMRequest
 from .messages import Message
 from .tools import AgentTool
@@ -48,6 +49,7 @@ def make_llm_agent(
     init_state: StateInitFn | None = None,
     hooks: HookMap | None = None,
     timeout_seconds: float | None = None,
+    retry_model_calls: bool = True,
 ) -> Agent:
     """Build an `Agent` whose `generate` is backed by `provider`.
 
@@ -61,7 +63,9 @@ def make_llm_agent(
     (`complete_with_tool_call_retry`, which layers `complete_with_retry`):
     transient provider throttling (TPM / rate-limit / 429) and a malformed
     tool call in the model's own output. Every LLM-backed agent gets both
-    without each caller re-wrapping `generate`.
+    without each caller re-wrapping `generate`. Durable callers can set
+    `retry_model_calls=False` to let their outer attempt budget own retries.
+    Provider SDK transport retries remain provider-owned.
     """
     # Resolve the effective system prompt once so the value `generate` sends
     # and the value recorded on the `Agent` (for the request trace) can't drift.
@@ -90,7 +94,11 @@ def make_llm_agent(
             request = dataclasses.replace(
                 request, timeout_seconds=effective_timeout_seconds
             )
-        response = complete_with_tool_call_retry(request)
+        response = (
+            complete_with_tool_call_retry(request)
+            if retry_model_calls
+            else complete(request)
+        )
         kind = "final" if response.stop_reason == "end_turn" else "step"
         return llm_response_to_assistant_message(
             response,

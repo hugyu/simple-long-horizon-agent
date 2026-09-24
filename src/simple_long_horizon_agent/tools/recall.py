@@ -76,6 +76,7 @@ def make_recall_tool(
         del call_id, abort, on_update
         try:
             indices = _coerce_indices(args.get("indices"), max_indices=max_indices)
+            offset = coerce_int("offset", args.get("offset", 0), minimum=0)
         except ValueError as exc:
             return text_result(f"Invalid recall argument: {exc}", is_error=True)
         messages = state.messages
@@ -92,7 +93,7 @@ def make_recall_tool(
         returned = indices
         for position, index in enumerate(indices):
             block = render_transcript_message(
-                index, messages[index], max_chars=max_chars_per_message
+                index, messages[index], max_chars=max_chars_per_message, offset=offset
             )
             cost = len(block) + (2 if rendered else 0)  # 2 for the "\n\n" joiner
             # Always return the first message (already per-message capped); stop
@@ -122,6 +123,11 @@ def make_recall_tool(
         parameters={
             "type": "object",
             "properties": {
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Character offset within each rendered message body. Use next_offset to continue a truncated message.",
+                },
                 "indices": {
                     "type": "array",
                     "items": {"type": "integer"},
@@ -138,7 +144,9 @@ def make_recall_tool(
     )
 
 
-def render_transcript_message(index: int, message: Message, *, max_chars: int) -> str:
+def render_transcript_message(
+    index: int, message: Message, *, max_chars: int, offset: int = 0
+) -> str:
     """Render one transcript message for the model: header plus visible content."""
     header = (
         f"[transcript message {index}] role={message.role} "
@@ -167,8 +175,11 @@ def render_transcript_message(index: int, message: Message, *, max_chars: int) -
         parts.append(f"({images} image block(s) omitted)")
     body = "\n".join(parts) or "(no visible content)"
     total = len(body)
-    if total > max_chars:
-        body = body[:max_chars] + f"\n… [truncated; {total} chars total]"
+    body = body[offset : offset + max_chars]
+    if offset + max_chars < total:
+        body += (
+            f"\n… [truncated; {total} chars total; next_offset={offset + max_chars}]"
+        )
     return f"{header}\n{body}"
 
 

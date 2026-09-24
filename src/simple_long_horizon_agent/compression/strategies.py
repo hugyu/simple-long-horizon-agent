@@ -41,7 +41,6 @@ one `strategy` slot.
 from __future__ import annotations
 
 import time
-from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -64,7 +63,12 @@ from ..messages import (
     tool_results_of,
 )
 from ..protocols import ModelRequestEvent, ModelResponseEvent
-from .runtime import _active_context_tokens, _align_tool_pairs, _tool_partners
+from .runtime import (
+    _active_context_tokens,
+    _align_tool_pairs,
+    _tool_partners,
+    format_index_ranges as format_index_ranges,
+)
 
 if TYPE_CHECKING:
     from ..core import Agent
@@ -86,23 +90,6 @@ DEFAULT_PRESERVE_KINDS: tuple[MessageKind, ...] = (
     "summary",
     "context",
 )
-
-
-def format_index_ranges(indices: Sequence[int]) -> str:
-    """Render indices as compact sorted ranges: (2, 3, 4, 7) -> '2-4, 7'."""
-    ordered = sorted(set(indices))
-    if not ordered:
-        return ""
-    ranges: list[str] = []
-    start = prev = ordered[0]
-    for index in ordered[1:]:
-        if index == prev + 1:
-            prev = index
-            continue
-        ranges.append(f"{start}-{prev}" if start != prev else f"{start}")
-        start = prev = index
-    ranges.append(f"{start}-{prev}" if start != prev else f"{start}")
-    return ", ".join(ranges)
 
 
 def continuation_preamble() -> str:
@@ -150,16 +137,49 @@ class ToolCompactStrategy:
             if self.keep_recent_exchanges
             else exchanges
         )
-        compress_indices = tuple(
+        previous = tuple(
+            index
+            for index, message in active
+            if message.kind == "summary"
+            and (message.sidecar or {}).get("compression", {}).get("strategy")
+            == "tool-compact"
+        )
+        compress_indices = previous + tuple(
             index
             for assistant_index, result_indices in old
             for index in (assistant_index, *result_indices)
+        )
+        observations = []
+        for index, message in active:
+            if index in previous:
+                observations.extend(
+                    line
+                    for line in text_of(message.content).splitlines()
+                    if line.startswith("- ")
+                )
+        observations.extend(
+            _format_compact_summary(active, old, self.preview_chars).splitlines()[1:]
+        )
+        # Keep recent distinct observations, not only the newest exchange.
+        # Citations still link evicted observations through earlier summaries.
+        observations = list(dict.fromkeys(reversed(observations)))[::-1]
+        limit = max(500, self.threshold_tokens)
+        while (
+            len(observations) > 1
+            and sum(len(line) + 1 for line in observations) > limit
+        ):
+            observations.pop(0)
+        summary = (
+            f"Compacted {len(old)} older tool exchange(s); recent observations:\n"
+            + "\n".join(observations)[-limit:]
+            + "\n"
         )
         return CompressionDecision(
             compress_indices=compress_indices,
             replacement=make_message(
                 "user",
-                _format_compact_summary(active, old, self.preview_chars) + "\n",
+                summary,
+                sidecar={"compression": {"strategy": "tool-compact"}},
                 sender="runtime",
                 target=agent_name,
                 kind="summary",

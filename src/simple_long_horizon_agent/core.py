@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Iterator, cast
 
 from .compression import maybe_compress_context
+from .compression.runtime import enforce_input_budget
 from .context_view import (
     ContextPolicy,
     build_context_view,
@@ -61,7 +62,7 @@ from .run_control import (
     RunControlError,
     operation_args_digest,
 )
-from .state import State
+from .state import State, StateResourceLimitError
 from .tools import AbortFlag, AgentTool, ToolResult, ToolUpdateFn, text_result
 
 if TYPE_CHECKING:
@@ -245,6 +246,8 @@ def run(
         for compression_event in maybe_compress_context(agent, state, policy):
             yield compression_event
 
+        yield from enforce_input_budget(agent, state, policy)
+
         context = build_context_view(
             name,
             state.active_context_messages(),
@@ -281,7 +284,25 @@ def run(
             )
         )
 
-        output = agent.generate(visible)
+        try:
+            output = agent.generate(visible)
+        except Exception as exc:
+            # Only explicit provider window errors qualify; other failures keep
+            # their normal retry policy. Persist the retry marker across restarts.
+            code = getattr(exc, "code", None)
+            if code not in {"context_length_exceeded", "context_window_exceeded"} or (
+                policy.max_input_tokens is None and policy.max_input_bytes is None
+            ):
+                raise
+            key = "context_overflow_retry:" + name
+            if state.data.get(key):
+                raise StateResourceLimitError(
+                    "Provider rejected context after emergency compaction; reduce fixed input or configured input allowance"
+                ) from exc
+            state.data[key] = True
+            yield from enforce_input_budget(agent, state, policy, force=True)
+            continue
+        state.data.pop("context_overflow_retry:" + name, None)
         output_tool_calls = message_tool_calls(output)
         yield state.record_event(
             ModelResponseEvent(
@@ -475,7 +496,10 @@ def dispatch_tool_calls(
                 if operation is not None and operation_ledger is not None:
                     operation_ledger.transition(
                         operation,
-                        "confirmed" if not result.is_error else "unknown",
+                        "confirmed"
+                        if result.execution_complete is True
+                        or (result.execution_complete is None and not result.is_error)
+                        else "unknown",
                         result={
                             "is_error": result.is_error,
                             "terminate": result.terminate,
@@ -549,10 +573,23 @@ def _execute_one(
     if tool is None:
         return text_result(f"Tool {tool_call.name!r} not found", is_error=True)
 
+    import threading
+
+    cancelled = threading.Event()
+
+    def tool_abort() -> bool:
+        return cancelled.is_set() or abort()
+
     def run_tool() -> ToolResult:
+        if tool_abort():
+            return text_result(
+                "Tool cancelled before execution",
+                is_error=True,
+                execution_complete=True,
+            )
         try:
             return tool.execute(
-                tool_call.id, dict(tool_call.arguments), abort, on_update
+                tool_call.id, dict(tool_call.arguments), tool_abort, on_update
             )
         except Exception as exc:
             return text_result(f"{type(exc).__name__}: {exc}", is_error=True)
@@ -569,12 +606,16 @@ def _execute_one(
         try:
             return future.result(timeout=tool.timeout_seconds)
         except FuturesTimeoutError:
+            cancelled.set()
+            # Python threads cannot be killed safely. Join before returning so
+            # the next action cannot race a timed-out writer. Tools must cooperate.
+            future.result()
             return text_result(
                 f"Tool {tool_call.name!r} timed out after {tool.timeout_seconds}s",
                 is_error=True,
             )
     finally:
-        pool.shutdown(wait=False)
+        pool.shutdown(wait=True)
 
 
 def _operation_ledger(state: State) -> OperationLedger | None:
